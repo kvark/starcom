@@ -47,3 +47,50 @@ jobs:
       - name: Isolated Linux SSH and tmux integration
         if: runner.os == 'Linux'
         run: scripts/test-ssh.sh
+
+  desktop-development-inputs:
+    # Temporary, read-only dependency export for the desktop implementation.
+    # Kept in the existing workflow: no branch-push or additional triggers.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve and export the matching GUI dependency set
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/desktop-inputs/source" "$RUNNER_TEMP/desktop-inputs/fileman"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/desktop-inputs/source"
+          export BUNDLE="$RUNNER_TEMP/desktop-inputs"
+          python3 - <<'PY'
+          import os, pathlib
+          p = pathlib.Path(os.environ['BUNDLE']) / 'source' / 'Cargo.toml'
+          s = p.read_text()
+          dependencies = '''blade-egui = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
+          blade-graphics = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
+          egui = { version = "0.34", optional = true }
+          egui-winit = { version = "0.34", default-features = false, features = ["clipboard", "wayland", "x11"], optional = true }
+          winit = { version = "0.30.5", optional = true }
+          png = { version = "0.18", optional = true }
+          log = { version = "0.4", optional = true }
+          env_logger = { version = "0.11", optional = true }
+          '''
+          s = s.replace('# Use OpenSSL on Windows', dependencies + '\n# Use OpenSSL on Windows')
+          s = s.replace('default = ["ssh"]', 'default = ["ssh", "gui"]\ngui = ["ssh", "dep:blade-egui", "dep:blade-graphics", "dep:egui", "dep:egui-winit", "dep:winit", "dep:png", "dep:log", "dep:env_logger"]')
+          s += '\n[lints.rust]\nunexpected_cfgs = { level = "warn", check-cfg = [\'cfg(gles)\'] }\n'
+          p.write_text(s)
+          PY
+          cargo vendor --versioned-dirs --manifest-path "$BUNDLE/source/Cargo.toml" "$BUNDLE/vendor" > "$BUNDLE/vendor-config.toml"
+          git clone --depth 1 https://github.com/kvark/fileman.git "$RUNNER_TEMP/fileman"
+          cp "$RUNNER_TEMP/fileman/src/main.rs" "$RUNNER_TEMP/fileman/src/snapshot_render.rs" "$RUNNER_TEMP/fileman/Cargo.toml" "$RUNNER_TEMP/fileman/CONTRIBUTING.md" "$BUNDLE/fileman/"
+          git -C "$RUNNER_TEMP/fileman" rev-parse HEAD > "$BUNDLE/fileman/REVISION"
+          tar -C "$BUNDLE" -czf "$RUNNER_TEMP/desktop-inputs.tar.gz" source vendor vendor-config.toml fileman
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-development-inputs
+          path: ${{ runner.temp }}/desktop-inputs.tar.gz
+          retention-days: 1
