@@ -1,0 +1,63 @@
+# Contributing
+
+Starcom follows [FileMan](https://github.com/kvark/fileman), its sister project.
+The reference inspected for the initial plan is FileMan commit
+`26499ebdb3d983190c61b9016a0ea31b2711aacf`.
+
+## Code style
+
+- Keep dependencies and code volume low. Simple is good; do not anticipate a
+  plugin framework, workspace, or abstraction without a concrete need.
+- One `use` per crate. Prefer modules over long lists of imported members; use
+  qualified names when a list would not fit comfortably on one line.
+- Do not rely on implicit references in `match`; use explicit `ref` bindings.
+- Use enums instead of boolean arguments that obscure meaning.
+- Keep I/O out of protocol, terminal-model, and state-transition tests.
+- Use `anyhow` for application-level context; use explicit error types where
+  callers need to distinguish recovery decisions.
+- Never log keys, passwords, terminal input, or full remote output by default.
+
+## Organization
+
+Start with one Rust 2024 package, a small binary, and a reusable library. Split
+modules rather than introducing multiple crates prematurely. Proposed modules
+are listed in PLAN.md; create them when implemented, not as empty placeholders.
+Use `tests/data/` for small synthetic fixtures, `scripts/` for development tools,
+and `etc/` for eventual desktop metadata and replay screenshots.
+
+Use FileMan's Blade/egui/winit versions together when introducing the GUI.
+Do not copy image/archive/SFTP dependencies that Starcom does not use. Do not add
+`eframe`, GPUI, or a second renderer just to get a window. Add SSH dependencies
+only with the transport implementation. Commit Cargo.lock once dependency
+resolution has actually been performed; do not invent lockfile entries.
+
+## Workflow
+
+Run these checks before submitting changes:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+```
+
+CI should exercise Linux, macOS, and Windows clients. Tests requiring a real tmux
+server run only on Linux and must use an isolated socket/session, never the
+contributor's existing server. A tmux process surviving a connection loss is not
+proof that terminal restoration works: test screen, modes, layout, and history.
+
+Keep PLAN.md's implementation status honest. Separate implemented code, checks
+actually run, and manual acceptance still outstanding. Never claim a performance
+improvement from dependency counts or architecture alone.
+
+## Security and compatibility
+
+All remote output is untrusted. Keep it as bytes until the terminal parser;
+escape diagnostics before printing them to another terminal. Bound framing,
+reply, history, pending-command, and UI queues. Preserve host-key verification.
+Do not weaken SSH authentication to make a test pass.
+
+Never replay uncertain input across reconnects, silently create a replacement
+session, or modify global tmux settings. Keep the ordinary tmux client usable as
+a fallback. Changes affecting another attached client's geometry need an
+explicit, tested sizing policy.
