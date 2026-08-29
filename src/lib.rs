@@ -11,5 +11,8 @@ pub mod core;
 pub mod inspect;
 pub mod replay;
 #[cfg(feature = "ssh")]
+pub mod session;
+pub mod snapshot;
+#[cfg(feature = "ssh")]
 pub mod ssh;
 pub mod terminal;

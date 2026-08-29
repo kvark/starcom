@@ -27,6 +27,7 @@ pub struct Terminal {
     model: term::Term<event::VoidListener>,
     parser: vte::ansi::Processor,
     size: core::Size,
+    history_limit: usize,
 }
 
 impl Terminal {
@@ -43,11 +44,40 @@ impl Terminal {
             model: term::Term::new(config, &size, event::VoidListener),
             parser: vte::ansi::Processor::new(),
             size,
+            history_limit: history_lines,
         }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.model, bytes);
+    }
+
+    /// Conservative maximum cell allocation for the primary and alternate grids.
+    pub fn estimated_cells(size: core::Size, history_lines: usize) -> usize {
+        let history = history_lines
+            .min(MAX_HISTORY_LINES)
+            .min((MAX_BUFFER_CELLS / size.columns()).saturating_sub(size.rows()));
+        (history + 2 * size.rows()) * size.columns()
+    }
+
+    pub fn history_capacity(&self) -> usize {
+        self.history_limit
+    }
+
+    pub fn cell_budget(&self) -> usize {
+        (self.history_limit + 2 * self.size.rows()) * self.size.columns()
+    }
+
+    /// Restore tmux's cursor convention, including x == width (pending wrap).
+    /// Called only after State has validated these coordinates.
+    pub(crate) fn restore_cursor(&mut self, column: usize, row: usize) {
+        debug_assert!(column <= self.size.columns() && row < self.size.rows());
+        let cursor = &mut self.model.grid_mut().cursor;
+        cursor.point = index::Point::new(
+            index::Line(row as i32),
+            index::Column(column.min(self.size.columns() - 1)),
+        );
+        cursor.input_needs_wrap = column == self.size.columns();
     }
 
     pub fn size(&self) -> core::Size {

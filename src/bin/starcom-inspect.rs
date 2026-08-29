@@ -2,13 +2,13 @@
 use std::{collections, env, ffi, path, process, time};
 
 use anyhow::Context;
-use starcom::{core, inspect, ssh};
+use starcom::{core, inspect, session, snapshot, ssh};
 
-const HELP: &str = "Starcom live SSH/tmux inspector (read-only; no GUI or restored terminal)\n\
+const HELP: &str = "Starcom SSH/tmux inspector (read-only; no GUI)\n\
 \n\
 Usage: starcom-inspect --host HOST --user USER --session NAME --known-hosts FILE\n\
                       [--identity FILE | --agent] [--port PORT] [--socket PATH]\n\
-                      [--history LINES] [--timeout SECONDS]\n\
+                      [--history LINES] [--timeout SECONDS] [--watch SECONDS]\n\
 \n\
 HOST is a DNS name or unbracketed IP, not an SSH config alias. This first backend\n\
 does not read ~/.ssh/config. Supply connection settings explicitly.\n\
@@ -19,7 +19,10 @@ Use --agent for an encrypted key already loaded in an SSH agent; --identity\n\
 currently accepts an unencrypted private-key file. Exactly one is required.\n\
 Defaults: port 22, history 200 lines (max 1000), timeout 10 seconds per operation.\n\
 OS DNS resolution and local agent IPC are not covered by the network timeout.\n\
-Captures are escaped textual observations, NOT an atomic/interactive session.\n";
+Default captures are NOT an atomic/interactive session.\n\
+--watch restores pane models and collects\n\
+read-only live output for 1..=3600 seconds, then prints their final screens.\n\
+Some terminal parser state is not exposed by tmux; see docs/SYNCHRONIZATION.md.\n";
 
 fn main() -> process::ExitCode {
     match run() {
@@ -47,7 +50,7 @@ fn run() -> anyhow::Result<()> {
                 agent = true;
             }
             "--host" | "--user" | "--session" | "--known-hosts" | "--identity" | "--port"
-            | "--socket" | "--history" | "--timeout" => {
+            | "--socket" | "--history" | "--timeout" | "--watch" => {
                 let value = args
                     .next()
                     .with_context(|| format!("{arg} needs a value"))?;
@@ -96,6 +99,16 @@ fn run() -> anyhow::Result<()> {
         "--history exceeds {}",
         inspect::MAX_HISTORY_LINES
     );
+    let watch_seconds = if values.contains_key("--watch") {
+        let seconds: u64 = optional_number(&mut values, "--watch", 0)?;
+        anyhow::ensure!(
+            (1..=3600).contains(&seconds),
+            "--watch must be 1..=3600 seconds"
+        );
+        Some(seconds)
+    } else {
+        None
+    };
     let options = ssh::Options {
         host,
         port,
@@ -104,6 +117,9 @@ fn run() -> anyhow::Result<()> {
         authentication,
         timeout: time::Duration::from_secs(seconds),
     };
+    if let Some(seconds) = watch_seconds {
+        return watch(&options, &session, socket.as_deref(), history, seconds);
+    }
     let mut inspector = inspect::Inspector::attach(&options, &session, socket.as_deref())?;
     let observation = inspector.observe(history)?;
     println!(
@@ -133,6 +149,54 @@ fn run() -> anyhow::Result<()> {
             capture.pane.history_limit
         );
         for (row, text) in capture.escaped_rows.iter().enumerate() {
+            if !text.is_empty() {
+                println!("  {row:>4}: {text:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn watch(
+    options: &ssh::Options,
+    name: &core::SessionName,
+    socket: Option<&str>,
+    history: usize,
+    seconds: u64,
+) -> anyhow::Result<()> {
+    let mut session = session::Session::attach(options, name, socket, history)?;
+    println!(
+        "Read-only live models: session {}, {} panes; collecting {seconds} seconds of output.",
+        session.view().session,
+        session.view().panes().len()
+    );
+    println!("Reconstructed observable state; not a complete tmux parser checkpoint.");
+    let deadline = time::Instant::now() + time::Duration::from_secs(seconds);
+    while time::Instant::now() < deadline {
+        session.poll(deadline.min(time::Instant::now() + time::Duration::from_millis(250)))?;
+        match session.view().status() {
+            snapshot::Status::Watching => {}
+            snapshot::Status::NeedsResync => {
+                println!("Resynchronizing: topology changed or output continuity was lost.");
+                session.synchronize()?;
+            }
+            snapshot::Status::Disconnected => {
+                anyhow::bail!("tmux detached during live observation")
+            }
+        }
+    }
+    for (id, pane) in session.view().panes() {
+        let size = pane.terminal.size();
+        println!(
+            "Pane {id}: {}x{}; alternate={}",
+            size.columns(),
+            size.rows(),
+            pane.terminal.is_alternate_screen()
+        );
+        if pane.history_may_be_truncated {
+            println!("  History is bounded; earlier retained lines may not be loaded.");
+        }
+        for (row, text) in pane.terminal.screen_lines().iter().enumerate() {
             if !text.is_empty() {
                 println!("  {row:>4}: {text:?}");
             }

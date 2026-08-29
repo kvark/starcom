@@ -1,8 +1,8 @@
-//! Read-only live tmux inspection. This is not terminal restoration.
+//! Read-only tmux inspection and bounded control-channel requests.
 //!
-//! Captures are observations made at different times. They must not be appended
-//! to an emulator, or used as a reason to mark a connection Live. Snapshot/live
-//! ordering, mode restoration and interactive input are a subsequent milestone.
+//! `observe` produces independent observations, not an atomic terminal snapshot.
+//! The session module coordinates a snapshot-to-live boundary over this channel.
+//! Neither path exposes interactive input or marks a connection policy Live.
 
 use std::{collections, io, time};
 
@@ -46,6 +46,12 @@ pub struct Observation {
     pub metadata_changed_during_capture: bool,
 }
 
+pub(crate) struct Batch {
+    pub replies: Vec<Vec<String>>,
+    /// The number of completed replies at each notification's wire position.
+    pub notifications: Vec<(usize, tmuxctl::Notification)>,
+}
+
 pub struct Inspector {
     channel: ssh::Channel,
     control: control::Control,
@@ -62,7 +68,10 @@ impl Inspector {
         let channel = ssh::Connection::connect(options)?.exec(&command)?;
         Ok(Self {
             channel,
-            control: control::Control::default(),
+            control: control::Control::new(control::Limits {
+                pending_commands: 256,
+                ..control::Limits::default()
+            })?,
             stderr: Vec::new(),
         })
     }
@@ -106,7 +115,7 @@ impl Inspector {
         })
     }
 
-    fn panes(&mut self) -> anyhow::Result<Vec<Pane>> {
+    pub(crate) fn panes(&mut self) -> anyhow::Result<Vec<Pane>> {
         let lines = self.request(concat!(
             "list-panes -s -F '",
             "#{pane_id} #{window_id} #{pane_width} #{pane_height} ",
@@ -116,30 +125,54 @@ impl Inspector {
         parse_panes(&lines)
     }
 
-    fn request(&mut self, command: &str) -> anyhow::Result<Vec<String>> {
-        let result = self.request_inner(command);
+    pub(crate) fn request(&mut self, command: &str) -> anyhow::Result<Vec<String>> {
+        let mut batch = self.request_batch(&[command.to_owned()])?;
+        Ok(batch.replies.remove(0))
+    }
+
+    /// One newline-terminated, synchronous tmux command list. Register every
+    /// reply before writing; never retry a partial write or failed command list.
+    pub(crate) fn request_batch(&mut self, commands: &[String]) -> anyhow::Result<Batch> {
+        let result = self.request_batch_inner(commands);
         if result.is_err() {
-            let _ = self.control.finish(|_| {});
-            self.channel.abort();
+            self.abort();
         }
         result.with_context(|| {
-            // stderr is never mixed into the control stream or emitted raw.
-            let diagnostic = String::from_utf8_lossy(&self.stderr);
-            let brief: String = diagnostic.chars().take(512).collect();
-            format!("tmux request failed; remote stderr: {:?}", brief)
+            let brief: String = String::from_utf8_lossy(&self.stderr)
+                .chars()
+                .take(512)
+                .collect();
+            format!("tmux request failed; remote stderr: {brief:?}")
         })
     }
 
-    fn request_inner(&mut self, command: &str) -> anyhow::Result<Vec<String>> {
+    fn request_batch_inner(&mut self, commands: &[String]) -> anyhow::Result<Batch> {
         anyhow::ensure!(
-            command.len() <= 4096
-                && command.ends_with('\n')
-                && command.bytes().filter(|&b| b == b'\n').count() == 1,
-            "invalid internal control command"
+            !commands.is_empty() && commands.len() <= 256,
+            "invalid command count"
         );
+        let mut wire = String::new();
+        for command in commands {
+            let command = command.strip_suffix('\n').unwrap_or(command);
+            anyhow::ensure!(
+                !command.is_empty()
+                    && command.len() <= 4096
+                    && !command.chars().any(|ch| matches!(ch, '\n' | '\r' | '\0')),
+                "invalid internal control command"
+            );
+            if !wire.is_empty() {
+                wire.push_str(" ; ");
+            }
+            wire.push_str(command);
+        }
+        anyhow::ensure!(wire.len() < 64 * 1024, "command batch exceeds 64 KiB");
+        wire.push('\n');
         let deadline = time::Instant::now() + self.channel.timeout();
-        let id = self.control.register_command()?;
-        let mut unsent = command.as_bytes();
+        let mut ids = Vec::with_capacity(commands.len());
+        for _ in commands {
+            ids.push(self.control.register_command()?);
+        }
+        let mut unsent = wire.as_bytes();
         while !unsent.is_empty() {
             anyhow::ensure!(
                 time::Instant::now() < deadline,
@@ -157,20 +190,67 @@ impl Inspector {
                 }
             }
         }
-        let mut buffer = [0; 8192];
+        let mut batch = Batch {
+            replies: Vec::new(),
+            notifications: Vec::new(),
+        };
         let mut total = 0usize;
         loop {
+            let (events, bytes) = self
+                .read_events(deadline)?
+                .context("tmux reply deadline expired")?;
+            total = total.checked_add(bytes).context("wire budget overflow")?;
             anyhow::ensure!(
-                time::Instant::now() < deadline,
-                "tmux reply deadline expired"
+                total <= MAX_TRANSFER,
+                "tmux batch exceeds 8 MiB wire budget"
             );
-            let mut progress = false;
-            // Drain stderr as well as stdout: a noisy login script must not fill
-            // the shared SSH channel window and deadlock command replies.
+            for event in events {
+                match event {
+                    tmuxctl::Incoming::Reply { id, result } => {
+                        anyhow::ensure!(
+                            ids.get(batch.replies.len()) == Some(&id),
+                            "unexpected command reply"
+                        );
+                        batch.replies.push(
+                            result
+                                .map_err(|error| {
+                                    anyhow::anyhow!("tmux rejected request: {error:?}")
+                                })?
+                                .lines,
+                        );
+                    }
+                    tmuxctl::Incoming::Notification(tmuxctl::Notification::Exit(reason)) => {
+                        anyhow::bail!("tmux attachment ended ({reason:?})");
+                    }
+                    tmuxctl::Incoming::Notification(notification) => {
+                        batch
+                            .notifications
+                            .push((batch.replies.len(), notification));
+                    }
+                }
+            }
+            if batch.replies.len() == commands.len() {
+                return Ok(batch);
+            }
+        }
+    }
+
+    /// Read at most one stdout/stderr chunk. None is an idle deadline, not EOF.
+    /// The return value preserves wire order, including output after the last
+    /// reply in the same SSH packet. Network chunk boundaries are not barriers.
+    fn read_events(
+        &mut self,
+        deadline: time::Instant,
+    ) -> anyhow::Result<Option<(Vec<tmuxctl::Incoming>, usize)>> {
+        let mut buffer = [0; 8192];
+        loop {
+            if time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let mut bytes = 0usize;
             match self.channel.read_stderr(&mut buffer) {
                 Ok(count) => {
-                    total += count;
-                    progress |= count != 0;
+                    bytes += count;
                     anyhow::ensure!(
                         self.stderr.len() + count <= MAX_STDERR,
                         "remote stderr exceeds 64 KiB"
@@ -184,39 +264,12 @@ impl Inspector {
                     ) => {}
                 Err(error) => return Err(error).context("read SSH stderr"),
             }
-            let mut reply = None;
-            let mut exit = None;
-            let mut unexpected_text = false;
+            let mut events = Vec::new();
             match io::Read::read(&mut self.channel, &mut buffer) {
                 Ok(count) => {
-                    total += count;
-                    progress |= count != 0;
+                    bytes += count;
                     self.control
-                        .feed(&buffer[..count], |incoming| match incoming {
-                            tmuxctl::Incoming::Reply {
-                                id: received,
-                                result,
-                            } => {
-                                reply = Some(if received == id {
-                                    result.map(|output| output.lines).map_err(|error| {
-                                        anyhow::anyhow!("tmux rejected request: {error:?}")
-                                    })
-                                } else {
-                                    Err(anyhow::anyhow!("unexpected command reply"))
-                                });
-                            }
-                            tmuxctl::Incoming::Notification(tmuxctl::Notification::Exit(
-                                reason,
-                            )) => {
-                                exit = Some(reason);
-                            }
-                            tmuxctl::Incoming::Notification(tmuxctl::Notification::Unknown(
-                                text,
-                            )) => {
-                                unexpected_text |= !text.starts_with('%');
-                            }
-                            _ => {}
-                        })?;
+                        .feed(&buffer[..count], |event| events.push(event))?;
                 }
                 Err(error)
                     if matches!(
@@ -225,32 +278,57 @@ impl Inspector {
                     ) => {}
                 Err(error) => return Err(error).context("read SSH stdout"),
             }
-            anyhow::ensure!(
-                total <= MAX_TRANSFER,
-                "tmux response exceeds 8 MiB wire budget"
-            );
-            anyhow::ensure!(
-                !unexpected_text,
-                "unexpected stdout before/in the tmux control stream; check noninteractive shell startup output"
-            );
-            if let Some(reason) = exit {
-                anyhow::bail!(
-                    "tmux attachment ended ({reason:?}); the requested session may not exist"
-                );
+            for event in &events {
+                if let tmuxctl::Incoming::Notification(tmuxctl::Notification::Unknown(ref text)) =
+                    *event
+                {
+                    anyhow::ensure!(
+                        text.starts_with('%'),
+                        "unexpected stdout in tmux control stream"
+                    );
+                }
             }
-            if let Some(result) = reply {
-                return result;
+            if bytes != 0 {
+                return Ok(Some((events, bytes)));
             }
-            if self.channel.eof() {
-                let _ = self.control.finish(|_| {});
-                anyhow::bail!(
-                    "SSH exec channel ended before a tmux reply; check server, session, and tmux availability"
-                );
-            }
-            if !progress {
-                self.channel.wait(deadline)?;
+            anyhow::ensure!(!self.channel.eof(), "SSH control channel ended");
+            if let Err(error) = self.channel.wait(deadline) {
+                if error.kind == ssh::Kind::Timeout {
+                    return Ok(None);
+                }
+                return Err(error.into());
             }
         }
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        deadline: time::Instant,
+    ) -> anyhow::Result<Vec<tmuxctl::Notification>> {
+        let result = (|| {
+            let Some((events, _)) = self.read_events(deadline)? else {
+                return Ok(Vec::new());
+            };
+            let mut notifications = Vec::new();
+            for event in events {
+                match event {
+                    tmuxctl::Incoming::Notification(notification) => {
+                        notifications.push(notification)
+                    }
+                    tmuxctl::Incoming::Reply { .. } => anyhow::bail!("unsolicited command reply"),
+                }
+            }
+            Ok(notifications)
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
+    pub(crate) fn abort(&mut self) {
+        let _ = self.control.finish(|_| {});
+        self.channel.abort();
     }
 }
 
@@ -282,7 +360,7 @@ fn attach_command(session: &core::SessionName, socket: Option<&str>) -> anyhow::
     Ok(command)
 }
 
-fn parse_info(lines: &[String]) -> anyhow::Result<(String, tmuxctl::SessionId)> {
+pub(crate) fn parse_info(lines: &[String]) -> anyhow::Result<(String, tmuxctl::SessionId)> {
     anyhow::ensure!(lines.len() == 1, "invalid tmux client metadata");
     let fields: Vec<_> = lines[0].split('|').collect();
     anyhow::ensure!(

@@ -2,15 +2,14 @@
 
 **Session Terminal And Remote COMmander.**
 
-A small graphical client for persistent remote tmux sessions, targeting Linux,
-macOS, and Windows. Remote hosts need only stock SSH and tmux on Linux—no
-Starcom server.
+A small graphical client for persistent remote tmux sessions. Linux, macOS, and Windows
+clients; Linux hosts with stock SSH and tmux. No remote Starcom service.
 
-A sister project to [FileMan](https://github.com/kvark/fileman): Rust,
-Alacritty's terminal core, and a planned Blade + egui interface.
+A sister project to [FileMan](https://github.com/kvark/fileman), using Rust and
+Alacritty's terminal core, with Blade + egui planned for the interface.
 
-**In development:** embedded SSH inspection works; live terminal synchronization,
-the GUI, and automatic reconnect are next.
+**In development:** embedded SSH inspection and experimental snapshot-to-live
+synchronization. The GUI, interactive input, and automatic reconnect are next.
 
 ## Try
 
@@ -22,7 +21,9 @@ cargo run --locked --bin starcom-inspect -- \
   --known-hosts "$HOME/.ssh/known_hosts" --agent
 ```
 
-Connection settings are explicit; SSH config aliases are not supported yet.
-Host keys must already be trusted. See `--help` for other options.
+Add `--watch 5` to collect live output into reconstructed pane models for five
+seconds and print their final screens. Connection settings are explicit; SSH
+config aliases are not supported yet. Host keys must already be trusted.
 
-[SSH usage](docs/SSH.md) · [Roadmap](PLAN.md) · [Contributing](CONTRIBUTING.md)
+See [SSH usage](docs/SSH.md), [synchronization limits](docs/SYNCHRONIZATION.md),
+[the roadmap](PLAN.md), and [contributing](CONTRIBUTING.md).

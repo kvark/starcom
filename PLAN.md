@@ -1,6 +1,16 @@
 # Starcom: architecture and implementation roadmap
 
-Date: 2026-08-29. Status: M0 headless foundation implemented; M1 is next.
+Date: 2026-08-29. Status: M0 and embedded SSH inspection implemented; M1 now
+includes read-only snapshot-to-live reconstruction, validated locally on Linux.
+
+The experimental `starcom-inspect --watch` path restores fresh pane models and
+consumes live output. Linux tmux 3.4 continuity, pending-byte, resize, hook-safety,
+and disconnect tests pass. Broader platform/TUI acceptance and unexported parser
+state remain open; M2's desktop UI is the next implementation stage. See
+[synchronization coverage and limits](docs/SYNCHRONIZATION.md).
+
+Development targets `main` directly. CI runs on pull requests and pushes to
+`main`; do not create extra milestone branches for routine implementation work.
 
 This document records the decisions behind **Session Terminal And Remote
 COMmander**. It is the working plan, not a claim that the listed capabilities
@@ -107,7 +117,10 @@ Create these as the corresponding feature lands:
 - `src/command.rs`: typed command construction and safe argument encoding.
 - `src/connection.rs`: connection epochs, recovery states, retry policy.
 - `src/terminal.rs`: pane-local Alacritty model; no window, SSH, or local PTY.
-- `src/app_state.rs`: hosts, sessions, pane topology, restoration transactions.
+- `src/snapshot.rs`: validated pane captures, reconstruction, and view invalidation.
+- `src/session.rs`: snapshot/live transaction and read-only stream orchestration.
+- `src/inspect.rs`: bounded SSH control requests and diagnostic observation.
+- `src/app_state.rs`: future GUI host/session ownership and presentation state.
 - `src/ssh.rs`: embedded transport, authentication, host keys, config subset.
 - `src/input.rs`: conventional GUI keys and terminal input/mouse encoding.
 - `src/ui/`: terminal views, sidebar, tabs, divider interactions, dialogs.
@@ -132,12 +145,12 @@ package declares Rust 1.96+, as required by tmuxctl 0.1. Audit the actual resolv
 source, not just README claims. Do not introduce Alacritty's window/renderer or
 a local PTY dependency of our own.
 
-SSH candidate: `russh`, using an explicitly selected crypto backend and only
-needed features. Before committing to it, compare dependency/build cost and
-agent/config support with FileMan's existing `ssh2` approach. Embedded SSH is the
-architectural decision; a particular SSH library is not yet irrevocable. Do not
-ship both libraries by default. Configuration parsing is acceptable; incomplete
-semantics must be explicit.
+Embedded SSH uses `ssh2`, following FileMan, with `polling` for readiness waits
+and `base64` for host-key fingerprints. No second SSH library or asynchronous
+runtime is included. Windows enables vendored OpenSSL; Linux/macOS normally
+use system OpenSSL development libraries. See `docs/SSH.md` for authentication,
+trust-policy, and timeout boundaries. SSH configuration parsing is still pending;
+connection settings are explicit and unsupported semantics must not be ignored.
 
 Add only dependencies used by implemented code. Measure dependency count,
 clean-build time, binary size, startup, idle CPU, and memory separately; one is
@@ -269,22 +282,33 @@ UI thread and coalesce repaint requests, not terminal bytes.
 - [x] Test fragmented input, multiple panes, control characters, and teardown.
 
 Gate: deterministic tests pass; README clearly says this is not yet a live GUI.
-The foundation has 25 unit/integration tests. The state machine is policy only:
-there is no SSH channel, reconnect timer, or snapshot-restoration transaction.
+The M0 increment contained 25 unit/integration tests and a policy-only connection
+state machine. SSH and snapshot/live models were subsequently added in M1; the
+network reconnect scheduler remains unimplemented.
 The replay path uses a fixed pane size and rejects layout changes. Unit tests
 are not evidence of compatibility with a real tmux server; that is M1's gate.
 
 ### M1 — Existing-session attachment over embedded SSH
 
-- [ ] Choose and pin the SSH library/features after a small dependency audit.
-- [ ] Host-key verification and a minimal explicit authentication/config path.
-- [ ] Open a non-PTY exec channel; attach only to an existing tmux session.
-- [ ] Discover topology and actual dimensions before interpreting pane state.
-- [ ] Establish initial history/screen/mode synchronization ordering.
-- [ ] Add isolated Linux tmux + localhost-SSH integration tests and timeouts.
+- [x] Choose and pin the SSH library/features after a small dependency audit.
+- [x] Host-key verification and a minimal explicit authentication/config path.
+- [x] Open a non-PTY exec channel; attach only to an existing tmux session.
+- [x] Discover topology and actual dimensions before interpreting pane state.
+- [x] Establish snapshot/live ordering for observable state on Linux tmux 3.4.
+- [x] Add isolated Linux tmux + localhost-SSH integration tests and timeouts.
+- [ ] Complete broader client-platform, tmux-version, and real TUI/Codex acceptance.
+- [ ] Close or explicitly handle the remaining unexported parser-state fidelity gaps.
+
+Implementation note: `snapshot.rs` builds fresh models from current/saved grids,
+cursor/modes, and pending bytes. `session.rs` establishes a synchronous command
+boundary, preserves subsequent output, and rebuilds invalidated views. No input
+API or network reconnect loop is enabled. See `docs/SYNCHRONIZATION.md` for exact
+limits and validation; this is not a claim of a universal tmux checkpoint.
 
 Gate: inspect a pre-existing shell and a full-screen TUI from the client; an
 ordinary tmux client can still attach; no custom remote executable is installed.
+Controlled primary/alternate-screen tests pass; native real-application acceptance
+remains outstanding. M2 can proceed against the current read-only model API.
 
 ### M2 — Minimal FileMan-style desktop client
 
@@ -350,10 +374,10 @@ Codex. Include two attached clients of different sizes, connection loss during a
 paste, remote resize while detached, changed host key, missing session, and
 server restart. Record unsupported terminal features explicitly.
 
-## 11. Open decisions, not excuses to block M0
+## 11. Remaining design decisions
 
-1. Embedded SSH backend: russh versus reusing ssh2; include Windows agent support
-   and build/dependency costs in the comparison.
+1. Embedded SSH uses `ssh2`, following FileMan. Expand tested SSH configuration
+   and platform-agent coverage without introducing a second default SSH stack.
 2. Exact snapshot/live-output ordering and mode reconstruction for supported tmux
    versions. This is the primary correctness investigation in M1/M3.
 3. Native text rasterization/fallback/IME and eventual accessibility needs;

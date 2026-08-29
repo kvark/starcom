@@ -1,7 +1,8 @@
 # Embedded SSH: first live milestone
 
-Status: 2026-08-29. **M1 is partially implemented, not complete.** This is the
-implementation-status companion to [PLAN.md](../PLAN.md).
+Status: 2026-08-29. Embedded SSH inspection and read-only snapshot-to-live models
+are implemented. General interactive terminal fidelity and desktop acceptance
+remain open. See [PLAN.md](../PLAN.md) and [synchronization details](SYNCHRONIZATION.md).
 
 ## Implemented
 
@@ -16,10 +17,13 @@ implementation-status companion to [PLAN.md](../PLAN.md).
 - Bounded pane discovery and textual screen/history inspection. Geometry, cursor,
   alternate-screen status, and history counts are reported. Captures are escaped
   when printed. SSH stderr never enters the control protocol parser.
-- Unit/CLI tests and seven Linux integration tests using disposable SSH/tmux
-  fixtures. Tests exercise trust failures before auth, hashed host keys, agent
-  auth, separate stderr, deadlines, missing sessions, and preservation of remote
-  process IDs, dimensions, and environment.
+- `--watch SECONDS` reconstructs fresh pane models, then feeds live output into
+  them. Geometry changes invalidate the view and trigger a new snapshot. Screens
+  remain readable on disconnect; input and automatic reconnect are not enabled.
+- Unit/CLI tests and isolated Linux integration tests cover transport/trust,
+  snapshot ordering, pending sequences, continuous output, resize, hook safety,
+  and preservation of remote jobs. See synchronization details for tests actually
+  executed and remaining platform coverage.
 
 The Windows dependency enables vendored OpenSSL for Ed25519 support; this has a
 native build cost. Linux/macOS normally use the system OpenSSL development
@@ -31,9 +35,11 @@ that libssh2 is smaller or faster than russh.
 ## Deliberate boundaries
 
 The inspector never enables interactive input and never marks the connection
-state `Live`. A capture is not a serialized terminal. Queries happen at different
-times; an unchanged metadata comparison does not prove an atomic snapshot.
-Captures must not be appended to an old Alacritty model as a reconnect strategy.
+state `Live`. Default inspection queries happen at different times; an unchanged
+metadata comparison does not prove an atomic snapshot. `--watch` uses a separate
+synchronous command batch and a fresh set of models, not captures appended to old
+models. A capture is still not a complete serialized terminal parser; fidelity
+limits and source-supported ordering assumptions are documented separately.
 The tmux read-only flag is not an authorization sandbox for control commands;
 the inspector itself only issues its small, private set of read-only queries.
 User-configured tmux hooks can still run when a client attaches.
@@ -56,24 +62,20 @@ not covered by those network timeouts. Connection/authentication are blocking
 and must run on a worker when a GUI is added. One connection currently owns one
 channel; multi-session connection sharing remains later work.
 
-Resource budgets are explicit: 128 panes, 1000 requested history lines, bounded
+Resource budgets are explicit: 128 panes for basic inspection (32 for live
+reconstruction), 1000 requested history lines, bounded
 protocol lines/replies, 64 KiB stderr, and 8 MiB capture/transfer budgets. Large
 sessions can fail with an explicit limit error. A captured text line resembling
 a tmux reply guard can currently cause the strict control parser to fail closed;
 framing-safe snapshot extraction needs attention before general terminal use.
 
-## Remaining M1 acceptance work
+## Remaining acceptance work
 
-1. Establish and test snapshot/live-output ordering, including cursor, modes,
-   alternate/primary screens, wrapping, and pending escape-sequence fragments.
-2. Feed a coherent restored state into pane emulators before enabling input.
-   Test output and topology changes while the initial snapshot is being built.
-3. Wire connection epochs and teardown to the live transport; keep uncertain
-   writes failed, never automatically replayed.
-4. Add the documented SSH configuration subset and capability/version matrix.
-   The current inspector validates required client flags but does not establish
-   compatibility with every tmux release.
+The snapshot-to-live path has passed controlled Linux tmux 3.4 tests, including
+primary/alternate buffers and output arriving during attachment. The next desktop
+step can use these models, while keeping their fidelity limits explicit.
 
-Then proceed to M2's Blade/egui desktop interface. Live TUI/Codex acceptance and
-reconnection tests remain outstanding; the integration fixture only demonstrates
-transport, inspection, and preservation of controlled primary/alternate screens.
+Still outstanding: full TUI/Codex acceptance, broader tmux and client-platform
+coverage, missing parser-state fidelity, SSH configuration semantics, interactive
+input gating, and transport reconnect/epoch integration. M2 adds Blade/egui views,
+selection, scrolling, and resizing; M3 integrates automatic connection recovery.
