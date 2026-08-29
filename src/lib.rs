@@ -1,11 +1,15 @@
-//! Headless building blocks for the Starcom tmux GUI.
+//! Building blocks for the Starcom tmux GUI.
 //!
-//! This foundation deliberately owns neither an SSH connection nor a window.
-//! See PLAN.md before adding a transport, renderer, or recovery behavior.
+//! Protocol and terminal modules own neither a network connection nor a window.
+//! The optional SSH backend and read-only inspector are the first live slice.
 
 pub mod command;
 pub mod connection;
 pub mod control;
 pub mod core;
+#[cfg(feature = "ssh")]
+pub mod inspect;
 pub mod replay;
+#[cfg(feature = "ssh")]
+pub mod ssh;
 pub mod terminal;
