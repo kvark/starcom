@@ -11,10 +11,27 @@ edition = "2024"
 rust-version = "1.96"
 default-run = "starcom"
 
+[[bin]]
+name = "starcom-inspect"
+path = "src/bin/starcom-inspect.rs"
+required-features = ["ssh"]
+
 [dependencies]
 anyhow = "1.0"
 alacritty_terminal = "0.26"
 tmuxctl = { version = "=0.1.0", default-features = false }
+ssh2 = { version = "0.9.6", optional = true }
+polling = { version = "3.11", optional = true }
+base64 = { version = "0.22", optional = true }
+
+# Use OpenSSL on Windows too, so Ed25519 support does not depend on WinCNG.
+[target.'cfg(windows)'.dependencies]
+ssh2 = { version = "0.9.6", optional = true, features = ["vendored-openssl"] }
+
+[features]
+default = ["ssh"]
+ssh = ["dep:ssh2", "dep:polling", "dep:base64"]
+vendored-openssl = ["ssh", "ssh2/vendored-openssl"]
 
 [profile.release]
 lto = "thin"

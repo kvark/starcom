@@ -2,15 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build-test:
@@ -19,13 +14,21 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Linux SSH dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config openssh-server tmux
+      - name: macOS OpenSSL
+        if: runner.os == 'macOS'
+        run: echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
       - name: Format check
         run: cargo fmt --check
       - name: Build
@@ -34,3 +37,8 @@ jobs:
         run: cargo test --locked --all-targets
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Core without SSH
+        run: cargo test --locked --no-default-features --all-targets
+      - name: Isolated Linux SSH and tmux integration
+        if: runner.os == 'Linux'
+        run: scripts/test-ssh.sh

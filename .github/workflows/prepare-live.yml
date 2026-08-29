@@ -1,0 +1,40 @@
+name: Prepare live validation
+on:
+  push:
+    branches: [starcom-live]
+    paths: [.github/workflows/prepare-live.yml]
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Prepare offline validation inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y tmux libssl-dev pkg-config
+          mkdir -p /tmp/starcom-validation/source /tmp/starcom-validation/toolchain /tmp/starcom-validation/bin
+          git archive HEAD | tar -x -C /tmp/starcom-validation/source
+          cargo vendor --locked /tmp/starcom-validation/vendor > /tmp/starcom-validation/vendor-config.toml
+          sysroot=$(rustc --print sysroot)
+          cp -a "$sysroot/bin" "$sysroot/lib" /tmp/starcom-validation/toolchain/
+          cp /usr/bin/tmux /tmp/starcom-validation/bin/
+          git clone --depth 1 --branch 3.4 https://github.com/tmux/tmux.git /tmp/tmux-source
+          mkdir /tmp/starcom-validation/tmux-source
+          git -C /tmp/tmux-source archive HEAD | tar -x -C /tmp/starcom-validation/tmux-source
+          tar -C /tmp/starcom-validation -czf validation-inputs.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: live-validation-inputs
+          path: validation-inputs.tar.gz
+          retention-days: 1
+          compression-level: 0
