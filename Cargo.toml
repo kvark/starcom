@@ -1,0 +1,21 @@
+[package]
+name = "starcom"
+version = "0.1.0"
+description = "Session Terminal And Remote COMmander"
+keywords = ["terminal", "tmux", "ssh"]
+categories = ["command-line-utilities"]
+license = "MIT"
+repository = "https://github.com/kvark/starcom"
+authors = ["Dzmitry Malyshau"]
+edition = "2024"
+rust-version = "1.96"
+default-run = "starcom"
+
+[dependencies]
+anyhow = "1.0"
+alacritty_terminal = "0.26"
+tmuxctl = { version = "=0.1.0", default-features = false }
+
+[profile.release]
+lto = "thin"
+strip = true
