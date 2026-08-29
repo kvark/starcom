@@ -1,6 +1,6 @@
 # Starcom: architecture and implementation roadmap
 
-Date: 2026-08-29. Status: initial plan and foundation work.
+Date: 2026-08-29. Status: M0 headless foundation implemented; M1 is next.
 
 This document records the decisions behind **Session Terminal And Remote
 COMmander**. It is the working plan, not a claim that the listed capabilities
@@ -114,8 +114,9 @@ Create these as the corresponding feature lands:
 - `src/main.rs`: CLI/bootstrap and eventually winit/Blade lifecycle.
 - `tests/data/`: small, synthetic, deterministic protocol fixtures.
 
-The first implementation may expose a headless replay command. That is a
-correctness harness, not a replacement product direction or a working SSH GUI.
+The first implementation exposes a headless replay command in `src/replay.rs`.
+That is a correctness harness, not a replacement product direction or a working
+SSH GUI. Only implemented modules exist; later modules are not empty scaffolding.
 
 ## 5. Dependencies and FileMan conventions
 
@@ -125,10 +126,11 @@ Its current GUI set is egui/egui-winit 0.34, winit 0.30.5, and Blade git revisio
 that the resolved versions still agree. Reuse its thin-LTO/stripped release
 profile, `AGENTS.md` pointers, contributor style, and tests/fixtures organization.
 
-Start terminal work with `alacritty_terminal` 0.26 and control work with
-`tmuxctl` 0.1, explicitly disabling tmuxctl's runtime/spawn defaults. Audit the
-actual resolved source, not just README claims. Do not introduce Alacritty's
-window/renderer or a local PTY dependency of our own.
+The foundation uses `alacritty_terminal` 0.26, `tmuxctl` 0.1 with its runtime/spawn
+defaults disabled, and `anyhow`. Cargo.lock is generated and committed. The
+package declares Rust 1.96+, as required by tmuxctl 0.1. Audit the actual resolved
+source, not just README claims. Do not introduce Alacritty's window/renderer or
+a local PTY dependency of our own.
 
 SSH candidate: `russh`, using an explicitly selected crypto backend and only
 needed features. Before committing to it, compare dependency/build cost and
@@ -137,10 +139,9 @@ architectural decision; a particular SSH library is not yet irrevocable. Do not
 ship both libraries by default. Configuration parsing is acceptable; incomplete
 semantics must be explicit.
 
-Add only dependencies used by implemented code. Keep a generated Cargo.lock in
-the application repository once resolution is available. Measure dependency
-count, clean-build time, binary size, startup, idle CPU, and memory separately;
-one is not a proxy for all the others.
+Add only dependencies used by implemented code. Measure dependency count,
+clean-build time, binary size, startup, idle CPU, and memory separately; one is
+not a proxy for all the others.
 
 ## 6. Protocol and terminal correctness
 
@@ -257,17 +258,21 @@ UI thread and coalesce repaint requests, not terminal bytes.
 
 ## 9. Ordered milestones and acceptance gates
 
-### M0 — Reusable foundation (first implementation)
+### M0 — Reusable foundation (implemented)
 
-- [ ] Establish one-package Rust layout, docs, style, and cross-platform CI.
-- [ ] Add validated IDs/dimensions and safe tmux command construction.
-- [ ] Wrap tmuxctl without coupling it to an SSH runtime or GUI.
-- [ ] Bound incoming framing and pending-command state; handle EOF explicitly.
-- [ ] Add connection epochs and a tested no-offline-input state machine.
-- [ ] Feed synthetic pane output into Alacritty; provide headless replay.
-- [ ] Test fragmented input, multiple panes, control characters, and teardown.
+- [x] Establish one-package Rust layout, docs, style, and cross-platform CI.
+- [x] Add validated IDs/dimensions and safe tmux command construction.
+- [x] Wrap tmuxctl without coupling it to an SSH runtime or GUI.
+- [x] Bound incoming framing and pending-command state; handle EOF explicitly.
+- [x] Add connection epochs and a tested no-offline-input state machine.
+- [x] Feed synthetic pane output into Alacritty; provide headless replay.
+- [x] Test fragmented input, multiple panes, control characters, and teardown.
 
 Gate: deterministic tests pass; README clearly says this is not yet a live GUI.
+The foundation has 25 unit/integration tests. The state machine is policy only:
+there is no SSH channel, reconnect timer, or snapshot-restoration transaction.
+The replay path uses a fixed pane size and rejects layout changes. Unit tests
+are not evidence of compatibility with a real tmux server; that is M1's gate.
 
 ### M1 — Existing-session attachment over embedded SSH
 
