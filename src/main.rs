@@ -5,7 +5,7 @@ use starcom::{core, replay};
 
 const HELP: &str = "Starcom: Session Terminal And Remote COMmander\n\
 \n\
-Early headless foundation; no GUI or live SSH attachment yet.\n\
+Headless replay harness. Use starcom-inspect for read-only live SSH inspection.\n\
 \n\
 Usage: starcom --replay FILE [--size COLSxROWS]\n\
        starcom --help\n\
