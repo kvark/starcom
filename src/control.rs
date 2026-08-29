@@ -88,8 +88,10 @@ impl Default for Control {
 
 impl Control {
     pub fn new(limits: Limits) -> Result<Self, Error> {
-        if limits.line_bytes == 0 || limits.reply_bytes == 0
-            || limits.reply_lines == 0 || limits.pending_commands == 0
+        if limits.line_bytes == 0
+            || limits.reply_bytes == 0
+            || limits.reply_lines == 0
+            || limits.pending_commands == 0
         {
             return Err(Error::InvalidLimits);
         }
@@ -177,7 +179,11 @@ impl Control {
         }
         let truncated = !self.line.is_empty() || self.reply.is_some();
         self.close(&mut emit);
-        if truncated { Err(Error::TruncatedStream) } else { Ok(()) }
+        if truncated {
+            Err(Error::TruncatedStream)
+        } else {
+            Ok(())
+        }
     }
 
     fn close(&mut self, emit: &mut impl FnMut(tmuxctl::Incoming)) {
@@ -209,7 +215,9 @@ impl Control {
                     self.reply = None;
                 }
                 None => {
-                    reply.bytes = reply.bytes.checked_add(line.len() + 1)
+                    reply.bytes = reply
+                        .bytes
+                        .checked_add(line.len() + 1)
                         .ok_or(Error::ReplyTooLarge)?;
                     reply.lines += 1;
                     if reply.bytes > self.limits.reply_bytes {
@@ -223,11 +231,17 @@ impl Control {
             None => match envelope {
                 Some((GuardKind::Begin, guard)) => {
                     if guard.flags != 0
-                        && self.last_control_number.is_some_and(|last| guard.number <= last)
+                        && self
+                            .last_control_number
+                            .is_some_and(|last| guard.number <= last)
                     {
                         return Err(Error::OutOfOrderReply);
                     }
-                    self.reply = Some(ReplyBudget { guard, bytes: 0, lines: 0 });
+                    self.reply = Some(ReplyBudget {
+                        guard,
+                        bytes: 0,
+                        lines: 0,
+                    });
                 }
                 Some(_) => return Err(Error::UnexpectedGuard),
                 None => check_layout_depth(line)?,
@@ -254,16 +268,32 @@ fn parse_guard(line: &[u8]) -> Result<Option<(GuardKind, Guard)>, Error> {
     let text = std::str::from_utf8(line).map_err(|_| Error::MalformedGuard)?;
     let mut fields = text.split(' ');
     fields.next();
-    let timestamp = fields.next().ok_or(Error::MalformedGuard)?
-        .parse().map_err(|_| Error::MalformedGuard)?;
-    let number = fields.next().ok_or(Error::MalformedGuard)?
-        .parse().map_err(|_| Error::MalformedGuard)?;
-    let flags = fields.next().ok_or(Error::MalformedGuard)?
-        .parse().map_err(|_| Error::MalformedGuard)?;
+    let timestamp = fields
+        .next()
+        .ok_or(Error::MalformedGuard)?
+        .parse()
+        .map_err(|_| Error::MalformedGuard)?;
+    let number = fields
+        .next()
+        .ok_or(Error::MalformedGuard)?
+        .parse()
+        .map_err(|_| Error::MalformedGuard)?;
+    let flags = fields
+        .next()
+        .ok_or(Error::MalformedGuard)?
+        .parse()
+        .map_err(|_| Error::MalformedGuard)?;
     if fields.next().is_some() {
         return Err(Error::MalformedGuard);
     }
-    Ok(Some((kind, Guard { timestamp, number, flags })))
+    Ok(Some((
+        kind,
+        Guard {
+            timestamp,
+            number,
+            flags,
+        },
+    )))
 }
 
 fn check_layout_depth(line: &[u8]) -> Result<(), Error> {
@@ -296,14 +326,21 @@ mod tests {
         for split in 0..=wire.len() {
             let mut control = Control::default();
             let mut events = Vec::new();
-            control.feed(&wire[..split], |event| events.push(event)).unwrap();
-            control.feed(&wire[split..], |event| events.push(event)).unwrap();
-            assert_eq!(events, vec![tmuxctl::Incoming::Notification(
-                tmuxctl::Notification::Output {
-                    pane: tmuxctl::PaneId(3),
-                    bytes: b"a\x1b[31m\xff\n".to_vec(),
-                }
-            )]);
+            control
+                .feed(&wire[..split], |event| events.push(event))
+                .unwrap();
+            control
+                .feed(&wire[split..], |event| events.push(event))
+                .unwrap();
+            assert_eq!(
+                events,
+                vec![tmuxctl::Incoming::Notification(
+                    tmuxctl::Notification::Output {
+                        pane: tmuxctl::PaneId(3),
+                        bytes: b"a\x1b[31m\xff\n".to_vec(),
+                    }
+                )]
+            );
         }
     }
 
@@ -312,13 +349,18 @@ mod tests {
         let mut control = Control::default();
         let id = control.register_command().unwrap();
         let mut events = Vec::new();
-        control.feed(
-            b"%begin 1 1 0\n%end 1 1 0\n%begin 1 2 1\na\n\nb\n%end 1 2 1\n",
-            |event| events.push(event),
-        ).unwrap();
+        control
+            .feed(
+                b"%begin 1 1 0\n%end 1 1 0\n%begin 1 2 1\na\n\nb\n%end 1 2 1\n",
+                |event| events.push(event),
+            )
+            .unwrap();
         assert_eq!(events.len(), 1);
         match events[0] {
-            tmuxctl::Incoming::Reply { id: got, result: Ok(ref output) } => {
+            tmuxctl::Incoming::Reply {
+                id: got,
+                result: Ok(ref output),
+            } => {
                 assert_eq!(got, id);
                 assert_eq!(output.lines, ["a", "", "b"]);
             }
@@ -334,10 +376,13 @@ mod tests {
         let mut events = Vec::new();
         let error = control.feed(b"%begin 1 2 1\n%end 1 99 1\n", |e| events.push(e));
         assert_eq!(error, Err(Error::MismatchedGuard));
-        assert_eq!(events, vec![tmuxctl::Incoming::Reply {
-            id,
-            result: Err(tmuxctl::CommandError::Disconnected),
-        }]);
+        assert_eq!(
+            events,
+            vec![tmuxctl::Incoming::Reply {
+                id,
+                result: Err(tmuxctl::CommandError::Disconnected),
+            }]
+        );
         assert_eq!(control.register_command(), Err(Error::Closed));
     }
 
@@ -347,21 +392,34 @@ mod tests {
         control.register_command().unwrap();
         control.feed(b"%begin 1 2 1\npartial", |_| {}).unwrap();
         let mut events = Vec::new();
-        assert_eq!(control.finish(|e| events.push(e)), Err(Error::TruncatedStream));
+        assert_eq!(
+            control.finish(|e| events.push(e)),
+            Err(Error::TruncatedStream)
+        );
         assert_eq!(events.len(), 1);
         assert!(control.finish(|_| panic!("duplicate completion")).is_ok());
     }
 
     #[test]
     fn limits_apply_before_upstream_buffering() {
-        let limits = Limits { line_bytes: 16, reply_bytes: 4, pending_commands: 1,
-            ..Limits::default() };
+        let limits = Limits {
+            line_bytes: 16,
+            reply_bytes: 4,
+            pending_commands: 1,
+            ..Limits::default()
+        };
         let mut control = Control::new(limits).unwrap();
         control.register_command().unwrap();
-        assert_eq!(control.register_command(), Err(Error::TooManyPendingCommands));
+        assert_eq!(
+            control.register_command(),
+            Err(Error::TooManyPendingCommands)
+        );
         assert_eq!(control.feed(&[b'x'; 17], |_| {}), Err(Error::LineTooLong));
         let mut control = Control::new(limits).unwrap();
-        assert_eq!(control.feed(b"%begin 1 1 0\n12345\n", |_| {}), Err(Error::ReplyTooLarge));
+        assert_eq!(
+            control.feed(b"%begin 1 1 0\n12345\n", |_| {}),
+            Err(Error::ReplyTooLarge)
+        );
     }
 
     #[test]
@@ -369,18 +427,29 @@ mod tests {
         let mut control = Control::default();
         control.register_command().unwrap();
         let mut events = Vec::new();
-        control.feed(b"%exit detached\n", |e| events.push(e)).unwrap();
+        control
+            .feed(b"%exit detached\n", |e| events.push(e))
+            .unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(control.pending_commands(), 0);
-        assert_eq!(control.feed(b"%sessions-changed\n", |_| {}), Err(Error::Closed));
+        assert_eq!(
+            control.feed(b"%sessions-changed\n", |_| {}),
+            Err(Error::Closed)
+        );
     }
 
     #[test]
     fn nested_and_reordered_replies_are_errors_not_panics() {
         let mut control = Control::default();
-        assert_eq!(control.feed(b"%begin 1 1 0\n%begin 1 2 0\n", |_| {}), Err(Error::NestedReply));
+        assert_eq!(
+            control.feed(b"%begin 1 1 0\n%begin 1 2 0\n", |_| {}),
+            Err(Error::NestedReply)
+        );
         let mut control = Control::default();
         control.feed(b"%begin 1 2 1\n%end 1 2 1\n", |_| {}).unwrap();
-        assert_eq!(control.feed(b"%begin 1 2 1\n", |_| {}), Err(Error::OutOfOrderReply));
+        assert_eq!(
+            control.feed(b"%begin 1 2 1\n", |_| {}),
+            Err(Error::OutOfOrderReply)
+        );
     }
 }

@@ -31,7 +31,10 @@ impl Size {
 
 impl Default for Size {
     fn default() -> Self {
-        Self { columns: 80, rows: 24 }
+        Self {
+            columns: 80,
+            rows: 24,
+        }
     }
 }
 

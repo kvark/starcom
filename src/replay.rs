@@ -52,19 +52,24 @@ impl Replay {
         match event {
             tmuxctl::Incoming::Notification(tmuxctl::Notification::Output { pane, bytes })
             | tmuxctl::Incoming::Notification(tmuxctl::Notification::ExtendedOutput {
-                pane, bytes, ..
+                pane,
+                bytes,
+                ..
             }) => {
                 if !self.panes.contains_key(&pane) && self.panes.len() >= MAX_PANES {
                     anyhow::bail!("replay exceeds the {MAX_PANES}-pane safety budget");
                 }
-                self.panes.entry(pane)
+                self.panes
+                    .entry(pane)
                     .or_insert_with(|| terminal::Terminal::new(self.size, 64))
                     .feed(&bytes);
             }
             tmuxctl::Incoming::Notification(tmuxctl::Notification::LayoutChange { .. }) => {
                 anyhow::bail!("fixed-size replay does not implement layout changes");
             }
-            tmuxctl::Incoming::Reply { result: Err(error), .. } => return Err(error.into()),
+            tmuxctl::Incoming::Reply {
+                result: Err(error), ..
+            } => return Err(error.into()),
             _ => {}
         }
         Ok(())

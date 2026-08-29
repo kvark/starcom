@@ -31,9 +31,9 @@ pub struct Terminal {
 
 impl Terminal {
     pub fn new(size: core::Size, history_lines: usize) -> Self {
-        let history_lines = history_lines.min(MAX_HISTORY_LINES).min(
-            (MAX_BUFFER_CELLS / size.columns()).saturating_sub(size.rows())
-        );
+        let history_lines = history_lines
+            .min(MAX_HISTORY_LINES)
+            .min((MAX_BUFFER_CELLS / size.columns()).saturating_sub(size.rows()));
         let config = term::Config {
             scrolling_history: history_lines,
             osc52: term::Osc52::Disabled,
@@ -62,12 +62,20 @@ impl Terminal {
     /// The real renderer should use model().renderable_content(), not this
     /// allocation-heavy diagnostic representation.
     pub fn screen_lines(&self) -> Vec<String> {
-        (0..self.size.rows()).map(|row| {
-            self.model.bounds_to_string(
-                index::Point::new(index::Line(row as i32), index::Column(0)),
-                index::Point::new(index::Line(row as i32), index::Column(self.size.columns() - 1)),
-            ).trim_end_matches(&[' ', '\r', '\n'][..]).to_owned()
-        }).collect()
+        (0..self.size.rows())
+            .map(|row| {
+                self.model
+                    .bounds_to_string(
+                        index::Point::new(index::Line(row as i32), index::Column(0)),
+                        index::Point::new(
+                            index::Line(row as i32),
+                            index::Column(self.size.columns() - 1),
+                        ),
+                    )
+                    .trim_end_matches(&[' ', '\r', '\n'][..])
+                    .to_owned()
+            })
+            .collect()
     }
 
     pub fn is_alternate_screen(&self) -> bool {

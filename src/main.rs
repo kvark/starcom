@@ -9,6 +9,7 @@ Early headless foundation; no GUI or live SSH attachment yet.\n\
 \n\
 Usage: starcom --replay FILE [--size COLSxROWS]\n\
        starcom --help\n\
+\n\
 Use - as FILE to read a synthetic control-mode transcript from stdin.\n\
 The default pane size is 80x24. All replay panes use the same fixed size.\n\
 Output rows are quoted/escaped so remote text cannot control this terminal.\n";
@@ -39,7 +40,9 @@ fn run() -> anyhow::Result<()> {
             }
             Some("--replay") => {
                 anyhow::ensure!(input.is_none(), "--replay was supplied more than once");
-                input = Some(path::PathBuf::from(arguments.next().context("--replay needs a file")?));
+                input = Some(path::PathBuf::from(
+                    arguments.next().context("--replay needs a file")?,
+                ));
             }
             Some("--size") => {
                 let argument = arguments.next().context("--size needs COLSxROWS")?;
@@ -68,12 +71,19 @@ fn run() -> anyhow::Result<()> {
             break;
         }
         total += count;
-        anyhow::ensure!(total <= 16 * 1024 * 1024, "replay exceeds the 16 MiB input budget");
+        anyhow::ensure!(
+            total <= 16 * 1024 * 1024,
+            "replay exceeds the 16 MiB input budget"
+        );
         replay.feed(&buffer[..count])?;
     }
     replay.finish()?;
-    println!("Starcom replay: {} panes, {}x{} cells (no network connection)",
-        replay.panes().len(), size.columns(), size.rows());
+    println!(
+        "Starcom replay: {} panes, {}x{} cells (no network connection)",
+        replay.panes().len(),
+        size.columns(),
+        size.rows()
+    );
     for (pane, terminal) in replay.panes() {
         println!("Pane {pane}:");
         for (row, text) in terminal.screen_lines().iter().enumerate() {

@@ -19,10 +19,13 @@ pub struct Command(String);
 
 impl Command {
     pub fn list_panes() -> Self {
-        Self(concat!(
-            "list-panes -s -F ",
-            "'#{pane_id} #{window_id} #{pane_width} #{pane_height}'\n"
-        ).to_owned())
+        Self(
+            concat!(
+                "list-panes -s -F ",
+                "'#{pane_id} #{window_id} #{pane_width} #{pane_height}'\n"
+            )
+            .to_owned(),
+        )
     }
 
     pub fn select_pane(pane: tmuxctl::PaneId) -> Self {
@@ -96,7 +99,10 @@ mod tests {
     fn input_is_hex_not_command_syntax() {
         let command = Command::send_bytes(tmuxctl::PaneId(7), b"a;\n\x00\xff").unwrap();
         assert_eq!(command.as_str(), "send-keys -H -t %7 61 3b 0a 00 ff\n");
-        assert_eq!(command.as_bytes().iter().filter(|&&b| b == b'\n').count(), 1);
+        assert_eq!(
+            command.as_bytes().iter().filter(|&&b| b == b'\n').count(),
+            1
+        );
     }
 
     #[test]

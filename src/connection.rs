@@ -32,7 +32,10 @@ pub struct Connection {
 
 impl Default for Connection {
     fn default() -> Self {
-        Self { epoch: Epoch(0), state: State::Disconnected }
+        Self {
+            epoch: Epoch(0),
+            state: State::Disconnected,
+        }
     }
 }
 
@@ -40,7 +43,12 @@ impl Connection {
     /// Explicitly start or supersede an attempt. The transport owner must close
     /// the old channel and fail its pending commands before replacing it.
     pub fn begin_connect(&mut self) -> Epoch {
-        self.epoch = Epoch(self.epoch.0.checked_add(1).expect("connection epoch exhausted"));
+        self.epoch = Epoch(
+            self.epoch
+                .0
+                .checked_add(1)
+                .expect("connection epoch exhausted"),
+        );
         self.state = State::Connecting;
         self.epoch
     }
@@ -69,7 +77,10 @@ impl Connection {
 
     pub fn fail(&mut self, epoch: Epoch, failure: Failure) -> bool {
         if epoch != self.epoch
-            || !matches!(self.state, State::Connecting | State::Restoring | State::Live)
+            || !matches!(
+                self.state,
+                State::Connecting | State::Restoring | State::Live
+            )
         {
             return false;
         }
@@ -137,7 +148,11 @@ mod tests {
 
     #[test]
     fn security_failures_do_not_enter_automatic_backoff() {
-        for failure in [Failure::Authentication, Failure::HostKey, Failure::MissingSession] {
+        for failure in [
+            Failure::Authentication,
+            Failure::HostKey,
+            Failure::MissingSession,
+        ] {
             let mut connection = Connection::default();
             let epoch = connection.begin_connect();
             assert!(connection.fail(epoch, failure));
