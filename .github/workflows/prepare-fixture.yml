@@ -1,0 +1,32 @@
+name: Prepare fixture tools
+on:
+  push:
+    branches: [starcom-live]
+    paths: [.github/workflows/prepare-fixture.yml]
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Package fixture executables
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server tmux
+          mkdir -p tools/bin tools/lib
+          cp /usr/bin/tmux /usr/sbin/sshd tools/bin/
+          for executable in /usr/bin/tmux /usr/sbin/sshd; do
+            ldd "$executable" | awk '/=> \/.*\// {print $3}' | while read -r library; do
+              case "$(basename "$library")" in
+                libc.so.*|libm.so.*|libpthread.so.*|librt.so.*|libdl.so.*|libresolv.so.*) ;;
+                *) cp -L "$library" tools/lib/ ;;
+              esac
+            done
+          done
+          tar -czf fixture-tools.tar.gz tools
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixture-tools
+          path: fixture-tools.tar.gz
+          retention-days: 1
