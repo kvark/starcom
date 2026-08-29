@@ -29,32 +29,16 @@ jobs:
       - name: macOS OpenSSL
         if: runner.os == 'macOS'
         run: echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+      - name: Format check
+        run: cargo fmt --check
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --locked --all-targets
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Core without SSH
-        run: cargo test --no-default-features --all-targets
+        run: cargo test --locked --no-default-features --all-targets
       - name: Isolated Linux SSH and tmux integration
         if: runner.os == 'Linux'
         run: scripts/test-ssh.sh
-      - name: Format check
-        run: cargo fmt --check
-      - name: Preserve validation material
-        if: always()
-        shell: bash
-        run: |
-          cargo fmt
-          git diff -- src tests > formatting.patch
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: validation-${{ matrix.os }}
-          path: |
-            Cargo.lock
-            formatting.patch
-            src/
-            tests/
-            scripts/

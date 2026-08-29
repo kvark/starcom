@@ -3,81 +3,71 @@
 **Session Terminal And Remote COMmander.**
 
 A small graphical client for persistent remote tmux sessions. The client targets
-Linux, macOS, and Windows; remote hosts initially target Linux with ordinary
-OpenSSH and tmux. No Starcom server, patched tmux, or additional listening port.
+Linux, macOS, and Windows; remote hosts initially target Linux with stock SSH
+and tmux. No Starcom server, patched tmux, or additional listening port.
 
-Starcom is a sister project to [FileMan](https://github.com/kvark/fileman): Rust,
-simple modules, few dependencies, and Blade + egui rather than a large
-application framework.
+A sister project to [FileMan](https://github.com/kvark/fileman): Rust, simple
+modules, few dependencies, and eventually Blade + egui for the desktop interface.
 
 ## Status
 
-**The headless foundation is implemented; the desktop application is not yet
-usable.** There is no live SSH connection, GUI, or automatic reconnect loop yet.
-See [PLAN.md](PLAN.md) for the architecture, decisions, acceptance criteria, and
-ordered roadmap.
+**M0 is implemented; M1 has a working read-only SSH inspection path. There is no
+GUI, interactive remote terminal, or automatic reconnect loop yet.**
 
-Implemented modules provide bounded tmux control-mode framing and command/reply
-handling, typed command construction, connection epochs and input gating,
-Alacritty terminal models, and a synthetic multi-pane replay CLI. Twenty-five
-unit/integration tests run without tmux, SSH, a display, or a GPU. CI runs the
-build, tests, Clippy, and formatting checks on Linux, macOS, and Windows.
+The foundation provides bounded tmux control framing, typed commands, connection
+epochs, input gating, Alacritty terminal models, and synthetic replay. The new
+embedded `ssh2` backend verifies host keys before authentication and attaches to
+existing sessions through a non-PTY SSH channel. `starcom-inspect` discovers panes
+and prints bounded, escaped text captures without sending pane input or resizing.
 
-Only three direct dependencies are currently needed: `alacritty_terminal`,
-`tmuxctl` (without its runtime drivers), and `anyhow`. The embedded SSH backend
-and matching FileMan GUI dependencies will be introduced with their respective
-implementations, not as unused scaffolding.
+These captures are observations made at different times, **not atomic snapshots
+or restored emulator state**. Correct snapshot/live-output synchronization is
+still outstanding. See [PLAN.md](PLAN.md) for the overall roadmap and
+[docs/SSH.md](docs/SSH.md) for current M1 scope, limitations, and next steps.
 
-## Try the foundation
+## Try live inspection
 
-Requires Rust 1.96 or newer (tmuxctl's minimum supported version).
+Requires Rust 1.96+, a C toolchain/OpenSSL development setup, and a Linux host
+with an existing tmux session. Replace the example host, user, and session:
+
+```sh
+cargo run --locked --bin starcom-inspect -- \
+  --host server.example.com --user your-user --session work \
+  --known-hosts "$HOME/.ssh/known_hosts" --agent
+```
+
+Use `--identity /path/to/key` instead of `--agent` for an unencrypted private key.
+For an encrypted key, load it into your SSH agent first. Trust must already be
+established in the supplied known-hosts file; unknown or changed keys are refused.
+
+This first transport does not read SSH config aliases, Include, or ProxyJump.
+Pass settings explicitly. `--port`, `--socket`, `--history`, and `--timeout` are
+available; run `--help` for details. No local `ssh` executable is used.
+
+## Replay and tests
 
 ```sh
 cargo run --locked -- --replay tests/data/two-panes.tmux
 cargo test --locked --all-targets
+cargo test --locked --no-default-features --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The replay command prints escaped snapshots of two independent terminal models.
-It uses fixed 80x24 panes unless `--size COLSxROWS` is specified. It is a
-correctness harness, not a general capture importer: live topology changes,
-initial screen/history restoration, and network transport are not implemented.
-Use `--help` for the small CLI surface.
+Default features include SSH. `--no-default-features` retains the network-free
+core. Linux live integration tests run through `scripts/test-ssh.sh`, which
+creates and removes its own loopback sshd, keys, agent, and isolated tmux socket.
+It requires OpenSSH, tmux, Python, and sudo. It never uses your default tmux server.
 
-## Architecture
-
-```text
-Blade + egui GUI                  Linux host
-        |                            |
-terminal models                 ordinary sshd
-        |                            |
-tmux control protocol <--- SSH ---> tmux -C
-                                     |
-                              existing tmux server
-                                     |
-                              shells / applications
-```
-
-Use tmux's documented control mode, not its private Unix-domain IPC. The SSH
-transport is independent of the protocol engine. Embedded SSH is the intended
-primary transport; a system-SSH adapter may be provided for complex environments.
-
-Reconnect must reconstruct the pane state before enabling input. A successful
-SSH handshake is not a restored session, and uncertain keystrokes must never be
-silently replayed. Those rules are already represented in the state model;
-actual transport/recovery integration remains the next stage of work.
+CI checks Windows, macOS, and Linux builds/tests, plus real Linux SSH/tmux tests.
+Native desktop input, clipboard, IME, and real application workflows are not yet
+implemented or validated. No performance claims are made.
 
 ## Development
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) for organization, style, and validation.
-The project starts as one Rust 2024 package with reusable library modules and a
-small executable. Keep network and GUI dependencies outside the protocol/state
-modules, and preserve wire fixture bytes across platforms.
-
-The next milestone is attaching to an existing tmux session over embedded SSH,
-with verified host keys and correct initial topology/screen synchronization.
-Blade/egui views, selection, and divider resizing follow that foundation.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for FileMan-style organization and checks.
+The project is one Rust 2024 package with reusable library modules. The GUI will
+use FileMan's matching Blade/egui/winit dependency set, not GPUI or eframe.
 
 ## License
 
