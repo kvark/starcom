@@ -20,7 +20,7 @@ pub(crate) enum Action {
     New,
     Select(u64),
     Close(u64),
-    Tab(u64, ui::Action),
+    Tab(u64, Box<ui::Action>),
 }
 
 pub(crate) struct Workspace {
@@ -247,12 +247,17 @@ impl Workspace {
         let action = root
             .push_id(tab.id, |root| tab.ui.show(root, &mut tab.client.lock()))
             .inner;
-        Action::Tab(tab.id, action)
+        Action::Tab(tab.id, Box::new(action))
     }
 
     /// Apply once, after egui finished its potentially repeated layout passes.
     pub fn apply(&mut self, action: Action, mut clipboard: impl FnMut() -> Option<String>) {
-        if matches!(action, Action::None | Action::Tab(_, ui::Action::None)) {
+        let nothing_to_do = match &action {
+            Action::None => true,
+            Action::Tab(_, tab_action) => matches!(**tab_action, ui::Action::None),
+            _ => false,
+        };
+        if nothing_to_do {
             return;
         }
         let result = (|| -> anyhow::Result<()> {
@@ -289,7 +294,7 @@ impl Workspace {
                     else {
                         return Ok(());
                     };
-                    let result = match action {
+                    let result = match *action {
                         ui::Action::None => Ok(()),
                         ui::Action::Connect(connection) => {
                             let label = format!(
@@ -404,7 +409,10 @@ mod tests {
         let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
         let original = workspace.tabs[0].id;
         workspace.new_tab().unwrap();
-        workspace.apply(Action::Tab(original, ui::Action::Disconnect), || None);
+        workspace.apply(
+            Action::Tab(original, Box::new(ui::Action::Disconnect)),
+            || None,
+        );
         assert_eq!(workspace.tabs[0].client.phase(), desktop::Phase::Demo);
         assert_eq!(workspace.tabs[1].client.phase(), desktop::Phase::Idle);
     }
@@ -583,7 +591,10 @@ mod tests {
         )
         .unwrap();
         let before = count.load(sync::atomic::Ordering::Relaxed);
-        workspace.apply(Action::Tab(workspace.tabs[0].id, ui::Action::None), || None);
+        workspace.apply(
+            Action::Tab(workspace.tabs[0].id, Box::new(ui::Action::None)),
+            || None,
+        );
         assert_eq!(count.load(sync::atomic::Ordering::Relaxed), before);
     }
 }

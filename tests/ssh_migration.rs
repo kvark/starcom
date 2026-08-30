@@ -737,10 +737,18 @@ fn a_restarted_server_is_reported_as_a_replacement() {
         command.stderr(std::process::Stdio::null());
         command
     };
+    // `kill-server` returns before the old server has finished exiting, and a
+    // `new-session` landing on one still shutting down fails with "server exited
+    // unexpectedly". That is a fixture race, not a product failure, so retry it
+    // rather than failing the run; twelve attempts 10ms apart stay inside the
+    // 350ms replacement budget asserted below. Report tmux's own message on the
+    // way out: `private()` silences stderr, which left CI with a bare assertion.
     let start = || {
-        assert!(
-            private()
+        let mut last = String::new();
+        for _ in 0..12 {
+            let attempt = private()
                 .env_remove("TMUX")
+                .stderr(std::process::Stdio::piped())
                 .args([
                     "-f",
                     "/dev/null",
@@ -754,10 +762,15 @@ fn a_restarted_server_is_reported_as_a_replacement() {
                     "24",
                     "cat > /dev/null",
                 ])
-                .status()
-                .unwrap()
-                .success()
-        );
+                .output()
+                .unwrap();
+            if attempt.status.success() {
+                return;
+            }
+            last = String::from_utf8_lossy(&attempt.stderr).trim().to_owned();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("tmux never started the replacement server: {last}");
     };
     let _ = private().args(["kill-server"]).status();
     start();
