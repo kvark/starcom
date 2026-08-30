@@ -108,6 +108,12 @@ jobs:
           cargo vendor --versioned-dirs --manifest-path "$BUNDLE/source/Cargo.toml" "$BUNDLE/vendor" > "$BUNDLE/vendor-config.toml"
           cargo tree --manifest-path "$BUNDLE/source/Cargo.toml" --all-features > "$BUNDLE/dependencies.txt"
           tar -C "$BUNDLE" -czf "$RUNNER_TEMP/starcom-recovery.tar.gz" source original recovered-tree.json vendor vendor-config.toml dependencies.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starcom-recovered-source
+          path: ${{ runner.temp }}/starcom-recovery.tar.gz
+          compression-level: 0
+          retention-days: 7
       - name: Export portable Rust toolchain and isolated test executables
         shell: bash
         run: |
@@ -116,23 +122,18 @@ jobs:
           sudo apt-get install -y openssh-server tmux
           SYSROOT=$(rustc --print sysroot)
           mkdir -p "$RUNNER_TEMP/toolchain" "$RUNNER_TEMP/fixture/bin" "$RUNNER_TEMP/fixture/lib"
-          cp -a "$SYSROOT/bin" "$SYSROOT/lib" "$SYSROOT/libexec" "$RUNNER_TEMP/toolchain/" 2>/dev/null || true
+          for entry in bin lib libexec; do
+            if test -d "$SYSROOT/$entry"; then cp -a "$SYSROOT/$entry" "$RUNNER_TEMP/toolchain/"; fi
+          done
           test -x "$RUNNER_TEMP/toolchain/bin/rustc"
-          rm -f "$RUNNER_TEMP/toolchain/bin/rustdoc"
           for name in tmux ssh ssh-keygen ssh-agent ssh-add sshd; do
             exe=$(command -v "$name" || echo /usr/sbin/sshd)
             cp "$exe" "$RUNNER_TEMP/fixture/bin/$name"
-            ldd "$exe" | awk '/=> \/ {print $3}' | while read -r lib; do cp -L "$lib" "$RUNNER_TEMP/fixture/lib/"; done
+            ldd "$exe" | awk '$2 == "=>" {print $3}' | while read -r lib; do cp -L "$lib" "$RUNNER_TEMP/fixture/lib/"; done
           done
           if test -f /usr/lib/openssh/sshd-session; then cp /usr/lib/openssh/sshd-session "$RUNNER_TEMP/fixture/bin/"; fi
           rustc --version > "$RUNNER_TEMP/toolchain/VERSION"
           tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/starcom-toolchain.tar.gz" toolchain fixture
-      - uses: actions/upload-artifact@v4
-        with:
-          name: starcom-recovered-source
-          path: ${{ runner.temp }}/starcom-recovery.tar.gz
-          compression-level: 0
-          retention-days: 7
       - uses: actions/upload-artifact@v4
         with:
           name: starcom-offline-toolchain
