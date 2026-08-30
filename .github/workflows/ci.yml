@@ -49,55 +49,93 @@ jobs:
         run: scripts/test-ssh.sh
 
   desktop-development-inputs:
-    # Temporary, read-only dependency export for the desktop implementation.
-    # Kept in the existing workflow: no branch-push or additional triggers.
+    # Temporary recovery/export; never publishes application code or credentials.
+    # Removed once the recovered desktop and transport pass validation.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - name: Resolve and export the matching GUI and pure-Rust SSH dependency set
+        with:
+          components: rustfmt, clippy
+      - name: Recover uploaded source objects and resolve Rust-native SSH candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/desktop-inputs/source" "$RUNNER_TEMP/desktop-inputs/fileman"
-          git archive HEAD | tar -x -C "$RUNNER_TEMP/desktop-inputs/source"
-          export BUNDLE="$RUNNER_TEMP/desktop-inputs"
+          export BUNDLE="$RUNNER_TEMP/recovery"
+          mkdir -p "$BUNDLE/source" "$BUNDLE/original"
+          git archive HEAD | tar -x -C "$BUNDLE/original"
           python3 - <<'PY'
-          import os, pathlib
-          p = pathlib.Path(os.environ['BUNDLE']) / 'source' / 'Cargo.toml'
+          import base64, concurrent.futures, hashlib, json, os, pathlib, urllib.request
+          root = pathlib.Path(os.environ['BUNDLE'])
+          api = 'https://api.github.com/repos/kvark/starcom/git/'
+          def get(path):
+              req = urllib.request.Request(api + path, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          tree = get('trees/536c3ae32ae13f0a52d1df98d8168e9277cc55b1?recursive=1')
+          assert not tree['truncated']
+          (root / 'recovered-tree.json').write_text(json.dumps(tree, indent=2))
+          def save(entry):
+              if entry['type'] != 'blob':
+                  return
+              rel = pathlib.PurePosixPath(entry['path'])
+              assert not rel.is_absolute() and '..' not in rel.parts
+              blob = get('blobs/' + entry['sha'])
+              data = base64.b64decode(blob['content'])
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == entry['sha']
+              out = root / 'source' / rel
+              out.parent.mkdir(parents=True, exist_ok=True)
+              out.write_bytes(data)
+              out.chmod(0o755 if entry['mode'] == '100755' else 0o644)
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+              list(pool.map(save, tree['tree']))
+          p = root / 'source' / 'Cargo.toml'
           s = p.read_text()
-          dependencies = '''puressh = { version = "=0.1.3", default-features = false, features = ["client", "multichannel"], optional = true }
-          blade-egui = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
-          blade-graphics = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
-          egui = { version = "0.34", optional = true }
-          egui-winit = { version = "0.34", default-features = false, features = ["clipboard", "wayland", "x11"], optional = true }
-          winit = { version = "0.30.5", optional = true }
-          png = { version = "0.18", optional = true }
-          log = { version = "0.4", optional = true }
-          env_logger = { version = "0.11", optional = true }
-          '''
-          s = s.replace('ssh2 = { version = "0.9.6", optional = true }\npolling = { version = "3.11", optional = true }\nbase64 = { version = "0.22", optional = true }', dependencies.rstrip())
-          start = s.index('[target.\'cfg(windows)\'.dependencies]')
+          s = s.replace('ssh2 = { version = "0.9.6", optional = true }', 'sunset = { version = "=0.6.0", default-features = false, features = ["std", "openssh-key", "rsa", "ecdsa256"], optional = true }\nssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "ed25519", "rsa", "p256", "encryption"], optional = true }\nhmac = { version = "0.13", optional = true }\nsha1 = { version = "0.11", optional = true }\nzeroize = { version = "1", optional = true }')
+          start = s.index('# Use OpenSSL on Windows')
           end = s.index('[features]', start)
           s = s[:start] + s[end:]
-          s = s.replace('default = ["ssh"]', 'default = ["ssh", "gui"]')
-          s = s.replace('ssh = ["dep:ssh2", "dep:polling", "dep:base64"]', 'ssh = ["dep:puressh"]')
+          s = s.replace('ssh = ["dep:ssh2", "dep:polling", "dep:base64"]', 'ssh = ["dep:sunset", "dep:ssh-key", "dep:hmac", "dep:sha1", "dep:zeroize", "dep:polling", "dep:base64"]')
           s = s.replace('vendored-openssl = ["ssh", "ssh2/vendored-openssl"]\n', '')
-          s = s.replace('ssh = ["dep:puressh"]', 'ssh = ["dep:puressh"]\ngui = ["ssh", "dep:blade-egui", "dep:blade-graphics", "dep:egui", "dep:egui-winit", "dep:winit", "dep:png", "dep:log", "dep:env_logger"]')
-          s += '\n[lints.rust]\nunexpected_cfgs = { level = "warn", check-cfg = [\'cfg(gles)\'] }\n'
           p.write_text(s)
           PY
           cargo vendor --versioned-dirs --manifest-path "$BUNDLE/source/Cargo.toml" "$BUNDLE/vendor" > "$BUNDLE/vendor-config.toml"
-          git clone --depth 1 https://github.com/kvark/fileman.git "$RUNNER_TEMP/fileman"
-          cp "$RUNNER_TEMP/fileman/src/main.rs" "$RUNNER_TEMP/fileman/src/snapshot_render.rs" "$RUNNER_TEMP/fileman/Cargo.toml" "$RUNNER_TEMP/fileman/CONTRIBUTING.md" "$BUNDLE/fileman/"
-          git -C "$RUNNER_TEMP/fileman" rev-parse HEAD > "$BUNDLE/fileman/REVISION"
-          tar -C "$BUNDLE" -czf "$RUNNER_TEMP/desktop-inputs.tar.gz" source vendor vendor-config.toml fileman
+          cargo tree --manifest-path "$BUNDLE/source/Cargo.toml" --all-features > "$BUNDLE/dependencies.txt"
+          tar -C "$BUNDLE" -czf "$RUNNER_TEMP/starcom-recovery.tar.gz" source original recovered-tree.json vendor vendor-config.toml dependencies.txt
+      - name: Export portable Rust toolchain and isolated test executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y openssh-server tmux
+          SYSROOT=$(rustc --print sysroot)
+          mkdir -p "$RUNNER_TEMP/toolchain" "$RUNNER_TEMP/fixture/bin" "$RUNNER_TEMP/fixture/lib"
+          cp -a "$SYSROOT/bin" "$SYSROOT/lib" "$SYSROOT/libexec" "$RUNNER_TEMP/toolchain/" 2>/dev/null || true
+          test -x "$RUNNER_TEMP/toolchain/bin/rustc"
+          rm -f "$RUNNER_TEMP/toolchain/bin/rustdoc"
+          for name in tmux ssh ssh-keygen ssh-agent ssh-add sshd; do
+            exe=$(command -v "$name" || echo /usr/sbin/sshd)
+            cp "$exe" "$RUNNER_TEMP/fixture/bin/$name"
+            ldd "$exe" | awk '/=> \/ {print $3}' | while read -r lib; do cp -L "$lib" "$RUNNER_TEMP/fixture/lib/"; done
+          done
+          if test -f /usr/lib/openssh/sshd-session; then cp /usr/lib/openssh/sshd-session "$RUNNER_TEMP/fixture/bin/"; fi
+          rustc --version > "$RUNNER_TEMP/toolchain/VERSION"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/starcom-toolchain.tar.gz" toolchain fixture
       - uses: actions/upload-artifact@v4
         with:
-          name: desktop-development-inputs
-          path: ${{ runner.temp }}/desktop-inputs.tar.gz
+          name: starcom-recovered-source
+          path: ${{ runner.temp }}/starcom-recovery.tar.gz
+          compression-level: 0
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starcom-offline-toolchain
+          path: ${{ runner.temp }}/starcom-toolchain.tar.gz
+          compression-level: 0
           retention-days: 1
