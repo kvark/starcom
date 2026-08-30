@@ -557,3 +557,68 @@ fn snapshot_refuses_yielding_user_hooks_without_removing_them() {
     assert_eq!(before, tmux(&["show-hooks", "-t", &fixture.name]));
     assert!(!marker.exists(), "capture ran before rejecting the hook");
 }
+
+/// M4: asking what exists must never bring a tmux server into existence, and
+/// creating one must be a separate, deliberate act that does not attach.
+#[test]
+#[ignore = "requires the isolated SSH/tmux fixture"]
+fn discovery_never_starts_a_server_and_creation_is_explicit() {
+    use starcom::sessions;
+
+    let socket = root().join("tmux.sock");
+    let listed = sessions::list(&options(), socket.to_str()).unwrap();
+    assert!(
+        listed.iter().any(|summary| summary.name == "starcom"),
+        "the fixture session was not listed: {listed:?}"
+    );
+    for summary in &listed {
+        // A listed name must be one the attach path would accept.
+        assert!(core::SessionName::new(summary.name.clone()).is_ok());
+    }
+
+    // A socket with no server must report that, and must still not exist after.
+    let absent = root().join("discovery-absent.sock");
+    assert!(!absent.exists());
+    let error = format!(
+        "{:#}",
+        sessions::list(&options(), absent.to_str()).unwrap_err()
+    );
+    // tmux words this differently for a default socket and an explicit -S path.
+    assert!(
+        error.contains("no server running") || error.contains("error connecting to"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !absent.exists(),
+        "listing sessions started a tmux server on a socket that had none"
+    );
+
+    // Creating is the one path allowed to start a server, and it does not attach.
+    let created = core::SessionName::new("starcom-created").unwrap();
+    sessions::create(
+        &options(),
+        absent.to_str(),
+        &created,
+        core::Size::new(90, 25).unwrap(),
+    )
+    .unwrap();
+    assert!(absent.exists(), "creation did not start the server");
+    let listed = sessions::list(&options(), absent.to_str()).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "starcom-created");
+    assert_eq!(
+        listed[0].attached, 0,
+        "creating a session must not attach to it"
+    );
+
+    // The fixture's own server is untouched by all of this.
+    assert_eq!(
+        tmux(&["list-sessions", "-F", "#{session_name}"]).trim(),
+        "starcom"
+    );
+    let _ = process::Command::new("tmux")
+        .arg("-S")
+        .arg(&absent)
+        .arg("kill-server")
+        .status();
+}

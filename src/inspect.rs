@@ -620,10 +620,6 @@ pub(crate) struct Identity {
     pub created: u64,
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
 #[cfg(test)]
 fn attach_command(session: &core::SessionName, socket: Option<&str>) -> anyhow::Result<String> {
     attach_command_with_access(session, socket, session::Access::ReadOnly)
@@ -641,7 +637,7 @@ fn attach_command_with_access(
             "invalid tmux socket path"
         );
         command.push_str(" -S ");
-        command.push_str(&shell_quote(socket));
+        command.push_str(&command::shell_quote(socket)?);
     }
     // -N forbids starting a server. -E leaves session environment untouched.
     // read-only is a UI safety flag, not an authorization sandbox for commands.
@@ -650,7 +646,7 @@ fn attach_command_with_access(
         command.push_str("read-only,");
     }
     command.push_str("ignore-size,no-output -t ");
-    command.push_str(&shell_quote(&format!("={}", session.as_str())));
+    command.push_str(&command::shell_quote(&format!("={}", session.as_str()))?);
     Ok(command)
 }
 

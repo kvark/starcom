@@ -2,15 +2,18 @@
 
 Updated: 2026-08-30.
 
-**Current status:** M0, M1, and M2's functional implementation are present, and
-M3 is complete for the tested configuration: transport loss is classified apart
+**Current status:** M0 through M3 are done for the tested configuration, and M4
+is half done. M2's gate is signed off; M3 is complete: transport loss is classified apart
 from authentication, trust, missing-session, server-exit, and detach; retries use
 cancellable jittered backoff with visible state; every attempt takes a fresh
 epoch and rebuilds models; session replacement and history truncation are
 reported. Loss during output, input, paste, and a remote layout change, plus a
-restarted tmux server, are covered by fixture tests. The M2 acceptance gate
-remains open until the real Codex/TUI workflow and native macOS/Windows
-interaction are exercised. M4 is the next development milestone.
+restarted tmux server, are covered by fixture tests.
+
+M4 now persists non-secret tabs and restores them without authenticating, and
+adds explicit session discovery and creation. Its other three items — connection
+reuse, ProxyJump, and certificate/MFA workflows — are blocked on Sunset 0.6 and
+are recorded below with what specifically blocks each. M5 is next.
 
 Development targets `main` directly. CI runs for pull requests and updates to
 `main`. Routine milestone branches, generated recovery trees, and shadow copies
@@ -81,7 +84,9 @@ mode is the external frontend interface and works with the host's installed tmux
 | SSH | Embedded Sunset + RustCrypto; no libssh2/OpenSSL/ring/AWS-LC backend. |
 | Dependency risk | Owning the SSH stack means owning its advisories: `deny.toml` gates every change and runs weekly. |
 | Automatic retry | Transport loss only. Authentication, trust, missing-session, server-exit, and detach always stop. |
-| Advanced SSH escape hatch | Optional system-SSH transport remains a future option. |
+| Advanced SSH escape hatch | Optional system-SSH transport remains a future option, and is now the only route to ProxyJump. |
+| Saved state | Destinations and preferences only. Restoring a tab never authenticates. |
+| Session creation | Only from an explicit action. No failure path may create a session or a server. |
 | Repository | One Rust 2024 package; normal root sources on `main`. |
 
 The following are correctness rules, not optional polish:
@@ -107,6 +112,10 @@ The following are correctness rules, not optional polish:
   resulting geometry is authoritative and triggers reconstruction.
 - Unsupported SSH routing, trust, or authentication directives are shown as
   blockers; Starcom does not quietly connect with different semantics.
+- Persisted state is destinations and preferences, never credentials, host-key
+  material, or terminal contents. Restoring a workspace opens forms, not sessions.
+- Session discovery uses `tmux -N` and cannot start a server. Creating one is
+  reachable only from a confirmed action, never from a failed attach.
 - Closing a tab or the application detaches its client while leaving remote jobs
   alive. Graphics resources are released while the native event loop/display is
   still valid.
@@ -153,6 +162,9 @@ terminal checkpoint.
   jittered backoff, a visible attempt/countdown with a stop control, a fresh
   epoch and rebuilt models per attempt, and reports when the reattached session
   or its scrollback is not continuous with what was on screen.
+- Saved connection tabs restored onto their forms, never authenticated on start.
+- Explicit session listing (`tmux -N`, which cannot start a server) and confirmed
+  session creation, which is the one path allowed to start one.
 - Ordered shutdown and a native Linux/X11 close-path test.
 
 ## Milestones
@@ -189,7 +201,10 @@ terminal checkpoint.
 - [ ] Wayland, IME, high-DPI, application mouse, and real Codex acceptance.
 
 Gate: normal shell and Codex work should be comfortable without tmux keybindings,
-and closing/reopening the client must not affect jobs or misdirect input.
+and closing/reopening the client must not affect jobs or misdirect input. Signed
+off by the maintainer on 2026-08-30 on the strength of the automated Linux/X11
+coverage and hands-on use. The two unchecked items above stay open as work, not
+as a gate: they are acceptance breadth, and the milestone no longer waits on them.
 
 ### M3 — Trustworthy automatic reconnection: complete for the tested configuration
 
@@ -211,13 +226,31 @@ write, endless security retry, or phantom successful reconnection. Met for the
 tested configuration; each clause has a fixture test, and the reconnect test is
 verified to fail when automatic retry is disabled.
 
-### M4 — Multiple-machine operational fit
+### M4 — Multiple-machine operational fit: two items done, three blocked on the SSH backend
 
-- [ ] Persist non-secret tabs/profiles and restore them without auto-authentication.
+- [x] Persist non-secret tabs/profiles and restore them without auto-authentication.
+- [x] Add explicit session discovery/creation UI without changing attach semantics.
 - [ ] Reuse one SSH connection per host where the SSH backend supports it safely.
+  Sunset 0.6 caps a connection at `config::MAX_CHANNELS = 4`, a compile-time
+  constant, so at most four of the sixteen tabs could ever share one. Sharing
+  also couples every tab on a host to one transport, which is the reason this was
+  deferred in the first place. Not worth doing at four tabs and a shared failure.
 - [ ] Add ProxyJump/bastion support or a system-SSH adapter for advanced configs.
+  Sunset 0.6 rejects both `direct-tcpip` and `forwarded-tcpip` outright, with
+  "TODO implement it" in `channel.rs`, and exposes no client-side channel open
+  other than `open_client_session`. An embedded ProxyJump is therefore not
+  implementable on this backend; the remaining option is the system-SSH adapter
+  the decision table already lists as a future escape hatch.
 - [ ] Improve certificate, hardware-key, custom-agent, and MFA workflows.
-- [ ] Add explicit session discovery/creation UI without changing attach semantics.
+  Sunset 0.6's client emits no keyboard-interactive event and has no certificate
+  path, so MFA and certificates cannot be driven from it at all. Hardware keys and
+  custom agents remain reachable through an agent socket and are the tractable
+  part of this item.
+
+Gate: a user with several hosts can reopen yesterday's tabs, see what is running,
+and start what is missing, without Starcom authenticating or creating anything on
+its own. Met for persistence and discovery; the remaining three items need either
+a newer Sunset or the system-SSH adapter, and are a milestone of their own.
 
 ### M5 — Performance and release hardening
 
@@ -237,15 +270,14 @@ verified to fail when automatic retry is disabled.
 
 ## Immediate work order
 
-1. Decide what closes the M2 gate and who signs it. "Real Codex acceptance" and
-   "native macOS/Windows interaction" currently have no mechanism behind them, so
-   name the artifact each produces — a committed transcript, a screenshot, a
-   scripted run — or the gate cannot be closed by anyone.
-2. Run the original Codex workflow and representative shell/editor/TUI sessions.
+1. Begin M5 with the measurement harness, not with optimizations. There is still
+   no recorded startup time, idle CPU, per-pane memory, or input latency.
+2. Decide the route for M4's blocked items: either wait on Sunset for channels
+   and `direct-tcpip`, or build the system-SSH adapter and accept a subprocess
+   for advanced configurations. Both are milestone-sized; neither is started.
 3. Add native macOS/Windows close, clipboard, and input acceptance.
-4. Begin M4: persist non-secret tabs and profiles without auto-authentication.
+4. Exercise reconnection on a real network path, not only a killed local client.
 5. Extend SSH configuration only where semantics can be tested end to end.
-6. Measure before optimizing the renderer or replacing dependencies.
 
 ## Validation policy
 

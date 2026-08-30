@@ -54,9 +54,44 @@ The parser never executes configuration commands. `Match`, `ProxyJump`,
 overrides, and other routing/security policy are displayed as blockers. Starcom
 does not silently bypass them by connecting directly or choosing another key.
 
-Use **Reload config** after editing the file. Settings are not persisted yet.
-Unknown or changed host keys fail instead of being accepted automatically. See
-[SSH.md](SSH.md) for the exact trust and authentication policy.
+Use **Reload config** after editing the file. Unknown or changed host keys fail
+instead of being accepted automatically. See [SSH.md](SSH.md) for the exact trust
+and authentication policy.
+
+## Saved tabs
+
+Open tabs are saved to `~/.config/starcom/workspace.conf` (`%APPDATA%\starcom\`
+on Windows, or `$XDG_CONFIG_HOME` where it is set) and reopened next time.
+
+What is saved is where a tab points and how it should connect: destination alias,
+host, user, port, session name, tmux socket, history depth, whether it is
+interactive, whether it reconnects, and whether it uses the agent or an identity
+file. Nothing that would let a reader of that file connect is written: no keys,
+no passphrases, no host-key material, and no terminal contents. An identity entry
+is the path you already chose, never the key behind it.
+
+Restored tabs open on their connection form with the fields filled in. Starcom
+does not connect or authenticate at startup — you press **Connect**, exactly as
+on a cold start. A saved file that cannot be read is reported and left untouched
+rather than replaced with a guess.
+
+The demo neither reads nor writes this file.
+
+## Finding and creating sessions
+
+**List sessions** asks the host what exists. It runs `tmux -N`, so asking can
+never bring a tmux server into existence: a host with no tmux running says so.
+Choosing a listed session fills the session field; it does not attach.
+
+**Create session** makes the named session on the host, after a confirmation that
+says plainly that this starts a tmux server if none is running. It is the only
+path in Starcom that may start one, it is reachable only from that button, and it
+leaves the new session detached — you still press **Connect** to attach. No
+failure anywhere else falls back to it: an attach that cannot find its session
+still fails, exactly as before.
+
+Both run on the tab's worker over their own short-lived connection, so neither
+blocks the window or disturbs a live attachment.
 
 ## Terminal input
 

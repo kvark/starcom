@@ -13,11 +13,15 @@ pub mod reconnect;
 pub mod replay;
 #[cfg(feature = "ssh")]
 pub mod session;
+#[cfg(feature = "ssh")]
+pub mod sessions;
 pub mod snapshot;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 #[cfg(feature = "ssh")]
 pub mod ssh_config;
+#[cfg(feature = "gui")]
+pub mod store;
 pub mod terminal;
 
 #[cfg(feature = "gui")]

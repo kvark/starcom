@@ -1,9 +1,9 @@
 //! Connection tabs own independent clients, forms, selection and input tokens.
 //! A new tab displays a form, never a sidebar alongside somebody else's panes.
 
-use std::sync;
+use std::{path, sync};
 
-use crate::{desktop, ssh_config, ui};
+use crate::{desktop, ssh_config, store, ui};
 
 const MAX_TABS: usize = 16;
 type Wake = sync::Arc<dyn Fn() + Send + Sync>;
@@ -31,6 +31,24 @@ pub(crate) struct Workspace {
     config: sync::Arc<ssh_config::Config>,
     config_error: Option<String>,
     notice: Option<String>,
+    /// Where saved tabs live. None disables persistence entirely, which is what
+    /// happens with no home directory and in the demo.
+    store: Option<path::PathBuf>,
+}
+
+/// A restored tab is labelled by where it points, not by a live connection.
+fn label(tab: &store::Tab) -> String {
+    let destination = if tab.destination.trim().is_empty() {
+        tab.host.trim()
+    } else {
+        tab.destination.trim()
+    };
+    match (destination.is_empty(), tab.session.trim()) {
+        (true, "") => "New connection".to_owned(),
+        (true, session) => session.to_owned(),
+        (false, "") => destination.to_owned(),
+        (false, session) => format!("{destination} / {session}"),
+    }
 }
 
 impl Workspace {
@@ -43,17 +61,74 @@ impl Workspace {
             config: sync::Arc::new(ssh_config::Config::default()),
             config_error: None,
             notice: None,
+            // The demo must not read or overwrite a real saved workspace.
+            store: (startup != desktop::Startup::Demo)
+                .then(desktop::home_path)
+                .flatten()
+                .map(|home| store::path(&home)),
         };
         if startup != desktop::Startup::Demo {
             workspace.reload_config();
+            workspace.restore();
         }
-        workspace.new_tab()?;
+        if workspace.tabs.is_empty() {
+            workspace.new_tab()?;
+        }
         if startup == desktop::Startup::Demo {
             workspace.tabs[0].client.demo()?;
             workspace.tabs[0].label = "Demo".into();
             workspace.tabs[0].ui.open_terminal();
         }
         Ok(workspace)
+    }
+
+    /// Reopen saved tabs on their connection forms. Restoring never connects and
+    /// never authenticates: the user presses Connect, exactly as on a cold start.
+    fn restore(&mut self) {
+        let Some(ref file) = self.store else { return };
+        let saved = match store::load(file) {
+            Ok(Some(saved)) => saved,
+            Ok(None) => return,
+            Err(error) => {
+                // Report it and start clean, but do NOT overwrite the file we
+                // could not read; the user may still want to repair it.
+                self.notice = Some(format!(
+                    "Could not read saved tabs ({error:#}); starting with one new tab. \
+                     The file was left as it is."
+                ));
+                self.store = None;
+                return;
+            }
+        };
+        for tab in saved.tabs {
+            if self.new_tab().is_err() {
+                break;
+            }
+            let index = self.tabs.len() - 1;
+            self.tabs[index].label = label(&tab);
+            self.tabs[index].ui.restore(tab);
+        }
+        self.active = saved.active.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// Persist after a change to which tabs exist or where they point. Failure
+    /// is reported once and then disables saving, rather than repeating on
+    /// every action.
+    fn persist(&mut self) {
+        let Some(ref file) = self.store else { return };
+        let saved = store::Workspace {
+            tabs: self
+                .tabs
+                .iter()
+                .take(store::MAX_TABS)
+                .map(|tab| tab.ui.saved())
+                .collect(),
+            active: self.active,
+        };
+        if let Err(error) = store::save(file, &saved) {
+            self.notice = Some(format!("Could not save tabs: {error:#}"));
+            self.store = None;
+        }
     }
 
     fn new_tab(&mut self) -> anyhow::Result<()> {
@@ -183,11 +258,15 @@ impl Workspace {
         let result = (|| -> anyhow::Result<()> {
             match action {
                 Action::None => {}
-                Action::New => self.new_tab()?,
+                Action::New => {
+                    self.new_tab()?;
+                    self.persist();
+                }
                 Action::Select(id) => {
                     if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
                         self.cancel_transient();
                         self.active = index;
+                        self.persist();
                     }
                 }
                 Action::Close(id) => {
@@ -201,9 +280,11 @@ impl Workspace {
                         if self.tabs.is_empty() {
                             self.new_tab()?;
                         }
+                        self.persist();
                     }
                 }
                 Action::Tab(id, action) => {
+                    let mut save = false;
                     let Some(tab) = self.tabs.get_mut(self.active).filter(|tab| tab.id == id)
                     else {
                         return Ok(());
@@ -216,15 +297,28 @@ impl Workspace {
                                 tab.ui.form.destination(),
                                 connection.session.as_str()
                             );
-                            tab.client.connect(connection).map(|()| {
+                            let started = tab.client.connect(connection).map(|()| {
                                 tab.label = label;
                                 tab.ui.open_terminal();
-                            })
+                            });
+                            // Remember where a successful connection pointed, so
+                            // the next start reopens the same form.
+                            save = started.is_ok();
+                            started
                         }
                         ui::Action::Demo => tab.client.demo().map(|()| {
                             tab.label = "Demo".into();
                             tab.ui.open_terminal();
                         }),
+                        ui::Action::ListSessions(connection) => {
+                            tab.client.list_sessions(connection)
+                        }
+                        ui::Action::CreateSession(connection) => {
+                            // A creation size only sets the new session's initial
+                            // geometry; tmux owns it from then on.
+                            tab.client
+                                .create_session(connection, crate::core::Size::default())
+                        }
                         ui::Action::Disconnect => {
                             tab.client.disconnect();
                             Ok(())
@@ -265,6 +359,9 @@ impl Workspace {
                     if let Err(error) = result {
                         tab.client.lock().error = Some(error.to_string());
                     }
+                    if save {
+                        self.persist();
+                    }
                 }
             }
             Ok(())
@@ -277,6 +374,8 @@ impl Workspace {
 
     pub fn shutdown(&mut self) {
         self.cancel_transient();
+        // Save before dropping the tabs: the forms are the thing being saved.
+        self.persist();
         self.tabs.clear();
     }
 }
@@ -309,6 +408,129 @@ mod tests {
         assert_eq!(workspace.tabs[0].client.phase(), desktop::Phase::Demo);
         assert_eq!(workspace.tabs[1].client.phase(), desktop::Phase::Idle);
     }
+    #[test]
+    fn saved_tabs_reopen_on_their_form_without_connecting() {
+        let directory = std::env::temp_dir().join(format!(
+            "starcom-workspace-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let file = directory.join("workspace.conf");
+        store::save(
+            &file,
+            &store::Workspace {
+                tabs: vec![
+                    store::Tab {
+                        destination: "dev".into(),
+                        host: "10.0.0.2".into(),
+                        user: "alice".into(),
+                        session: "work".into(),
+                        port: 2222,
+                        agent: true,
+                        history: 300,
+                        interactive: true,
+                        reconnect: true,
+                        ..store::Tab::default()
+                    },
+                    store::Tab {
+                        host: "build.example.test".into(),
+                        user: "bob".into(),
+                        session: "ci".into(),
+                        port: 22,
+                        agent: true,
+                        history: 200,
+                        ..store::Tab::default()
+                    },
+                ],
+                active: 1,
+            },
+        )
+        .unwrap();
+
+        let mut workspace = Workspace {
+            tabs: Vec::new(),
+            active: 0,
+            next: 1,
+            wake: sync::Arc::new(|| {}),
+            config: sync::Arc::new(ssh_config::Config::default()),
+            config_error: None,
+            notice: None,
+            store: Some(file.clone()),
+        };
+        workspace.restore();
+        assert_eq!(workspace.tabs.len(), 2);
+        assert_eq!(workspace.active, 1);
+        // The whole point: no tab may be connecting or connected at startup.
+        for tab in &workspace.tabs {
+            assert_eq!(
+                tab.client.phase(),
+                desktop::Phase::Idle,
+                "restoring a workspace must not authenticate"
+            );
+            assert!(tab.client.retry().is_none());
+        }
+        assert_eq!(workspace.tabs[0].label, "dev / work");
+        assert_eq!(workspace.tabs[1].label, "build.example.test / ci");
+        // Round-tripping through the live tabs must not lose or alter anything.
+        workspace.persist();
+        let reloaded = store::load(&file).unwrap().unwrap();
+        assert_eq!(reloaded.tabs.len(), 2);
+        assert_eq!(reloaded.tabs[0].host, "10.0.0.2");
+        assert_eq!(reloaded.tabs[0].port, 2222);
+        assert_eq!(reloaded.tabs[1].session, "ci");
+        assert_eq!(reloaded.active, 1);
+    }
+
+    #[test]
+    fn an_unreadable_saved_workspace_is_reported_and_left_alone() {
+        let directory = std::env::temp_dir().join(format!(
+            "starcom-workspace-bad-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("workspace.conf");
+        let original = "[tab]\nport not-a-number\n";
+        std::fs::write(&file, original).unwrap();
+        let mut workspace = Workspace {
+            tabs: Vec::new(),
+            active: 0,
+            next: 1,
+            wake: sync::Arc::new(|| {}),
+            config: sync::Arc::new(ssh_config::Config::default()),
+            config_error: None,
+            notice: None,
+            store: Some(file.clone()),
+        };
+        workspace.restore();
+        assert!(workspace.tabs.is_empty());
+        assert!(workspace.notice.is_some(), "the failure must be reported");
+        // A file we could not read must not be replaced by a guess.
+        workspace.new_tab().unwrap();
+        workspace.persist();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
+
     #[test]
     fn connections_and_tabs_are_bounded() {
         let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();

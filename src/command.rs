@@ -88,6 +88,16 @@ impl Command {
     }
 }
 
+/// Quote one value for the remote POSIX shell that runs the exec command.
+/// Rejects control characters outright rather than trying to encode them.
+pub(crate) fn shell_quote(value: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control),
+        "value cannot be placed in a remote command"
+    );
+    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputSizeError;
 
@@ -111,6 +121,18 @@ mod tests {
             command.as_bytes().iter().filter(|&&b| b == b'\n').count(),
             1
         );
+    }
+
+    #[test]
+    fn shell_quoting_neutralizes_metacharacters_and_rejects_controls() {
+        assert_eq!(
+            shell_quote("work's; $(id)").unwrap(),
+            "'work'\"'\"'s; $(id)'"
+        );
+        assert_eq!(shell_quote("/tmp/a b").unwrap(), "'/tmp/a b'");
+        for bad in ["", "a\nb", "a\0b", "a\u{1b}b"] {
+            assert!(shell_quote(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]
