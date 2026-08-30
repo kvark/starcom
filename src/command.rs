@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::core;
+use crate::{core, input};
 
 /// Small requests keep the control channel responsive. Paste batching is a
 /// separate operation; callers must not silently truncate a larger input.
@@ -62,6 +62,57 @@ impl Command {
         }
         line.push('\n');
         Ok(Self(line))
+    }
+
+    pub fn send_key(
+        pane: tmuxctl::PaneId,
+        key: input::Key,
+        modifiers: input::Modifiers,
+    ) -> Result<Self, input::Error> {
+        Ok(Self(format!(
+            "send-keys -t {pane} {}\n",
+            key.name(modifiers)?
+        )))
+    }
+
+    /// One axis only. tmux retains ownership of the window's total dimensions.
+    pub fn resize_axis(pane: tmuxctl::PaneId, resize: input::Resize) -> Result<Self, input::Error> {
+        input::Action::Resize(resize).validate()?;
+        let axis = match resize.axis {
+            input::Axis::Columns => "-x",
+            input::Axis::Rows => "-y",
+        };
+        Ok(Self(format!(
+            "resize-pane -t {pane} {axis} {}\n",
+            resize.cells
+        )))
+    }
+
+    /// A single synchronous command list creates a private named buffer, appends
+    /// bounded octal-quoted chunks, and pastes/deletes it. Never -w: the remote
+    /// clipboard and the user's automatically named paste buffers are untouched.
+    pub(crate) fn paste(pane: tmuxctl::PaneId, paste: &input::Paste, buffer: &str) -> Vec<Self> {
+        assert!(!buffer.is_empty() && buffer.len() <= 128);
+        assert!(
+            buffer
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        );
+        let mut commands = Vec::new();
+        for (index, chunk) in paste.as_str().as_bytes().chunks(768).enumerate() {
+            let append = if index == 0 { "" } else { "-a " };
+            let mut line = format!("set-buffer {append}-b {buffer} \"");
+            for &byte in chunk {
+                line.push('\\');
+                line.push(char::from(b'0' + (byte >> 6)));
+                line.push(char::from(b'0' + (byte >> 3 & 7)));
+                line.push(char::from(b'0' + (byte & 7)));
+            }
+            line.push_str("\"\n");
+            commands.push(Self(line));
+        }
+        commands.push(Self(format!("paste-buffer -d -p -b {buffer} -t {pane}\n")));
+        commands
     }
 
     pub fn as_bytes(&self) -> &[u8] {

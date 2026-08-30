@@ -1,16 +1,23 @@
-//! A read-only snapshot-to-live session over the embedded SSH transport.
+//! Snapshot-to-live sessions with explicit read-only or interactive access.
 //!
-//! No keyboard writes, automatic reconnect or GUI ownership. A failed restore
-//! aborts the channel and leaves the previous view available for inspection.
+//! A failed restore aborts the channel and leaves the previous view readable.
+//! User actions are never retried, and no automatic device replies are sent.
 
 use std::{collections, time};
 
-use crate::{core, inspect, snapshot, ssh};
+use crate::{core, input, inspect, snapshot, ssh};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Access {
+    ReadOnly,
+    Interactive,
+}
 
 pub struct Session {
     inspector: inspect::Inspector,
     view: snapshot::View,
     history: usize,
+    access: Access,
 }
 
 impl Session {
@@ -20,14 +27,31 @@ impl Session {
         socket: Option<&str>,
         history: usize,
     ) -> anyhow::Result<Self> {
-        let mut inspector = inspect::Inspector::attach(options, session, socket)?;
+        Self::attach_with_access(options, session, socket, history, Access::ReadOnly)
+    }
+
+    pub fn attach_with_access(
+        options: &ssh::Options,
+        session: &core::SessionName,
+        socket: Option<&str>,
+        history: usize,
+        access: Access,
+    ) -> anyhow::Result<Self> {
+        let mut inspector =
+            inspect::Inspector::attach_with_access(options, session, socket, access)?;
         let info = inspector.request("display-message -p '#{version}|#{session_id}|#{client_control_mode}|#{client_readonly}|#{client_flags}|#{client_tty}'\n")?;
-        let (_, session) = inspect::parse_info(&info)?;
-        let view = restore(&mut inspector, session, history)?;
+        let (_, session) = inspect::parse_info_with_access(&info, access)?;
+        let mut view = restore(&mut inspector, session, history)?;
+        if access == Access::Interactive {
+            for event in inspector.enable_input(&view)? {
+                view.apply(event);
+            }
+        }
         Ok(Self {
             inspector,
             view,
             history,
+            access,
         })
     }
 
@@ -58,10 +82,54 @@ impl Session {
         }
     }
 
+    /// Explicit caller-originated input only. Success acknowledges tmux's
+    /// command, not application completion. Never retry on an uncertain result.
+    pub fn interact(
+        &mut self,
+        pane: tmuxctl::PaneId,
+        action: &input::Action,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.access == Access::Interactive, "read-only attachment");
+        validate_action(&self.view, pane, action)?;
+        let target = action_target(&self.view, pane)?;
+        match self
+            .inspector
+            .interact(target, std::slice::from_ref(action))
+        {
+            Ok(outcome) => {
+                for event in outcome.notifications {
+                    self.view.apply(event);
+                }
+                if !outcome.applied {
+                    self.view.invalidate();
+                    anyhow::bail!(
+                        "tmux blocked input: pane changed, is in a mode, or synchronize-panes is enabled"
+                    );
+                }
+                if matches!(action, input::Action::Resize(_)) {
+                    self.view.invalidate();
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.view.disconnect();
+                Err(error)
+            }
+        }
+    }
+
     /// Replace all pane models, never append captures to their old buffers.
     /// No old model is published as current while the transaction is incomplete.
     pub fn synchronize(&mut self) -> anyhow::Result<()> {
-        let result = restore(&mut self.inspector, self.view.session, self.history);
+        let result = (|| {
+            let mut view = restore(&mut self.inspector, self.view.session, self.history)?;
+            if self.access == Access::Interactive {
+                for event in self.inspector.enable_input(&view)? {
+                    view.apply(event);
+                }
+            }
+            Ok(view)
+        })();
         match result {
             Ok(view) => {
                 self.view = view;
@@ -74,6 +142,49 @@ impl Session {
             }
         }
     }
+}
+
+pub(crate) fn action_target(
+    view: &snapshot::View,
+    pane: tmuxctl::PaneId,
+) -> anyhow::Result<input::Target> {
+    let state = &view
+        .panes()
+        .get(&pane)
+        .ok_or_else(|| anyhow::anyhow!("pane is no longer in this session"))?
+        .state;
+    Ok(input::Target {
+        session: view.session,
+        pane,
+        window: state.window,
+        size: state.size,
+        left: state.left,
+        top: state.top,
+    })
+}
+
+pub(crate) fn validate_action(
+    view: &snapshot::View,
+    pane: tmuxctl::PaneId,
+    action: &input::Action,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        view.status() == snapshot::Status::Watching,
+        "input requires a synchronized live view"
+    );
+    let pane = view
+        .panes()
+        .get(&pane)
+        .ok_or_else(|| anyhow::anyhow!("pane is no longer in this session"))?;
+    action.validate()?;
+    if let input::Action::Resize(resize) = *action {
+        let size = pane.state.size;
+        match resize.axis {
+            input::Axis::Columns => core::Size::new(resize.cells, size.rows())?,
+            input::Axis::Rows => core::Size::new(size.columns(), resize.cells)?,
+        };
+    }
+    Ok(())
 }
 
 pub(crate) fn restore(

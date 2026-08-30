@@ -1,12 +1,12 @@
-//! Read-only tmux inspection and bounded control-channel requests.
+//! Bounded tmux inspection and explicitly authorized interactive requests.
 //!
 //! `observe` produces independent observations, not an atomic terminal snapshot.
 //! The session module coordinates a snapshot-to-live boundary over this channel.
-//! Neither path exposes interactive input or marks a connection policy Live.
+//! Readiness is established by a complete snapshot, not just an SSH handshake.
 
 use std::{collections, io, time};
 
-use crate::{control, core, ssh};
+use crate::{command, control, core, input, session, snapshot, ssh};
 use anyhow::Context;
 
 const MAX_PANES: usize = 128;
@@ -52,10 +52,23 @@ pub(crate) struct Batch {
     pub notifications: Vec<(usize, tmuxctl::Notification)>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReadPurpose {
+    Reply,
+    Poll,
+}
+
+pub(crate) struct Interaction {
+    pub applied: bool,
+    pub notifications: Vec<tmuxctl::Notification>,
+}
+
 pub struct Inspector {
     channel: ssh::Channel,
     control: control::Control,
     stderr: Vec<u8>,
+    input_buffer_prefix: Option<String>,
+    input_sequence: u64,
 }
 
 impl Inspector {
@@ -64,7 +77,16 @@ impl Inspector {
         session: &core::SessionName,
         socket: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let command = attach_command(session, socket)?;
+        Self::attach_with_access(options, session, socket, session::Access::ReadOnly)
+    }
+
+    pub(crate) fn attach_with_access(
+        options: &ssh::Options,
+        session: &core::SessionName,
+        socket: Option<&str>,
+        access: session::Access,
+    ) -> anyhow::Result<Self> {
+        let command = attach_command_with_access(session, socket, access)?;
         let channel = ssh::Connection::connect(options)?.exec(&command)?;
         Ok(Self {
             channel,
@@ -73,6 +95,8 @@ impl Inspector {
                 ..control::Limits::default()
             })?,
             stderr: Vec::new(),
+            input_buffer_prefix: None,
+            input_sequence: 0,
         })
     }
 
@@ -165,11 +189,22 @@ impl Inspector {
             }
             wire.push_str(command);
         }
-        anyhow::ensure!(wire.len() < 64 * 1024, "command batch exceeds 64 KiB");
+        anyhow::ensure!(wire.len() < 512 * 1024, "command batch exceeds 512 KiB");
         wire.push('\n');
+        self.exchange(&wire, commands.len())
+    }
+
+    /// `if-shell -F` emits a reply for itself and each chosen branch command.
+    /// Both branches of an interactive transaction have the same reply count.
+    fn exchange(&mut self, wire: &str, reply_count: usize) -> anyhow::Result<Batch> {
+        anyhow::ensure!(reply_count > 0 && reply_count <= 256, "invalid reply count");
+        anyhow::ensure!(
+            wire.len() < 512 * 1024,
+            "control transaction exceeds budget"
+        );
         let deadline = time::Instant::now() + self.channel.timeout();
-        let mut ids = Vec::with_capacity(commands.len());
-        for _ in commands {
+        let mut ids = Vec::with_capacity(reply_count);
+        for _ in 0..reply_count {
             ids.push(self.control.register_command()?);
         }
         let mut unsent = wire.as_bytes();
@@ -182,6 +217,7 @@ impl Inspector {
                 Ok(0) => anyhow::bail!("tmux channel closed during write; delivery is uncertain"),
                 Ok(count) => unsent = &unsent[count..],
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.channel.take_wakeup();
                     self.channel.wait(deadline)?
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -197,7 +233,7 @@ impl Inspector {
         let mut total = 0usize;
         loop {
             let (events, bytes) = self
-                .read_events(deadline)?
+                .read_events(deadline, ReadPurpose::Reply)?
                 .context("tmux reply deadline expired")?;
             total = total.checked_add(bytes).context("wire budget overflow")?;
             anyhow::ensure!(
@@ -229,7 +265,7 @@ impl Inspector {
                     }
                 }
             }
-            if batch.replies.len() == commands.len() {
+            if batch.replies.len() == reply_count {
                 return Ok(batch);
             }
         }
@@ -241,10 +277,12 @@ impl Inspector {
     fn read_events(
         &mut self,
         deadline: time::Instant,
+        purpose: ReadPurpose,
     ) -> anyhow::Result<Option<(Vec<tmuxctl::Incoming>, usize)>> {
         let mut buffer = [0; 8192];
         loop {
-            if time::Instant::now() >= deadline {
+            let woken = self.channel.take_wakeup();
+            if (purpose == ReadPurpose::Poll && woken) || time::Instant::now() >= deadline {
                 return Ok(None);
             }
             let mut bytes = 0usize;
@@ -306,7 +344,7 @@ impl Inspector {
         deadline: time::Instant,
     ) -> anyhow::Result<Vec<tmuxctl::Notification>> {
         let result = (|| {
-            let Some((events, _)) = self.read_events(deadline)? else {
+            let Some((events, _)) = self.read_events(deadline, ReadPurpose::Poll)? else {
                 return Ok(Vec::new());
             };
             let mut notifications = Vec::new();
@@ -326,6 +364,201 @@ impl Inspector {
         result
     }
 
+    #[cfg(feature = "gui")]
+    pub(crate) fn waker(&self) -> ssh::Wake {
+        self.channel.waker()
+    }
+
+    /// Enable application input only after the initial snapshot and policy
+    /// checks. tmux's read-only flag is sticky, so interactive connections attach
+    /// without it; the application gate remains closed until this succeeds.
+    /// Keep ignore-size: local windows must never change remote dimensions.
+    pub(crate) fn enable_input(
+        &mut self,
+        view: &snapshot::View,
+    ) -> anyhow::Result<Vec<tmuxctl::Notification>> {
+        let aliases = self.request_batch(&["show-options -s -v command-alias".to_owned()])?;
+        for alias in &aliases.replies[0] {
+            let name = alias.split_once('=').map(|(name, _)| name).unwrap_or("");
+            anyhow::ensure!(
+                !matches!(
+                    name,
+                    "send-keys"
+                        | "set-buffer"
+                        | "paste-buffer"
+                        | "resize-pane"
+                        | "if-shell"
+                        | "display-message"
+                ),
+                "a command alias overrides an interactive command"
+            );
+        }
+        let mut hooks = vec![
+            "show-hooks -g".to_owned(),
+            "show-hooks -gw".to_owned(),
+            format!("show-hooks -t '{}'", view.session),
+        ];
+        let windows: collections::BTreeSet<_> = view
+            .panes()
+            .values()
+            .map(|pane| pane.state.window)
+            .collect();
+        hooks.extend(
+            windows
+                .iter()
+                .map(|window| format!("show-hooks -w -t {window}")),
+        );
+        hooks.extend(
+            view.panes()
+                .keys()
+                .map(|pane| format!("show-hooks -p -t {pane}")),
+        );
+        let hooks = self.request_batch(&hooks)?;
+        for lines in &hooks.replies {
+            for line in lines {
+                let hook = line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .split('[')
+                    .next()
+                    .unwrap_or("");
+                if matches!(
+                    hook,
+                    "after-send-keys"
+                        | "after-set-buffer"
+                        | "after-paste-buffer"
+                        | "after-resize-pane"
+                        | "after-if-shell"
+                        | "after-display-message"
+                ) {
+                    anyhow::ensure!(
+                        line == hook,
+                        "configured {hook} hook prevents safe interactive transactions"
+                    );
+                }
+            }
+        }
+        let batch = self.request_batch(&[
+            "display-message -p '#{client_control_mode}|#{client_readonly}|#{client_flags}|#{client_tty}|#{client_pid}'".to_owned(),
+        ])?;
+        anyhow::ensure!(
+            batch.replies[0].len() == 1,
+            "invalid interactive client metadata"
+        );
+        let fields: Vec<_> = batch.replies[0][0].split('|').collect();
+        anyhow::ensure!(
+            fields.len() == 5
+                && fields[0] == "1"
+                && fields[1] == "0"
+                && fields[2].split(',').any(|flag| flag == "ignore-size")
+                && fields[3].is_empty(),
+            "tmux did not preserve interactive access, ignore-size, or the non-PTY channel"
+        );
+        let pid: u32 = fields[4].parse()?;
+        let stamp = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)?
+            .as_nanos();
+        self.input_buffer_prefix = Some(format!("starcom-{pid}-{stamp:x}"));
+        Ok(aliases
+            .notifications
+            .into_iter()
+            .chain(hooks.notifications)
+            .chain(batch.notifications)
+            .map(|(_, event)| event)
+            .collect())
+    }
+
+    pub(crate) fn interact(
+        &mut self,
+        target: input::Target,
+        actions: &[input::Action],
+    ) -> anyhow::Result<Interaction> {
+        anyhow::ensure!(
+            !actions.is_empty() && actions.len() <= 32,
+            "invalid input batch"
+        );
+        let prefix = self
+            .input_buffer_prefix
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("read-only attachment"))?;
+        self.input_sequence = self
+            .input_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("input sequence exhausted"))?;
+        let mut commands = Vec::new();
+        let resizing = actions
+            .iter()
+            .any(|action| matches!(action, input::Action::Resize(_)));
+        for action in actions {
+            action.validate()?;
+            match *action {
+                input::Action::Bytes(ref bytes) => {
+                    commands.push(command::Command::send_bytes(target.pane, bytes)?)
+                }
+                input::Action::Key(key, modifiers) => {
+                    commands.push(command::Command::send_key(target.pane, key, modifiers)?)
+                }
+                input::Action::Resize(resize) => {
+                    anyhow::ensure!(actions.len() == 1, "resize must be a separate transaction");
+                    commands.push(command::Command::resize_axis(target.pane, resize)?);
+                }
+                input::Action::Paste(ref paste) => {
+                    anyhow::ensure!(actions.len() == 1, "paste must be a separate transaction");
+                    commands.extend(command::Command::paste(
+                        target.pane,
+                        paste,
+                        &format!("{prefix}-{}", self.input_sequence),
+                    ));
+                }
+            }
+        }
+        // No shell is spawned. The condition is evaluated by tmux immediately
+        // before inserting the synchronous action commands. Both branches end
+        // with an explicit marker; guard rejection is not a transport failure.
+        let mut wire = format!(
+            "if-shell -F -t {} '{}' {{ ",
+            target.pane,
+            target.guard(resizing)
+        );
+        for command in &commands {
+            wire.push_str(command.as_str().trim_end_matches('\n'));
+            wire.push_str(" ; ");
+        }
+        wire.push_str("display-message -p STARCOM-APPLIED } { ");
+        for _ in &commands {
+            wire.push_str("display-message -p '' ; ");
+        }
+        wire.push_str("display-message -p STARCOM-BLOCKED }\n");
+        let result = self.exchange(&wire, commands.len() + 2);
+        if result.is_err() {
+            self.abort();
+        }
+        // Server errors may echo command arguments. Never surface input or
+        // clipboard contents. Failure cannot be distinguished from delivery.
+        let batch = result.map_err(|_| {
+            anyhow::anyhow!(
+                "interactive request failed; delivery may be uncertain and was not retried"
+            )
+        })?;
+        let last = batch
+            .replies
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("missing interactive result"))?;
+        anyhow::ensure!(
+            last.len() == 1 && matches!(last[0].as_str(), "STARCOM-APPLIED" | "STARCOM-BLOCKED"),
+            "invalid interactive result"
+        );
+        Ok(Interaction {
+            applied: last[0] == "STARCOM-APPLIED",
+            notifications: batch
+                .notifications
+                .into_iter()
+                .map(|(_, event)| event)
+                .collect(),
+        })
+    }
+
     pub(crate) fn abort(&mut self) {
         let _ = self.control.finish(|_| {});
         self.channel.abort();
@@ -343,7 +576,16 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+#[cfg(test)]
 fn attach_command(session: &core::SessionName, socket: Option<&str>) -> anyhow::Result<String> {
+    attach_command_with_access(session, socket, session::Access::ReadOnly)
+}
+
+fn attach_command_with_access(
+    session: &core::SessionName,
+    socket: Option<&str>,
+    access: session::Access,
+) -> anyhow::Result<String> {
     let mut command = "exec tmux -N -C".to_owned();
     if let Some(socket) = socket {
         anyhow::ensure!(
@@ -355,12 +597,23 @@ fn attach_command(session: &core::SessionName, socket: Option<&str>) -> anyhow::
     }
     // -N forbids starting a server. -E leaves session environment untouched.
     // read-only is a UI safety flag, not an authorization sandbox for commands.
-    command.push_str(" attach-session -E -f read-only,ignore-size,no-output -t ");
+    command.push_str(" attach-session -E -f ");
+    if access == session::Access::ReadOnly {
+        command.push_str("read-only,");
+    }
+    command.push_str("ignore-size,no-output -t ");
     command.push_str(&shell_quote(&format!("={}", session.as_str())));
     Ok(command)
 }
 
 pub(crate) fn parse_info(lines: &[String]) -> anyhow::Result<(String, tmuxctl::SessionId)> {
+    parse_info_with_access(lines, session::Access::ReadOnly)
+}
+
+pub(crate) fn parse_info_with_access(
+    lines: &[String],
+    access: session::Access,
+) -> anyhow::Result<(String, tmuxctl::SessionId)> {
     anyhow::ensure!(lines.len() == 1, "invalid tmux client metadata");
     let fields: Vec<_> = lines[0].split('|').collect();
     anyhow::ensure!(
@@ -368,8 +621,15 @@ pub(crate) fn parse_info(lines: &[String]) -> anyhow::Result<(String, tmuxctl::S
         "tmux does not provide the required client metadata"
     );
     anyhow::ensure!(
-        fields[2] == "1" && fields[3] == "1" && fields[5].is_empty(),
-        "expected a read-only, non-PTY control client"
+        fields[2] == "1"
+            && fields[3]
+                == if access == session::Access::ReadOnly {
+                    "1"
+                } else {
+                    "0"
+                }
+            && fields[5].is_empty(),
+        "unexpected control-client access mode or PTY"
     );
     let flags: collections::BTreeSet<_> = fields[4].split(',').collect();
     anyhow::ensure!(

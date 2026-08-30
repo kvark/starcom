@@ -5,7 +5,7 @@ use starcom::{core, replay};
 
 const HELP: &str = "Starcom: Session Terminal And Remote COMmander\n\
 \n\
-Read-only desktop client, with headless replay and SSH inspection tools.\n\
+Tabbed desktop client, with headless replay and read-only SSH inspection tools.\n\
 \n\
 Usage: starcom [--demo] [--snapshot PNG]\n\
        starcom --replay FILE [--size COLSxROWS]\n\

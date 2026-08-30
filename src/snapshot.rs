@@ -350,6 +350,12 @@ impl View {
         &mut self.panes
     }
 
+    pub(crate) fn invalidate(&mut self) {
+        if self.status == Status::Watching {
+            self.status = Status::NeedsResync;
+        }
+    }
+
     pub fn status(&self) -> Status {
         self.status
     }
@@ -376,6 +382,9 @@ impl View {
                 }
             }
             tmuxctl::Notification::Exit(_) => self.disconnect(),
+            tmuxctl::Notification::Unknown(ref line)
+                if line.starts_with("%paste-buffer-changed ")
+                    || line.starts_with("%paste-buffer-deleted ") => {}
             // Unknown mutations, changes to pane geometry, and flow-control
             // gaps require a fresh snapshot. Never guess dimensions or replay
             // queued data into models whose topology may now be wrong.
