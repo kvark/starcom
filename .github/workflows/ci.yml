@@ -59,7 +59,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - name: Resolve and export the matching GUI dependency set
+      - name: Resolve and export the matching GUI and pure-Rust SSH dependency set
         shell: bash
         run: |
           set -euo pipefail
@@ -70,7 +70,8 @@ jobs:
           import os, pathlib
           p = pathlib.Path(os.environ['BUNDLE']) / 'source' / 'Cargo.toml'
           s = p.read_text()
-          dependencies = '''blade-egui = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
+          dependencies = '''puressh = { version = "=0.1.3", default-features = false, features = ["client", "multichannel"], optional = true }
+          blade-egui = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
           blade-graphics = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
           egui = { version = "0.34", optional = true }
           egui-winit = { version = "0.34", default-features = false, features = ["clipboard", "wayland", "x11"], optional = true }
@@ -79,8 +80,14 @@ jobs:
           log = { version = "0.4", optional = true }
           env_logger = { version = "0.11", optional = true }
           '''
-          s = s.replace('# Use OpenSSL on Windows', dependencies + '\n# Use OpenSSL on Windows')
-          s = s.replace('default = ["ssh"]', 'default = ["ssh", "gui"]\ngui = ["ssh", "dep:blade-egui", "dep:blade-graphics", "dep:egui", "dep:egui-winit", "dep:winit", "dep:png", "dep:log", "dep:env_logger"]')
+          s = s.replace('ssh2 = { version = "0.9.6", optional = true }\npolling = { version = "3.11", optional = true }\nbase64 = { version = "0.22", optional = true }', dependencies.rstrip())
+          start = s.index('[target.\'cfg(windows)\'.dependencies]')
+          end = s.index('[features]', start)
+          s = s[:start] + s[end:]
+          s = s.replace('default = ["ssh"]', 'default = ["ssh", "gui"]')
+          s = s.replace('ssh = ["dep:ssh2", "dep:polling", "dep:base64"]', 'ssh = ["dep:puressh"]')
+          s = s.replace('vendored-openssl = ["ssh", "ssh2/vendored-openssl"]\n', '')
+          s = s.replace('ssh = ["dep:puressh"]', 'ssh = ["dep:puressh"]\ngui = ["ssh", "dep:blade-egui", "dep:blade-graphics", "dep:egui", "dep:egui-winit", "dep:winit", "dep:png", "dep:log", "dep:env_logger"]')
           s += '\n[lints.rust]\nunexpected_cfgs = { level = "warn", check-cfg = [\'cfg(gles)\'] }\n'
           p.write_text(s)
           PY
