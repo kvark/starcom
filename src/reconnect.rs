@@ -50,7 +50,12 @@ impl Failure {
                 "The remote tmux server exited. Any session it held is gone; reattaching \
                  would attach to a different server."
             }
-            Self::Detached => "This client was detached. Reconnect when you want it back.",
+            // tmux sends a bare %exit for both an explicit detach and a server
+            // shutdown, so do not assert which one happened.
+            Self::Detached => {
+                "tmux ended this control session. Starcom does not reattach on its own, \
+                 because that happens both when you detach and when the server shuts down."
+            }
             Self::Configuration => "The connection settings were rejected.",
             Self::Protocol => "The tmux control stream was not usable.",
         }
@@ -58,30 +63,55 @@ impl Failure {
 }
 
 /// Classify a failed attachment or poll.
+///
+/// Types decide first, because they come from Starcom's own state machines. Only
+/// when nothing in the chain is typed does remote text get consulted, and even
+/// then it can only make a failure non-retriable.
 #[cfg(feature = "ssh")]
 pub fn classify(error: &anyhow::Error) -> Failure {
-    // A typed transport error is authoritative: it is produced by our own code
-    // from the SSH state machine, not from remote output.
-    if let Some(failure) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<ssh::Error>())
-        .map(|error| match error.kind {
-            ssh::Kind::Transport | ssh::Kind::Timeout => Failure::Transport,
-            ssh::Kind::Authentication => Failure::Authentication,
-            ssh::Kind::UnknownHostKey | ssh::Kind::ChangedHostKey => Failure::HostKey,
-            ssh::Kind::Configuration => Failure::Configuration,
-        })
-    {
+    let typed = error.chain().find_map(|cause| {
+        if let Some(error) = cause.downcast_ref::<ssh::Error>() {
+            return Some(from_ssh(error.kind));
+        }
+        let cause = cause.downcast_ref::<std::io::Error>()?;
+        // std::io::Error::other keeps its inner error behind get_ref(), not
+        // source(), so an SSH error boxed into io never reaches the chain walk.
+        if let Some(inner) = cause
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ssh::Error>())
+        {
+            return Some(from_ssh(inner.kind));
+        }
+        // The channel surfaces as std::io through Read/Write. An ended channel
+        // is transport loss no matter which layer wrapped it.
+        matches!(
+            cause.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::TimedOut
+        )
+        .then_some(Failure::Transport)
+    });
+    match typed {
         // tmux may still have told us the session is gone while the channel was
         // ending. That narrows a retriable failure; it never widens one.
-        if failure == Failure::Transport
-            && let Some(narrowed) = narrow(&format!("{error:#}"))
-        {
-            return narrowed;
-        }
-        return failure;
+        Some(Failure::Transport) => narrow(&format!("{error:#}")).unwrap_or(Failure::Transport),
+        Some(failure) => failure,
+        None => narrow(&format!("{error:#}")).unwrap_or(Failure::Protocol),
     }
-    narrow(&format!("{error:#}")).unwrap_or(Failure::Protocol)
+}
+
+#[cfg(feature = "ssh")]
+fn from_ssh(kind: ssh::Kind) -> Failure {
+    match kind {
+        ssh::Kind::Transport | ssh::Kind::Timeout => Failure::Transport,
+        ssh::Kind::Authentication => Failure::Authentication,
+        ssh::Kind::UnknownHostKey | ssh::Kind::ChangedHostKey => Failure::HostKey,
+        ssh::Kind::Configuration => Failure::Configuration,
+    }
 }
 
 /// Recognize tmux's own refusals in an error chain. Returns only non-retriable
@@ -234,6 +264,39 @@ mod tests {
         // An unrecognized failure is never retried.
         assert_eq!(
             classify(&anyhow::anyhow!("something new and unexplained")),
+            Failure::Protocol
+        );
+    }
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn a_channel_that_ended_is_transport_loss_at_any_layer() {
+        // The exec channel surfaces through Read/Write, so a drop mid-command
+        // arrives as std::io rather than as our own SSH error type.
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let error = anyhow::Error::new(std::io::Error::from(kind))
+                .context("tmux write failed; delivery is uncertain");
+            assert_eq!(classify(&error), Failure::Transport, "{kind:?}");
+        }
+        // An SSH error nested inside an io error still decides the outcome.
+        let nested = anyhow::Error::new(std::io::Error::other(ssh::Error::for_test(
+            ssh::Kind::ChangedHostKey,
+            "host key is not trusted",
+        )))
+        .context("read SSH stdout");
+        assert_eq!(classify(&nested), Failure::HostKey);
+        // Ordinary io failures are not transport loss.
+        assert_eq!(
+            classify(&anyhow::Error::new(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
             Failure::Protocol
         );
     }

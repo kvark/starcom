@@ -3,14 +3,14 @@
 Updated: 2026-08-30.
 
 **Current status:** M0, M1, and M2's functional implementation are present, and
-M3's implementation now lands with them: transport loss is classified apart from
-authentication, trust, missing-session, server-exit, and detach; retries use
+M3 is complete for the tested configuration: transport loss is classified apart
+from authentication, trust, missing-session, server-exit, and detach; retries use
 cancellable jittered backoff with visible state; every attempt takes a fresh
 epoch and rebuilds models; session replacement and history truncation are
-reported. The M2 acceptance gate remains open until the real Codex/TUI workflow
-and native macOS/Windows interaction are exercised, and M3's own gate stays open
-until loss during paste and during a remote layout change is covered. M4 is the
-next development milestone.
+reported. Loss during output, input, paste, and a remote layout change, plus a
+restarted tmux server, are covered by fixture tests. The M2 acceptance gate
+remains open until the real Codex/TUI workflow and native macOS/Windows
+interaction are exercised. M4 is the next development milestone.
 
 Development targets `main` directly. CI runs for pull requests and updates to
 `main`. Routine milestone branches, generated recovery trees, and shadow copies
@@ -191,22 +191,25 @@ terminal checkpoint.
 Gate: normal shell and Codex work should be comfortable without tmux keybindings,
 and closing/reopening the client must not affect jobs or misdirect input.
 
-### M3 — Trustworthy automatic reconnection: implemented, coverage still growing
+### M3 — Trustworthy automatic reconnection: complete for the tested configuration
 
 - [x] Classify transient transport loss separately from auth, trust, missing-session,
   tmux-restart, and explicit user detach.
 - [x] Cancellable exponential backoff with jitter and visible retry state.
 - [x] Reattach and reconstruct fresh models for every new epoch.
 - [x] Preserve the last view but never queue offline input or replay uncertain writes.
-- [x] Test connection loss during live output and pending input against a real
-  fixture; verify the test fails when automatic retry is disabled.
+- [x] Test connection loss during output, input, paste, and remote layout changes.
 - [x] Expose history truncation and server/session replacement clearly.
-- [ ] Test connection loss during a paste transaction and during a remote layout
-  change.
-- [ ] Exercise a genuinely restarted tmux server, not only a destroyed session.
+- [x] Reattach across a genuinely restarted tmux server and report it as a
+  replacement. A fresh server numbers its first session `$0` again, so identity
+  is the server pid, session id, and session creation time together.
+- [ ] Exercise loss on a real network path, not only a killed local control
+  client: latency, a suspended laptop, and a NAT rebind.
 
 Gate: repeated network loss produces no duplicate command, hidden gap, stale-pane
-write, endless security retry, or phantom successful reconnection.
+write, endless security retry, or phantom successful reconnection. Met for the
+tested configuration; each clause has a fixture test, and the reconnect test is
+verified to fail when automatic retry is disabled.
 
 ### M4 — Multiple-machine operational fit
 
@@ -234,14 +237,13 @@ write, endless security retry, or phantom successful reconnection.
 
 ## Immediate work order
 
-1. Close M3's remaining coverage: loss during a paste transaction, loss during a
-   remote layout change, and a genuinely restarted tmux server.
-2. Decide what closes the M2 gate and who signs it. "Real Codex acceptance" and
+1. Decide what closes the M2 gate and who signs it. "Real Codex acceptance" and
    "native macOS/Windows interaction" currently have no mechanism behind them, so
    name the artifact each produces — a committed transcript, a screenshot, a
    scripted run — or the gate cannot be closed by anyone.
-3. Run the original Codex workflow and representative shell/editor/TUI sessions.
-4. Add native macOS/Windows close, clipboard, and input acceptance.
+2. Run the original Codex workflow and representative shell/editor/TUI sessions.
+3. Add native macOS/Windows close, clipboard, and input acceptance.
+4. Begin M4: persist non-secret tabs and profiles without auto-authentication.
 5. Extend SSH configuration only where semantics can be tested end to end.
 6. Measure before optimizing the renderer or replacing dependencies.
 
