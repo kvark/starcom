@@ -2,28 +2,32 @@
 
 **Session Terminal And Remote COMmander.**
 
-A small graphical client for persistent remote tmux sessions. Linux, macOS, and Windows
-clients; Linux hosts with stock SSH and tmux. No remote Starcom service.
+A small native client for persistent remote tmux sessions. Linux, macOS, and
+Windows clients; Linux hosts with stock SSH and tmux. No remote Starcom service.
+A sister project to [FileMan](https://github.com/kvark/fileman), built with Rust,
+Blade, egui, and Alacritty's terminal core.
 
-A sister project to [FileMan](https://github.com/kvark/fileman), using Rust and
-Alacritty's terminal core, with Blade + egui planned for the interface.
+![Starcom desktop showing two terminal panes](etc/screenshot.png)
 
-**In development:** embedded SSH inspection and experimental snapshot-to-live
-synchronization. The GUI, interactive input, and automatic reconnect are next.
+*Built-in demo data, rendered by the application; not a remote session.*
 
-## Try
-
-Requires Rust 1.96+, an OpenSSL/C build setup, and an existing remote tmux session.
+## Run
 
 ```sh
-cargo run --locked --bin starcom-inspect -- \
-  --host server.example.com --user your-user --session work \
-  --known-hosts "$HOME/.ssh/known_hosts" --agent
+cargo run --release --locked
+# Explore the interface without connecting:
+cargo run --release --locked -- --demo
 ```
 
-Add `--watch 5` to collect live output into reconstructed pane models for five
-seconds and print their final screens. Connection settings are explicit; SSH
-config aliases are not supported yet. Host keys must already be trusted.
+Requires Rust 1.96+, the platform Rust linker, and a supported graphics driver.
+SSH and cryptography use Rust libraries; OpenSSL is not a build dependency.
+Enter explicit SSH settings and an existing tmux session in the connection panel;
+the host key must already be trusted.
 
-See [SSH usage](docs/SSH.md), [synchronization limits](docs/SYNCHRONIZATION.md),
-[the roadmap](PLAN.md), and [contributing](CONTRIBUTING.md).
+**Early read-only desktop:** live panes, window tabs, local scrollback, selection,
+copying, and draggable local views. Remote input, remote pane resizing, SSH config
+aliases, and automatic reconnect are not implemented yet.
+
+[Desktop usage](docs/DESKTOP.md) · [SSH inspection](docs/SSH.md) ·
+[Synchronization limits](docs/SYNCHRONIZATION.md) · [Roadmap](PLAN.md) ·
+[Contributing](CONTRIBUTING.md)

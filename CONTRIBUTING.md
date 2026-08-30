@@ -42,8 +42,9 @@ Run these checks before submitting changes:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --locked --all-features --all-targets -- -D warnings
+cargo test --locked --all-features --all-targets
+python3 scripts/check-dependencies.py
 ```
 
 CI should exercise Linux, macOS, and Windows clients. Tests requiring a real tmux
@@ -66,3 +67,24 @@ Never replay uncertain input across reconnects, silently create a replacement
 session, or modify global tmux settings. Keep the ordinary tmux client usable as
 a fallback. Changes affecting another attached client's geometry need an
 explicit, tested sizing policy.
+
+## Desktop validation
+
+Default features now build the Blade/egui desktop. Keep protocol/terminal tests
+usable with `--no-default-features`, and SSH-only tools with
+`--no-default-features --features ssh`. GUI tests use egui input replay without
+requiring a display. `--demo --snapshot PATH` renders the actual UI through Blade;
+only demo data may be captured by that path. The Linux Xvfb smoke script tests
+the native window and system clipboard. Do not equate these checks with native
+macOS/Windows/Wayland/IME acceptance or call local viewport resizing remote pane
+resizing. Keep CI triggers on PRs and main; no repository-writing preparation
+jobs belong in the final workflow.
+
+## Native dependency policy
+
+Use Rust SSH and cryptography implementations. Do not add libssh2, OpenSSL,
+ring, AWS-LC, or native crypto fallbacks through transitive features. The CI
+policy script checks the resolved graph; builds also disable C/C++ compiler
+invocation. This does not ban system linkers, OS FFI, graphics drivers, or Rust
+build-helper crates whose C compilation path is disabled. Keep dependency
+claims tied to the feature graph and actual builds, not a crate's marketing.

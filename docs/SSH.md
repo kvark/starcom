@@ -1,81 +1,111 @@
-# Embedded SSH: first live milestone
+# Embedded SSH
 
-Status: 2026-08-29. Embedded SSH inspection and read-only snapshot-to-live models
-are implemented. General interactive terminal fidelity and desktop acceptance
-remain open. See [PLAN.md](../PLAN.md) and [synchronization details](SYNCHRONIZATION.md).
+Starcom uses **Sunset 0.6** for the SSH protocol and **RustCrypto / `ssh-key`**
+for identity signing. `polling` supplies socket readiness without an asynchronous
+runtime. There is no local SSH subprocess, libssh2, OpenSSL, ring, or AWS-LC.
+The remote side remains ordinary Linux sshd and stock tmux.
 
-## Implemented
+This replaces the first milestone's C-backed `ssh2` implementation. FileMan's
+GUI conventions are retained; its older SSH dependency is not copied. Current
+russh backends require native crypto, so disabling its default features alone
+would not meet Starcom's requirement. Sunset's lower-level interface lets the
+application own bounded buffers, deadlines, and agent requests.
 
-- Embedded `ssh2` transport, following FileMan rather than introducing a second
-  SSH ecosystem. `polling` supplies readiness waits; `base64` formats SHA256
-  fingerprints. No asynchronous runtime or local SSH subprocess is required.
-- Explicit host/user/port/known-hosts/authentication options. Plain and hashed
-  known-host entries are checked before attempting identity or agent auth.
-- A non-PTY exec channel running stock `tmux -N -C`, attached to an existing
-  session. `-N` prevents server startup and `-E` prevents session environment
-  updates. `read-only,ignore-size,no-output` flags are verified after attachment.
-- Bounded pane discovery and textual screen/history inspection. Geometry, cursor,
-  alternate-screen status, and history counts are reported. Captures are escaped
-  when printed. SSH stderr never enters the control protocol parser.
-- `--watch SECONDS` reconstructs fresh pane models, then feeds live output into
-  them. Geometry changes invalidate the view and trigger a new snapshot. Screens
-  remain readable on disconnect; input and automatic reconnect are not enabled.
-- Unit/CLI tests and isolated Linux integration tests cover transport/trust,
-  snapshot ordering, pending sequences, continuous output, resize, hook safety,
-  and preservation of remote jobs. See synchronization details for tests actually
-  executed and remaining platform coverage.
+## Connect
 
-The Windows dependency enables vendored OpenSSL for Ed25519 support; this has a
-native build cost. Linux/macOS normally use the system OpenSSL development
-installation. `vendored-openssl` is available explicitly on those platforms too.
-The `ssh` feature is enabled by default; disable defaults to test just the core.
-This selection prioritizes reuse and proven integration, not an unmeasured claim
-that libssh2 is smaller or faster than russh.
+```sh
+cargo run --locked --bin starcom-inspect -- \
+  --host server.example.com --user your-user --session work \
+  --known-hosts "$HOME/.ssh/known_hosts" --agent
+```
 
-## Deliberate boundaries
+Use `--identity FILE` for an **unencrypted OpenSSH-format** private key instead
+of `--agent`. Ed25519, RSA with SHA-256 signatures, and ECDSA P-256 identities are
+supported. Unlock encrypted keys in your SSH agent; Starcom does not ask for or
+store passphrases. On Unix, the agent is selected by `SSH_AUTH_SOCK`. On Windows,
+use the local OpenSSH-agent named pipe (or a local pipe in `SSH_AUTH_SOCK`);
+Pageant and Unix-socket compatibility bridges are not implemented.
 
-The inspector never enables interactive input and never marks the connection
-state `Live`. Default inspection queries happen at different times; an unchanged
-metadata comparison does not prove an atomic snapshot. `--watch` uses a separate
-synchronous command batch and a fresh set of models, not captures appended to old
-models. A capture is still not a complete serialized terminal parser; fidelity
-limits and source-supported ordering assumptions are documented separately.
-The tmux read-only flag is not an authorization sandbox for control commands;
-the inspector itself only issues its small, private set of read-only queries.
-User-configured tmux hooks can still run when a client attaches.
+Connection options are explicit. SSH config aliases, Include/Match, bastions,
+ProxyJump/ProxyCommand, certificates, hardware security-key identities, and MFA
+prompts remain future work. No password fallback or agent forwarding occurs.
 
-SSH configuration parsing, jump hosts, proxy commands, MFA/password prompts,
-trust-on-first-use dialogs, and reconnect scheduling are not implemented. An
-explicit identity file must be unencrypted; encrypted keys can be loaded into an
-agent. Agent authentication was live-tested on Linux, not against every platform's
-agent implementation. No password or private-key contents are logged or stored.
+Add `--watch 5` to reconstruct pane models, consume five seconds of live output,
+and print escaped final screens. The GUI uses the same transport and snapshot
+logic. It remains read-only: keystrokes and clipboard paste are not sent remotely.
 
-Known-host markers such as `@revoked` and `@cert-authority`, wildcards, and negation
-patterns are rejected rather than ignored. This conservative check applies to
-the whole supplied file, including unrelated entries. Do not remove revocations
-to bypass this limitation. Supporting these semantics correctly, or using a
-system-SSH fallback, is subsequent work. Unknown/changed keys are not accepted
-and trust files are never rewritten automatically.
+## Trust and authentication
 
-Network operations have deadlines; OS DNS resolution and local agent IPC are
-not covered by those network timeouts. Connection/authentication are blocking
-and must run on a worker when a GUI is added. One connection currently owns one
-channel; multi-session connection sharing remains later work.
+Known-host verification occurs **before loading a private key or contacting the
+agent**, and is repeated on rekey. Exact hostnames, comma-separated exact entries,
+and hashed `|1|...` entries work. Non-default ports use the exact `[host]:port`
+identity, not a fallback to the port-22 entry. SHA-256 fingerprints are displayed.
+Unknown or changed keys fail; trust files are never changed automatically.
 
-Resource budgets are explicit: 128 panes for basic inspection (32 for live
-reconstruction), 1000 requested history lines, bounded
-protocol lines/replies, 64 KiB stderr, and 8 MiB capture/transfer budgets. Large
-sessions can fail with an explicit limit error. A captured text line resembling
-a tmux reply guard can currently cause the strict control parser to fail closed;
-framing-safe snapshot extraction needs attention before general terminal use.
+Markers such as `@revoked` and `@cert-authority`, wildcard patterns, and negation
+are rejected rather than silently ignored. This conservative restriction applies
+to the entire supplied file. Do not delete revocations to bypass it; full policy
+support or an explicit system-SSH adapter requires separate implementation.
 
-## Remaining acceptance work
+Private-key file bytes use zeroizing storage. Signing credentials and the local
+agent connection are released after authentication. Agent requests and replies
+are size-bounded, with explicit signature-algorithm checks. Credentials and pane
+contents are not logged by default. The dependency policy is not a claim that
+this application or its cryptographic dependencies have received a security audit.
 
-The snapshot-to-live path has passed controlled Linux tmux 3.4 tests, including
-primary/alternate buffers and output arriving during attachment. The next desktop
-step can use these models, while keeping their fidelity limits explicit.
+## Transport and tmux behavior
 
-Still outstanding: full TUI/Codex acceptance, broader tmux and client-platform
-coverage, missing parser-state fidelity, SSH configuration semantics, interactive
-input gating, and transport reconnect/epoch integration. M2 adds Blade/egui views,
-selection, scrolling, and resizing; M3 integrates automatic connection recovery.
+One worker owns one nonblocking SSH connection and one exec channel. It does not
+hold the GUI model lock while doing network I/O. Partial socket writes consume
+only accepted bytes; reconnect never retries uncertain application input. Receive
+queues are bounded (1 MiB stdout, 64 KiB stderr); backpressure stops reads instead
+of discarding terminal output. Stderr is always separate from the control stream.
+
+Network and agent I/O use deadlines. OS hostname resolution, local filesystem
+access, and agent connection establishment can still block outside those timers;
+they run on the worker, never the window thread. Worker cancellation invalidates
+publication immediately, but does not forcibly interrupt those OS calls.
+
+The non-PTY channel executes `tmux -N -C ... attach-session -E ...`.
+`-N` forbids starting a replacement server, `-E` leaves session environment alone,
+and the attachment starts with `read-only,ignore-size,no-output`. The client
+verifies those flags before proceeding. Sunset's exec request does not request
+an acknowledgment; only valid tmux replies establish readiness. Denied execs
+produce channel closure or an operation timeout, not a false successful session.
+
+The tmux read-only flag is not an authorization sandbox. Starcom issues its own
+restricted query set, does not change global options, and avoids remote input and
+geometry changes. Existing attach hooks may still run. Captures with yielding
+hooks are refused before capture because they invalidate snapshot ordering.
+
+Default inspection consists of separate observations. The `--watch` path uses
+an ordered snapshot-to-live transaction and fresh models; see
+[SYNCHRONIZATION.md](SYNCHRONIZATION.md) for remaining parser-state limitations.
+Output discarded by tmux cannot be reconstructed. Budget violations fail visibly.
+
+## Build policy and validation
+
+`python3 scripts/check-dependencies.py` checks the resolved host dependency graph
+for forbidden native SSH/crypto packages. CI also builds with unusable `CC` and
+`CXX` values to catch accidental C/C++ compilation. Normal platform linking,
+graphics drivers, and operating-system FFI are still required. Linux window-system
+crates can include the Rust `cc` or `pkg-config` helper crates without invoking a
+C compiler under our selected features; absence of their names is not the policy.
+
+The isolated Linux fixture requires test-server executables `sshd`, `ssh-keygen`,
+`ssh-agent`, `ssh-add`, and tmux. These are **test/runtime programs**, not native
+libraries compiled into Starcom. It generates and deletes its own keys, uses a
+loopback-only listener and a unique tmux socket, and never touches default sessions.
+
+Tests cover known-host failures before authentication, hashed entries, agent
+signing, Ed25519/RSA/P-256 identity authentication, 128 KiB streams across forced
+16 KiB rekeys, separated stderr, deadlines, snapshot continuity, capture-hook
+safety, and preservation of processes, dimensions, and session environment.
+A separate native Windows-agent test uses one disposable identity and removes it.
+
+Sunset currently has a small fixed receive window and a limited algorithm set.
+High-latency throughput, broader servers, rekey stress, and native platform agents
+need continued measurement and compatibility work. Pure Rust is not by itself
+proof of better latency, lower RAM, or mature SSH interoperability. The backend
+remains an experimental client integration, not a replacement for OpenSSH's full
+configuration/authentication surface.

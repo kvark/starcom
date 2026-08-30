@@ -1,13 +1,14 @@
 # Starcom: architecture and implementation roadmap
 
-Date: 2026-08-29. Status: M0 and embedded SSH inspection implemented; M1 now
-includes read-only snapshot-to-live reconstruction, validated locally on Linux.
+Date: 2026-08-29. Status: M0 implemented; M1 has read-only snapshot-to-live
+reconstruction; M2 has a read-only desktop increment. Interactive input, remote
+pane resizing, and automatic reconnect remain pending.
 
-The experimental `starcom-inspect --watch` path restores fresh pane models and
-consumes live output. Linux tmux 3.4 continuity, pending-byte, resize, hook-safety,
-and disconnect tests pass. Broader platform/TUI acceptance and unexported parser
-state remain open; M2's desktop UI is the next implementation stage. See
-[synchronization coverage and limits](docs/SYNCHRONIZATION.md).
+The Blade/egui desktop displays fresh Alacritty pane models over embedded
+Sunset/RustCrypto SSH. Local scrollback, selection/copy, window tabs, and viewing
+dividers are implemented. Broader native-platform/TUI acceptance and unexported
+parser state remain open. See [desktop scope](docs/DESKTOP.md),
+[SSH behavior](docs/SSH.md), and [synchronization limits](docs/SYNCHRONIZATION.md).
 
 Development targets `main` directly. CI runs on pull requests and pushes to
 `main`; do not create extra milestone branches for routine implementation work.
@@ -120,11 +121,12 @@ Create these as the corresponding feature lands:
 - `src/snapshot.rs`: validated pane captures, reconstruction, and view invalidation.
 - `src/session.rs`: snapshot/live transaction and read-only stream orchestration.
 - `src/inspect.rs`: bounded SSH control requests and diagnostic observation.
-- `src/app_state.rs`: future GUI host/session ownership and presentation state.
-- `src/ssh.rs`: embedded transport, authentication, host keys, config subset.
+- `src/desktop.rs`: cancellable read-only SSH worker and GUI connection state.
+- `src/window.rs`: FileMan-style winit/Blade lifecycle and offscreen rendering.
+- `src/ssh.rs` and `src/ssh/`: transport, bounded trust parsing, RustCrypto signing, agents.
 - `src/input.rs`: conventional GUI keys and terminal input/mouse encoding.
 - `src/ui/`: terminal views, sidebar, tabs, divider interactions, dialogs.
-- `src/main.rs`: CLI/bootstrap and eventually winit/Blade lifecycle.
+- `src/main.rs`: desktop, demo, snapshot, and headless CLI dispatch.
 - `tests/data/`: small, synthetic, deterministic protocol fixtures.
 
 The first implementation exposes a headless replay command in `src/replay.rs`.
@@ -145,12 +147,13 @@ package declares Rust 1.96+, as required by tmuxctl 0.1. Audit the actual resolv
 source, not just README claims. Do not introduce Alacritty's window/renderer or
 a local PTY dependency of our own.
 
-Embedded SSH uses `ssh2`, following FileMan, with `polling` for readiness waits
-and `base64` for host-key fingerprints. No second SSH library or asynchronous
-runtime is included. Windows enables vendored OpenSSL; Linux/macOS normally
-use system OpenSSL development libraries. See `docs/SSH.md` for authentication,
-trust-policy, and timeout boundaries. SSH configuration parsing is still pending;
-connection settings are explicit and unsupported semantics must not be ignored.
+Embedded SSH now uses Sunset 0.6 with RustCrypto identity signing through
+`ssh-key`; `polling` supplies readiness waits. The C-backed `ssh2` prototype is
+removed. No OpenSSL, ring, AWS-LC, or native crypto compilation is allowed.
+CI enforces the resolved dependency policy and blocks C/C++ compiler invocation;
+platform linkers, graphics libraries, and OS FFI remain normal requirements.
+See `docs/SSH.md` for trust policy, algorithms, agents, deadlines, and the current
+small SSH receive-window limitation. Connection settings remain explicit.
 
 Add only dependencies used by implemented code. Measure dependency count,
 clean-build time, binary size, startup, idle CPU, and memory separately; one is
@@ -310,13 +313,22 @@ ordinary tmux client can still attach; no custom remote executable is installed.
 Controlled primary/alternate-screen tests pass; native real-application acceptance
 remains outstanding. M2 can proceed against the current read-only model API.
 
-### M2 — Minimal FileMan-style desktop client
+### M2 — Minimal FileMan-style desktop client (read-only increment implemented)
 
-- [ ] Bring in the matching Blade/egui/winit set, with event-driven redraw.
-- [ ] Display independent pane grids, basic host/session selection, and errors.
-- [ ] Focus/input, local scrollback, selection, copy, and bracketed paste.
-- [ ] Draggable dividers with a tested shared-client sizing policy.
+- [x] Bring in the matching Blade/egui/winit set, with event-driven redraw.
+- [x] Display independent pane grids, explicit host/session form, window tabs, and errors.
+- [x] Local scrollback, selection, copy, and local-only draggable viewing dividers.
+- [x] Retain disconnected views and reject cancelled worker results.
+- [x] Add offscreen demo rendering and a native Linux/X11 clipboard/resize smoke harness.
+- [ ] Remote focus/input and bracketed paste with synchronized-epoch input gating.
+- [ ] Remote pane dividers with a tested shared-client sizing policy.
 - [ ] Manual smoke tests on Linux, macOS, and Windows; IME/high-DPI checks.
+
+Implementation note: the application opens a real read-only Blade/egui window.
+Only visible rows are painted; selection belongs to the pane emulator. The worker
+never performs SSH requests under the model lock. GPU frame views are retained
+until completion. Local divider movement does not resize tmux. Documentation and
+the real demo screenshot explicitly distinguish this from an interactive terminal.
 
 Gate: normal shell work and the user's Codex workflow are comfortable without
 learning tmux keybindings. Distinguish application history from terminal history.
@@ -376,8 +388,8 @@ server restart. Record unsupported terminal features explicitly.
 
 ## 11. Remaining design decisions
 
-1. Embedded SSH uses `ssh2`, following FileMan. Expand tested SSH configuration
-   and platform-agent coverage without introducing a second default SSH stack.
+1. Embedded SSH uses Sunset/RustCrypto. Measure its receive-window limits and
+   expand SSH configuration/agent compatibility without native crypto fallbacks.
 2. Exact snapshot/live-output ordering and mode reconstruction for supported tmux
    versions. This is the primary correctness investigation in M1/M3.
 3. Native text rasterization/fallback/IME and eventual accessibility needs;
@@ -392,11 +404,11 @@ server restart. Record unsupported terminal features explicitly.
 [3]: https://github.com/tmux/tmux/blob/master/control.c
 [4]: https://docs.rs/tmuxctl/latest/tmuxctl/
 [5]: https://docs.rs/alacritty_terminal/latest/alacritty_terminal/
-[6]: https://docs.rs/russh/latest/russh/
+[6]: https://docs.rs/sunset/0.6.0/sunset/
 [7]: https://github.com/kvark/fileman/tree/26499ebdb3d983190c61b9016a0ea31b2711aacf
 [8]: https://man.openbsd.org/ssh_config
 
 Primary technical references: [tmux control mode][1], [native client][2],
 [server control implementation][3], [tmuxctl][4], [Alacritty terminal core][5],
-[russh][6], [FileMan reference][7], and [OpenSSH configuration][8]. Library versions
+[Sunset][6], [FileMan reference][7], and [OpenSSH configuration][8]. Library versions
 and source links should be rechecked when a milestone introduces that dependency.

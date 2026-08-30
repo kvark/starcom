@@ -344,6 +344,12 @@ impl View {
     pub fn panes(&self) -> &collections::BTreeMap<tmuxctl::PaneId, Pane> {
         &self.panes
     }
+    /// Local selection changes only the client model, never the remote pane.
+    #[cfg(feature = "gui")]
+    pub(crate) fn panes_mut(&mut self) -> &mut collections::BTreeMap<tmuxctl::PaneId, Pane> {
+        &mut self.panes
+    }
+
     pub fn status(&self) -> Status {
         self.status
     }

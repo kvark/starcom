@@ -15,6 +15,9 @@ cleanup() {
 trap cleanup EXIT
 ssh-keygen -q -t ed25519 -N '' -f "$work/host_key"
 ssh-keygen -q -t ed25519 -N '' -f "$work/id_ed25519"
+ssh-keygen -q -t rsa -b 2048 -N '' -f "$work/id_rsa"
+ssh-keygen -q -t ecdsa -b 256 -N '' -f "$work/id_ecdsa"
+cat "$work/id_ed25519.pub" "$work/id_rsa.pub" "$work/id_ecdsa.pub" > "$work/authorized_keys"
 python3 - "$work/port" <<'PY'
 import socket, sys
 with socket.socket() as sock:
@@ -29,7 +32,7 @@ Port $port
 ListenAddress 127.0.0.1
 HostKey $work/host_key
 PidFile $work/sshd.pid
-AuthorizedKeysFile $work/id_ed25519.pub
+AuthorizedKeysFile $work/authorized_keys
 AllowUsers $user
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -37,6 +40,7 @@ PermitRootLogin prohibit-password
 UsePAM yes
 # Test fixture only: the unique authorized-key path lives under /tmp.
 StrictModes no
+RekeyLimit 16K
 PrintMotd no
 LogLevel ERROR
 EOF
@@ -68,7 +72,7 @@ cp "$work/known_hosts" "$work/known_hosts.hashed"
 ssh-keygen -H -f "$work/known_hosts.hashed" >/dev/null 2>&1
 eval "$(ssh-agent -s)" >/dev/null
 agent_started=1
-ssh-add "$work/id_ed25519" >/dev/null 2>&1
+ssh-add "$work/id_ed25519" "$work/id_rsa" "$work/id_ecdsa" >/dev/null 2>&1
 
 env -u TMUX tmux -S "$work/tmux.sock" -f /dev/null new-session -d -s starcom -x 100 -y 30 \
     "printf '\033[2J\033[HSTARCOM_PRIMARY_READY\r\n'; exec sleep 600"
@@ -86,4 +90,6 @@ for _ in $(seq 1 100); do
 done
 [[ "$count" == 2 ]] || { echo 'tmux fixture did not become ready' >&2; exit 1; }
 export STARCOM_TEST_DIR="$work" STARCOM_TEST_USER="$user"
-timeout 120s cargo test --test ssh_localhost -- --ignored --test-threads=1
+export STARCOM_AGENT_TEST_PUBKEY="$work/id_ed25519.pub"
+timeout 30s cargo test --locked --lib signs_with_isolated_openssh_agent -- --ignored --test-threads=1
+timeout 120s cargo test --locked --test ssh_localhost --test ssh_migration -- --ignored --test-threads=1

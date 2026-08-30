@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Rust still uses the normal platform linker; only native source compilation is blocked.
+  CC: starcom-no-c-compiler
+  CXX: starcom-no-cxx-compiler
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -19,47 +24,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Linux SSH dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config openssh-server tmux
-      - name: macOS OpenSSL
-        if: runner.os == 'macOS'
-        run: echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-      - name: Format check
-        run: cargo fmt --check
-      - name: Build
-        run: cargo build --locked --all-targets
-      - name: Test
-        run: cargo test --locked --all-targets
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Core without SSH
-        run: cargo test --locked --no-default-features --all-targets
-      - name: Isolated Linux SSH and tmux integration
-        if: runner.os == 'Linux'
-        run: scripts/test-ssh.sh
-
-  validate-recovered-desktop:
-    # Temporary, exact-tree validation. Creates blobs only; NEVER changes any ref.
-    # The application commit replaces this workflow with read-only cross-platform CI.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      CC: starcom-no-c-compiler
-      CXX: starcom-no-cxx-compiler
-      SOURCE_TREE: b38f4589d07559c6d1aa8ecbaf5e482f553227bf
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,91 +32,52 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Materialize the exact recovered source tree
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          export CANDIDATE="$RUNNER_TEMP/validated-desktop"
-          mkdir -p "$CANDIDATE"
-          echo "CANDIDATE=$CANDIDATE" >> "$GITHUB_ENV"
-          python3 - <<'PY'
-          import base64, concurrent.futures, hashlib, json, os, pathlib, urllib.request
-          root = pathlib.Path(os.environ['CANDIDATE'])
-          api = 'https://api.github.com/repos/kvark/starcom/git/'
-          def get(path):
-              req = urllib.request.Request(api + path, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(req, timeout=60) as response: return json.load(response)
-          tree = get('trees/' + os.environ['SOURCE_TREE'] + '?recursive=1')
-          assert not tree['truncated']
-          def save(entry):
-              if entry['type'] != 'blob': return
-              rel = pathlib.PurePosixPath(entry['path'])
-              assert not rel.is_absolute() and '..' not in rel.parts
-              data = base64.b64decode(get('blobs/' + entry['sha'])['content'])
-              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == entry['sha']
-              out = root / rel
-              out.parent.mkdir(parents=True, exist_ok=True)
-              out.write_bytes(data)
-              out.chmod(0o755 if entry['mode'] == '100755' else 0o644)
-          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool: list(pool.map(save, tree['tree']))
-          (root / 'source-tree.json').write_text(json.dumps(tree, indent=2))
-          PY
-      - name: Install test-server and software-rendering programs
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rustcrypto-desktop-v1
+      - name: Linux build and software-rendering dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config openssh-server tmux libxkbcommon-x11-0 libegl1 libvulkan1 mesa-vulkan-drivers vulkan-validationlayers xvfb xauth python3-xlib python3-pil
-      - name: Generate lockfile and validate without native source compilation
-        working-directory: ${{ env.CANDIDATE }}
+          sudo apt-get install -y pkg-config openssh-server tmux libxkbcommon-x11-0 libegl1 libvulkan1 mesa-vulkan-drivers vulkan-validationlayers xvfb xauth python3-xlib
+      - name: Format check
+        run: cargo fmt --check
+      - name: Native crypto dependency policy
+        run: python scripts/check-dependencies.py
+      - name: Build
+        run: cargo build --locked --all-features --all-targets
+      - name: Test
+        run: cargo test --locked --all-features --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - name: Core without SSH or GUI
+        run: cargo test --locked --no-default-features --all-targets
+      - name: SSH without GUI
+        run: cargo test --locked --no-default-features --features ssh --all-targets
+      - name: Native Windows OpenSSH-agent signing
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          cargo generate-lockfile
-          cargo fmt --check
-          python3 scripts/check-dependencies.py
-          cargo build --locked --all-features --all-targets
-          cargo test --locked --all-features --all-targets
-          cargo clippy --locked --all-features --all-targets -- -D warnings
-          scripts/test-ssh.sh
-      - name: Render genuine demo and test native clipboard and resizing
-        working-directory: ${{ env.CANDIDATE }}
+          Set-Service -Name ssh-agent -StartupType Manual
+          Start-Service ssh-agent
+          python scripts/test-windows-agent.py
+      - name: Isolated Linux SSH and tmux integration
+        if: runner.os == 'Linux'
+        run: scripts/test-ssh.sh
+      - name: Offscreen desktop and native X11 smoke
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
+          set -euo pipefail
           export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp*.json' -print -quit)"
           test -n "$VK_ICD_FILENAMES"
           cargo run --locked -- --demo --snapshot target/test-artifacts/desktop.png
           xvfb-run -a -s '-screen 0 1400x900x24' /usr/bin/python3 scripts/test-desktop.py
-          /usr/bin/python3 - <<'PY'
-          from pathlib import Path
-          from PIL import Image
-          Path('etc').mkdir(exist_ok=True)
-          image = Image.open('target/test-artifacts/desktop.png').convert('RGB')
-          image.quantize(colors=96, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE).save('etc/screenshot.png', optimize=True)
-          PY
-      - name: Preserve generated Git blobs without publishing a commit
-        working-directory: ${{ env.CANDIDATE }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import base64, hashlib, json, os, pathlib, urllib.request
-          result = {'source_tree': os.environ['SOURCE_TREE'], 'files': []}
-          for name in ['Cargo.lock', 'etc/screenshot.png']:
-              data = pathlib.Path(name).read_bytes()
-              sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              body = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode()
-              req = urllib.request.Request('https://api.github.com/repos/kvark/starcom/git/blobs', data=body, method='POST', headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json', 'Content-Type':'application/json'})
-              with urllib.request.urlopen(req, timeout=60) as response: blob = json.load(response)
-              assert blob['sha'] == sha
-              result['files'].append({'path':name, 'mode':'100644', 'type':'blob', 'sha':sha})
-          pathlib.Path('generated-blobs.json').write_text(json.dumps(result, indent=2))
-          print(json.dumps(result, indent=2))
-          PY
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - name: Upload desktop validation images and logs
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
         with:
-          name: recovered-desktop-validation
-          path: |
-            ${{ env.CANDIDATE }}/Cargo.lock
-            ${{ env.CANDIDATE }}/generated-blobs.json
-            ${{ env.CANDIDATE }}/source-tree.json
-            ${{ env.CANDIDATE }}/etc/screenshot.png
-            ${{ env.CANDIDATE }}/target/test-artifacts
+          name: desktop-validation
+          path: target/test-artifacts
           if-no-files-found: ignore
           retention-days: 7

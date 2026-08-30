@@ -1,13 +1,18 @@
-//! Embedded SSH using FileMan's libssh2 stack. No local ssh process or PTY.
+//! Embedded SSH with Sunset and RustCrypto; no libssh2, OpenSSL, or SSH subprocess.
 //!
-//! Connection/authentication are blocking, with libssh2 timeouts. Run this API
-//! on a worker, not the future GUI thread. Channel I/O is nonblocking and uses
-//! socket readiness, not sleep/poll loops. A connection owns one channel for now.
+//! Run connection setup on a worker. One nonblocking socket owns one exec channel;
+//! bounded queues preserve stdout/stderr separation and apply backpressure. The
+//! system resolver and local file/agent connection setup can still block.
 
-use std::{fmt, fs, io, net, path, time};
+use std::{collections, fmt, io, net, path, time};
 
-const MAX_KNOWN_HOSTS_BYTES: u64 = 4 * 1024 * 1024;
-const AGAIN: ssh2::ErrorCode = ssh2::ErrorCode::Session(-37);
+mod agent;
+mod auth;
+mod trust;
+
+const MAX_QUEUED_STDOUT: usize = 1024 * 1024;
+const MAX_QUEUED_STDERR: usize = 64 * 1024;
+const DRIVE_BUDGET: usize = 512;
 
 #[derive(Clone, Debug)]
 pub enum Authentication {
@@ -102,42 +107,39 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub struct Connection {
-    session: ssh2::Session,
+    runner: sunset::Runner<'static, sunset::Client>,
     socket: net::TcpStream,
     poller: polling::Poller,
     events: polling::Events,
-    timeout: time::Duration,
+    options: Options,
+    trust: trust::Store,
+    credentials: Option<auth::Credentials>,
+    verified: bool,
+    authenticated: bool,
     fingerprint: String,
+    handle: Option<sunset::ChanHandle>,
+    command: Option<String>,
+    started: bool,
+    incoming: Vec<u8>,
+    incoming_offset: usize,
+    stdout: collections::VecDeque<u8>,
+    stderr: collections::VecDeque<u8>,
+    closed: bool,
 }
 
 impl Connection {
     pub fn connect(options: &Options) -> Result<Self, Error> {
         options.validate()?;
-        let file =
-            fs::File::open(&options.known_hosts).map_err(|e| Error::new(Kind::Configuration, e))?;
-        let mut limited = io::Read::take(file, MAX_KNOWN_HOSTS_BYTES + 1);
-        let mut bytes = Vec::new();
-        io::Read::read_to_end(&mut limited, &mut bytes)
-            .map_err(|e| Error::new(Kind::Configuration, e))?;
-        if bytes.len() as u64 > MAX_KNOWN_HOSTS_BYTES {
-            return Err(Error::new(
-                Kind::Configuration,
-                "known-hosts file exceeds 4 MiB",
-            ));
-        }
-        let text = std::str::from_utf8(&bytes).map_err(|e| Error::new(Kind::Configuration, e))?;
-        // Reject unsupported trust semantics before networking or authentication.
-        validate_known_hosts(text)?;
-
-        // ToSocketAddrs uses the OS resolver; do not claim a DNS deadline here.
+        let trust = trust::Store::load(&options.known_hosts)?;
+        // The OS resolver isn't cancellable through ToSocketAddrs. Connection
+        // and authentication deadlines start after it returns; never run on UI.
         let addresses = net::ToSocketAddrs::to_socket_addrs(&(options.host.as_str(), options.port))
-            .map_err(|e| Error::new(Kind::Transport, e))?;
+            .map_err(transport)?;
         let deadline = time::Instant::now() + options.timeout;
         let mut socket = None;
         let mut last_error = "hostname resolved to no usable address".to_owned();
         for address in addresses.take(16) {
-            let remaining = remaining(deadline)?;
-            match net::TcpStream::connect_timeout(&address, remaining) {
+            match net::TcpStream::connect_timeout(&address, remaining(deadline)?) {
                 Ok(stream) => {
                     socket = Some(stream);
                     break;
@@ -145,111 +147,285 @@ impl Connection {
                 Err(error) => last_error = error.to_string(),
             }
         }
-        let socket = socket.ok_or_else(|| Error::new(Kind::Transport, last_error))?;
-        socket
-            .set_nodelay(true)
-            .map_err(|e| Error::new(Kind::Transport, e))?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| Error::new(Kind::Transport, e))?;
-        let mut session = ssh2::Session::new().map_err(|e| Error::new(Kind::Transport, e))?;
-        session.set_tcp_stream(
-            socket
-                .try_clone()
-                .map_err(|e| Error::new(Kind::Transport, e))?,
-        );
-        session.set_timeout(options.timeout.as_millis() as u32);
-        session
-            .handshake()
-            .map_err(|e| Error::new(Kind::Transport, e))?;
-        let (key, _) = session
-            .host_key()
-            .ok_or_else(|| Error::new(Kind::Transport, "server supplied no host key"))?;
-        let hash = session
-            .host_key_hash(ssh2::HashType::Sha256)
-            .ok_or_else(|| Error::new(Kind::Transport, "host-key fingerprint unavailable"))?;
-        let fingerprint = format!(
-            "SHA256:{}",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, hash)
-        );
-        verify_known_hosts(&session, text, &options.host, options.port, key).map_err(
-            |mut error| {
-                error.detail.push_str(&format!("; presented {fingerprint}"));
-                error
-            },
-        )?;
-
-        // Never authenticate before host-key verification. No TOFU, passwords in
-        // argv, agent forwarding, or fallback to an unintended identity.
-        let auth = match options.authentication {
-            Authentication::Identity(ref private_key) => {
-                session.userauth_pubkey_file(&options.user, None, private_key, None)
-            }
-            Authentication::Agent => session.userauth_agent(&options.user),
-        };
-        auth.map_err(|e| Error::new(Kind::Authentication, e))?;
-        if !session.authenticated() {
-            return Err(Error::new(
-                Kind::Authentication,
-                "authentication was not completed",
-            ));
-        }
-        session.set_blocking(false);
-        let poller = polling::Poller::new().map_err(|e| Error::new(Kind::Transport, e))?;
-        // SAFETY: Connection owns the registered socket and deletes it from the
-        // poller in Drop before the socket can be closed or reused.
-        unsafe { poller.add(&socket, polling::Event::readable(0)) }
-            .map_err(|e| Error::new(Kind::Transport, e))?;
-        Ok(Self {
-            session,
+        let socket = socket.ok_or_else(|| transport(last_error))?;
+        socket.set_nodelay(true).map_err(transport)?;
+        socket.set_nonblocking(true).map_err(transport)?;
+        let poller = polling::Poller::new().map_err(transport)?;
+        // SAFETY: Connection owns this socket and deregisters it before drop.
+        unsafe { poller.add(&socket, polling::Event::readable(0)) }.map_err(transport)?;
+        let mut connection = Self {
+            runner: sunset::Runner::new_client_owned(),
             socket,
             poller,
             events: polling::Events::new(),
-            timeout: options.timeout,
-            fingerprint,
-        })
+            options: options.clone(),
+            trust,
+            credentials: None,
+            verified: false,
+            authenticated: false,
+            fingerprint: String::new(),
+            handle: None,
+            command: None,
+            started: false,
+            incoming: Vec::new(),
+            incoming_offset: 0,
+            stdout: collections::VecDeque::new(),
+            stderr: collections::VecDeque::new(),
+            closed: false,
+        };
+        while !connection.authenticated {
+            remaining(deadline)?;
+            let progressed = connection.drive(deadline)?;
+            if connection.closed {
+                return Err(transport("connection ended before authentication"));
+            }
+            if !progressed {
+                connection.wait_ready(deadline)?;
+            }
+        }
+        // Signing secrets and the agent socket are not needed once authenticated.
+        connection.credentials = None;
+        Ok(connection)
     }
 
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
 
-    /// Execute a caller-constructed remote command; no interactive shell or PTY
-    /// is requested. User data must be shell-quoted by the command builder.
+    /// Execute a caller-quoted command without a PTY, environment requests,
+    /// forwarded agent, shell wrapper, or repeated SSH invocation.
     pub fn exec(mut self, command: &str) -> Result<Channel, Error> {
-        let deadline = time::Instant::now() + self.timeout;
-        let mut inner = self.retry(deadline, |session| session.channel_session())?;
-        self.retry(deadline, |_| inner.exec(command))?;
-        Ok(Channel {
-            inner,
-            connection: self,
-        })
+        if command.is_empty() || command.len() > 8192 || command.contains('\0') {
+            return Err(Error::new(
+                Kind::Configuration,
+                "invalid remote exec command",
+            ));
+        }
+        let deadline = time::Instant::now() + self.options.timeout;
+        self.command = Some(command.to_owned());
+        self.handle = Some(self.runner.open_client_session().map_err(protocol)?);
+        while !self.started {
+            remaining(deadline)?;
+            let progressed = self.drive(deadline)?;
+            if self.closed {
+                return Err(transport("connection ended opening exec channel"));
+            }
+            if !progressed {
+                self.wait_ready(deadline)?;
+            }
+        }
+        Ok(Channel { connection: self })
     }
 
-    fn retry<T>(
-        &mut self,
-        deadline: time::Instant,
-        mut operation: impl FnMut(&mut ssh2::Session) -> Result<T, ssh2::Error>,
-    ) -> Result<T, Error> {
-        loop {
-            remaining(deadline)?;
-            match operation(&mut self.session) {
-                Ok(value) => return Ok(value),
-                Err(error) if error.code() == AGAIN => self.wait(deadline)?,
-                Err(error) => return Err(Error::new(Kind::Transport, error)),
+    /// Advance bounded network/protocol work without blocking the socket.
+    /// Caller data is never retried across a new connection.
+    fn drive(&mut self, deadline: time::Instant) -> Result<bool, Error> {
+        if self.closed {
+            return Ok(false);
+        }
+        let mut any_progress = false;
+        for _ in 0..DRIVE_BUDGET {
+            // Drain an existing data packet before asking the protocol to move
+            // on. A full queue stops network reads rather than dropping output.
+            let mut progressed = self.drain_channel()?;
+            if self.runner.read_channel_ready().is_some() {
+                return Ok(any_progress || progressed);
             }
+            match self.runner.progress().map_err(protocol)? {
+                sunset::Event::None => {}
+                sunset::Event::Progressed => progressed = true,
+                sunset::Event::Cli(event) => {
+                    progressed = true;
+                    match event {
+                        sunset::CliEvent::Hostkey(check) => {
+                            let mut wire = Vec::new();
+                            sunset::sshwire::ssh_push_vec(
+                                &mut wire,
+                                &check.hostkey().map_err(protocol)?,
+                            )
+                            .map_err(protocol)?;
+                            // Also applied to subsequent key exchanges. Never
+                            // accept a changed key just because the channel exists.
+                            self.fingerprint =
+                                self.trust
+                                    .verify(&self.options.host, self.options.port, &wire)?;
+                            check.accept().map_err(protocol)?;
+                            self.verified = true;
+                        }
+                        sunset::CliEvent::Username(request) => {
+                            if !self.verified {
+                                return Err(transport(
+                                    "authentication requested before verified host key",
+                                ));
+                            }
+                            request.username(&self.options.user).map_err(protocol)?;
+                        }
+                        sunset::CliEvent::Pubkey(request) => {
+                            if !self.verified {
+                                return Err(transport(
+                                    "identity requested before verified host key",
+                                ));
+                            }
+                            if self.credentials.is_none() {
+                                self.credentials = Some(auth::Credentials::load(
+                                    &self.options.authentication,
+                                    deadline,
+                                )?);
+                            }
+                            let key = self
+                                .credentials
+                                .as_mut()
+                                .expect("loaded above")
+                                .next_key()?;
+                            request.pubkey(key).map_err(protocol)?;
+                        }
+                        sunset::CliEvent::AgentSign(request) => {
+                            self.credentials
+                                .as_mut()
+                                .ok_or_else(|| transport("unexpected signing request"))?
+                                .sign(request, deadline)?;
+                        }
+                        sunset::CliEvent::Password(request) => {
+                            request.skip().map_err(protocol)?;
+                            return Err(Error::new(
+                                Kind::Authentication,
+                                "server requires another authentication method; no password fallback",
+                            ));
+                        }
+                        sunset::CliEvent::Authenticated => {
+                            if !self.verified {
+                                return Err(transport("unverified authentication"));
+                            }
+                            self.authenticated = true;
+                        }
+                        sunset::CliEvent::SessionOpened(mut opened) => {
+                            if self.handle.as_ref().map(sunset::ChanHandle::num)
+                                != Some(opened.channel())
+                            {
+                                return Err(transport("unexpected SSH channel"));
+                            }
+                            let command = self
+                                .command
+                                .take()
+                                .ok_or_else(|| transport("unexpected exec notification"))?;
+                            opened.exec(command).map_err(protocol)?;
+                            // Sunset sends exec without requesting a reply.
+                            // Command readiness is established by tmux responses,
+                            // not by this flag (and denied execs end the channel).
+                            self.started = true;
+                        }
+                        sunset::CliEvent::SessionExit(_) | sunset::CliEvent::Banner(_) => {}
+                        sunset::CliEvent::Defunct => self.closed = true,
+                        sunset::CliEvent::PollAgain => {}
+                    }
+                }
+                sunset::Event::Serv(_) => return Err(transport("unexpected server-side event")),
+            }
+            if self.closed {
+                return Ok(true);
+            }
+            progressed |= self.flush_socket()?;
+            progressed |= self.drain_channel()?;
+            if self.runner.read_channel_ready().is_some() {
+                return Ok(any_progress || progressed);
+            }
+            if self.runner.is_input_ready() {
+                if self.incoming_offset == self.incoming.len() {
+                    let mut buffer = [0; 16 * 1024];
+                    match io::Read::read(&mut self.socket, &mut buffer) {
+                        Ok(0) => {
+                            self.runner.close_input();
+                            progressed = true;
+                        }
+                        Ok(count) => {
+                            self.incoming.clear();
+                            self.incoming.extend_from_slice(&buffer[..count]);
+                            self.incoming_offset = 0;
+                            progressed = true;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                            progressed = true
+                        }
+                        Err(error) => return Err(transport(error)),
+                    }
+                }
+                if self.incoming_offset < self.incoming.len() {
+                    let count = self
+                        .runner
+                        .input(&self.incoming[self.incoming_offset..])
+                        .map_err(protocol)?;
+                    self.incoming_offset += count;
+                    progressed |= count != 0;
+                }
+            }
+            any_progress |= progressed;
+            if !progressed {
+                break;
+            }
+        }
+        Ok(any_progress)
+    }
+
+    fn drain_channel(&mut self) -> Result<bool, Error> {
+        let Some((number, data, pending)) = self.runner.read_channel_ready() else {
+            return Ok(false);
+        };
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| transport("data before exec channel"))?;
+        if handle.num() != number {
+            return Err(transport("data for unknown channel"));
+        }
+        let (queue, limit) = match data {
+            sunset::ChanData::Normal => (&mut self.stdout, MAX_QUEUED_STDOUT),
+            sunset::ChanData::Stderr => (&mut self.stderr, MAX_QUEUED_STDERR),
+        };
+        let mut buffer = [0; 8192];
+        let capacity = buffer
+            .len()
+            .min(limit.saturating_sub(queue.len()))
+            .min(pending);
+        if capacity == 0 {
+            return Ok(false);
+        }
+        let count = self
+            .runner
+            .read_channel(handle, data, &mut buffer[..capacity])
+            .map_err(protocol)?;
+        queue.extend(&buffer[..count]);
+        Ok(count != 0)
+    }
+
+    fn flush_socket(&mut self) -> Result<bool, Error> {
+        let bytes = self.runner.output_buf();
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        match io::Write::write(&mut self.socket, bytes) {
+            Ok(0) => Err(transport(
+                "SSH socket closed during write; delivery is uncertain",
+            )),
+            Ok(count) => {
+                self.runner.consume_output(count);
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(true),
+            Err(error) => Err(transport(error)),
         }
     }
 
-    fn wait(&mut self, deadline: time::Instant) -> Result<(), Error> {
-        let interest = match self.session.block_directions() {
-            ssh2::BlockDirections::Outbound => polling::Event::writable(0),
-            ssh2::BlockDirections::Both => polling::Event::all(0),
-            _ => polling::Event::readable(0),
+    fn wait_ready(&mut self, deadline: time::Instant) -> Result<(), Error> {
+        let interest = if self.runner.is_output_pending() {
+            polling::Event::all(0)
+        } else {
+            polling::Event::readable(0)
         };
         self.poller
             .modify(&self.socket, interest)
-            .map_err(|e| Error::new(Kind::Transport, e))?;
+            .map_err(transport)?;
         loop {
             self.events.clear();
             match self
@@ -259,9 +435,16 @@ impl Connection {
                 Ok(count) if count != 0 => return Ok(()),
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(Error::new(Kind::Transport, error)),
+                Err(error) => return Err(transport(error)),
             }
         }
+    }
+
+    fn channel_eof(&self) -> bool {
+        self.closed
+            || self.handle.as_ref().is_some_and(|handle| {
+                self.runner.is_channel_eof(handle) || self.runner.is_channel_closed(handle)
+            })
     }
 }
 
@@ -273,50 +456,107 @@ impl Drop for Connection {
 }
 
 pub struct Channel {
-    inner: ssh2::Channel,
     connection: Connection,
 }
 
 impl Channel {
     pub fn timeout(&self) -> time::Duration {
-        self.connection.timeout
+        self.connection.options.timeout
     }
     pub fn fingerprint(&self) -> &str {
         self.connection.fingerprint()
     }
     pub fn eof(&self) -> bool {
-        self.inner.eof()
+        self.connection.channel_eof()
+            && self.connection.stdout.is_empty()
+            && self.connection.stderr.is_empty()
     }
     pub fn wait(&mut self, deadline: time::Instant) -> Result<(), Error> {
-        self.connection.wait(deadline)
+        remaining(deadline)?;
+        if !self.connection.drive(deadline)? && !self.eof() {
+            self.connection.wait_ready(deadline)?;
+        }
+        Ok(())
     }
     pub fn read_stderr(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        io::Read::read(&mut self.inner.stderr(), bytes)
+        self.read_stream(bytes, sunset::ChanData::Stderr)
     }
     pub fn abort(&mut self) {
+        self.connection.closed = true;
         let _ = self.connection.socket.shutdown(net::Shutdown::Both);
+    }
+    fn read_stream(&mut self, bytes: &mut [u8], data: sunset::ChanData) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.connection
+            .drive(time::Instant::now() + self.timeout())
+            .map_err(io::Error::other)?;
+        let eof = self.connection.channel_eof();
+        let queue = match data {
+            sunset::ChanData::Normal => &mut self.connection.stdout,
+            sunset::ChanData::Stderr => &mut self.connection.stderr,
+        };
+        let count = bytes.len().min(queue.len());
+        for byte in &mut bytes[..count] {
+            *byte = queue.pop_front().expect("length checked");
+        }
+        if count != 0 || eof {
+            Ok(count)
+        } else {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
     }
 }
 
 impl io::Read for Channel {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        io::Read::read(&mut self.inner, bytes)
+        self.read_stream(bytes, sunset::ChanData::Normal)
     }
 }
 
 impl io::Write for Channel {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        io::Write::write(&mut self.inner, bytes)
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.connection
+            .drive(time::Instant::now() + self.timeout())
+            .map_err(io::Error::other)?;
+        if self.connection.channel_eof() {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let handle = self
+            .connection
+            .handle
+            .as_ref()
+            .expect("exec opened channel");
+        let count = self
+            .connection
+            .runner
+            .write_channel(handle, sunset::ChanData::Normal, bytes)
+            .map_err(|error| io::Error::other(protocol(error)))?;
+        self.connection.flush_socket().map_err(io::Error::other)?;
+        if count == 0 {
+            Err(io::ErrorKind::WouldBlock.into())
+        } else {
+            Ok(count)
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
-        io::Write::flush(&mut self.inner)
+        self.connection
+            .drive(time::Instant::now() + self.timeout())
+            .map_err(io::Error::other)?;
+        if self.connection.runner.is_output_pending() {
+            Err(io::ErrorKind::WouldBlock.into())
+        } else {
+            Ok(())
+        }
     }
 }
 
 impl Drop for Channel {
     fn drop(&mut self) {
-        // Closing our SSH transport detaches this client, not the tmux server.
-        // Also prevents libssh2 teardown from waiting on a stalled peer.
         self.abort();
     }
 }
@@ -324,142 +564,26 @@ impl Drop for Channel {
 fn remaining(deadline: time::Instant) -> Result<time::Duration, Error> {
     deadline
         .checked_duration_since(time::Instant::now())
-        .filter(|d| !d.is_zero())
+        .filter(|duration| !duration.is_zero())
         .ok_or_else(|| Error::new(Kind::Timeout, "operation deadline expired"))
 }
 
-fn validate_known_hosts(text: &str) -> Result<(), Error> {
-    for (index, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let hosts = line.split_whitespace().next().unwrap_or("");
-        if hosts.starts_with('@') || hosts.contains(['*', '?', '!']) {
-            return Err(Error::new(
-                Kind::Configuration,
-                format!(
-                    "known-hosts line {} uses unsupported markers/patterns; refusing to ignore trust policy",
-                    index + 1
-                ),
-            ));
-        }
-    }
-    Ok(())
+fn protocol(error: sunset::Error) -> Error {
+    let kind = if matches!(error, sunset::Error::NoAuthMethods) {
+        Kind::Authentication
+    } else {
+        Kind::Transport
+    };
+    Error::new(kind, error)
 }
 
-fn verify_known_hosts(
-    session: &ssh2::Session,
-    text: &str,
-    host: &str,
-    port: u16,
-    key: &[u8],
-) -> Result<(), Error> {
-    validate_known_hosts(text)?;
-    let mut hosts = session
-        .known_hosts()
-        .map_err(|e| Error::new(Kind::Configuration, e))?;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        hosts
-            .read_str(line, ssh2::KnownHostFileKind::OpenSSH)
-            .map_err(|e| Error::new(Kind::Configuration, e))?;
-    }
-    // check_port may also consult an unqualified hostname. We intentionally
-    // require the exact OpenSSH host:port identity for a non-default port.
-    let lookup = if port == 22 {
-        host.to_owned()
-    } else {
-        format!("[{host}]:{port}")
-    };
-    match hosts.check(&lookup, key) {
-        ssh2::CheckResult::Match => Ok(()),
-        ssh2::CheckResult::NotFound => Err(Error::new(
-            Kind::UnknownHostKey,
-            "host key is not trusted; authenticate it out of band before adding it to known_hosts",
-        )),
-        ssh2::CheckResult::Mismatch => Err(Error::new(
-            Kind::ChangedHostKey,
-            "host key differs from known_hosts; refusing authentication",
-        )),
-        ssh2::CheckResult::Failure => Err(Error::new(
-            Kind::Configuration,
-            "known-hosts verification failed",
-        )),
-    }
+fn transport(detail: impl fmt::Display) -> Error {
+    Error::new(Kind::Transport, detail)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn key(fill: u8) -> Vec<u8> {
-        let mut key = b"\0\0\0\x0bssh-ed25519\0\0\0\x20".to_vec();
-        key.extend_from_slice(&[fill; 32]);
-        key
-    }
-
-    #[test]
-    fn host_keys_are_exact_and_port_scoped() {
-        let session = ssh2::Session::new().unwrap();
-        let key = key(7);
-        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key);
-        let text = format!("[example.test]:2222 ssh-ed25519 {encoded}\n");
-        assert!(verify_known_hosts(&session, &text, "example.test", 2222, &key).is_ok());
-        assert_eq!(
-            verify_known_hosts(&session, &text, "example.test", 22, &key)
-                .unwrap_err()
-                .kind,
-            Kind::UnknownHostKey
-        );
-        assert_eq!(
-            verify_known_hosts(&session, &text, "example.test", 2223, &key)
-                .unwrap_err()
-                .kind,
-            Kind::UnknownHostKey
-        );
-        assert_eq!(
-            verify_known_hosts(&session, &text, "other.test", 2222, &key)
-                .unwrap_err()
-                .kind,
-            Kind::UnknownHostKey
-        );
-        let mut changed = key.clone();
-        changed[20] ^= 1;
-        assert_eq!(
-            verify_known_hosts(&session, &text, "example.test", 2222, &changed)
-                .unwrap_err()
-                .kind,
-            Kind::ChangedHostKey
-        );
-        let bare = format!("example.test ssh-ed25519 {encoded}\n");
-        assert_eq!(
-            verify_known_hosts(&session, &bare, "example.test", 2222, &key)
-                .unwrap_err()
-                .kind,
-            Kind::UnknownHostKey
-        );
-    }
-
-    #[test]
-    fn unsupported_trust_policy_is_not_ignored() {
-        for line in [
-            "@revoked host ssh-ed25519 AAAA",
-            "@cert-authority host key",
-            "*.test key",
-            "!bad.test,good.test key",
-        ] {
-            assert_eq!(
-                validate_known_hosts(line).unwrap_err().kind,
-                Kind::Configuration
-            );
-        }
-        assert!(validate_known_hosts("# comment\n\n[::1]:2222 ssh-ed25519 AAAA\n").is_ok());
-    }
-
     #[test]
     fn diagnostics_cannot_emit_terminal_controls() {
         let error = Error::new(Kind::Transport, "remote\x1b]52;c;payload\x07\n");

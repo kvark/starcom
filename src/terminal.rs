@@ -1,4 +1,4 @@
-use alacritty_terminal::{event, grid, index, term, vte};
+use alacritty_terminal::{event, grid, index, selection, term, vte};
 
 use crate::core;
 
@@ -108,6 +108,51 @@ impl Terminal {
             .collect()
     }
 
+    /// Selection remains in Alacritty's model so incoming scrolls rotate its
+    /// anchors along with the text, including wide and combining characters.
+    pub fn begin_selection(
+        &mut self,
+        point: index::Point,
+        side: index::Side,
+        kind: selection::SelectionType,
+    ) {
+        let point = self.clamp_point(point);
+        self.model.selection = Some(selection::Selection::new(kind, point, side));
+    }
+
+    pub fn update_selection(&mut self, point: index::Point, side: index::Side) {
+        let point = self.clamp_point(point);
+        if let Some(ref mut selection) = self.model.selection {
+            selection.update(point, side);
+        }
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        self.model.selection_to_string()
+    }
+
+    pub fn selection_range(&self) -> Option<selection::SelectionRange> {
+        self.model
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.model))
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.model.selection = None;
+    }
+
+    fn clamp_point(&self, point: index::Point) -> index::Point {
+        use grid::Dimensions;
+        index::Point::new(
+            index::Line(point.line.0.clamp(
+                self.model.grid().topmost_line().0,
+                self.size.rows() as i32 - 1,
+            )),
+            index::Column(point.column.0.min(self.size.columns() - 1)),
+        )
+    }
+
     pub fn is_alternate_screen(&self) -> bool {
         self.model.mode().contains(term::TermMode::ALT_SCREEN)
     }
@@ -142,5 +187,44 @@ mod tests {
             terminal.feed(std::slice::from_ref(byte));
         }
         assert_eq!(terminal.screen_lines()[0], "café 界 e\u{301}");
+    }
+    #[test]
+    fn local_copy_preserves_soft_wraps_wide_and_combining_characters() {
+        let mut terminal = Terminal::new(core::Size::new(8, 3).unwrap(), 20);
+        terminal.feed("abcdefghij界e\u{301}".as_bytes());
+        terminal.begin_selection(
+            index::Point::new(index::Line(0), index::Column(0)),
+            index::Side::Left,
+            selection::SelectionType::Simple,
+        );
+        terminal.update_selection(
+            index::Point::new(index::Line(1), index::Column(4)),
+            index::Side::Right,
+        );
+        assert_eq!(
+            terminal.selected_text().as_deref(),
+            Some("abcdefghij界e\u{301}")
+        );
+    }
+
+    #[test]
+    fn selection_moves_with_incoming_scroll_without_copying_new_text() {
+        let mut terminal = Terminal::new(core::Size::new(10, 2).unwrap(), 20);
+        terminal.feed(b"alpha\r\nbeta");
+        terminal.begin_selection(
+            index::Point::new(index::Line(0), index::Column(0)),
+            index::Side::Left,
+            selection::SelectionType::Simple,
+        );
+        terminal.update_selection(
+            index::Point::new(index::Line(0), index::Column(4)),
+            index::Side::Right,
+        );
+        terminal.feed(b"\r\ngamma");
+        assert_eq!(terminal.selected_text().as_deref(), Some("alpha"));
+        assert_eq!(
+            terminal.selection_range().unwrap().start.line,
+            index::Line(-1)
+        );
     }
 }

@@ -31,6 +31,12 @@ impl Session {
         })
     }
 
+    /// The desktop worker keeps I/O separate from the briefly locked models.
+    #[cfg(feature = "gui")]
+    pub(crate) fn into_parts(self) -> (inspect::Inspector, snapshot::View) {
+        (self.inspector, self.view)
+    }
+
     pub fn view(&self) -> &snapshot::View {
         &self.view
     }
@@ -70,7 +76,7 @@ impl Session {
     }
 }
 
-fn restore(
+pub(crate) fn restore(
     inspector: &mut inspect::Inspector,
     session: tmuxctl::SessionId,
     history: usize,
