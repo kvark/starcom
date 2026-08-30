@@ -4,11 +4,14 @@ set -euo pipefail
 work=$(mktemp -d /tmp/starcom-ssh.XXXXXX)
 chmod 700 "$work"
 sshd_pid=""
+noforward_pid=""
 agent_started=0
 cleanup() {
     tmux -S "$work/tmux.sock" kill-server 2>/dev/null || true
     if [[ -f "$work/sshd.pid" ]]; then sudo kill "$(cat "$work/sshd.pid")" 2>/dev/null || true; fi
+    if [[ -f "$work/sshd.noforward.pid" ]]; then sudo kill "$(cat "$work/sshd.noforward.pid")" 2>/dev/null || true; fi
     if [[ -n "$sshd_pid" ]]; then sudo kill "$sshd_pid" 2>/dev/null || true; fi
+    if [[ -n "$noforward_pid" ]]; then sudo kill "$noforward_pid" 2>/dev/null || true; fi
     if [[ "$agent_started" == 1 ]]; then ssh-agent -k >/dev/null 2>&1 || true; fi
     rm -rf "$work"
 }
@@ -43,10 +46,27 @@ StrictModes no
 RekeyLimit 16K
 PrintMotd no
 LogLevel ERROR
+AllowTcpForwarding yes
 EOF
+# A second server that forbids forwarding, so the refusal path is exercised
+# against a real sshd rather than assumed. Bastions commonly disable it.
+python3 - "$work/port.noforward" <<'PY'
+import socket, sys
+with socket.socket() as sock:
+    sock.bind(('127.0.0.1', 0))
+    with open(sys.argv[1], 'w') as out:
+        out.write(str(sock.getsockname()[1]))
+PY
+noforward_port=$(cat "$work/port.noforward")
+sed -e "s/^Port .*/Port $noforward_port/" \
+    -e "s/^AllowTcpForwarding .*/AllowTcpForwarding no/" \
+    -e "s|^PidFile .*|PidFile $work/sshd.noforward.pid|" \
+    "$work/sshd_config" > "$work/sshd_config.noforward"
 sudo mkdir -p /run/sshd
 sudo /usr/sbin/sshd -D -e -f "$work/sshd_config" > "$work/sshd.log" 2>&1 &
 sshd_pid=$!
+sudo /usr/sbin/sshd -D -e -f "$work/sshd_config.noforward" > "$work/sshd.noforward.log" 2>&1 &
+noforward_pid=$!
 python3 - "$port" "$work/sshd.log" <<'PY'
 import socket, sys, time
 end = time.monotonic() + 10
@@ -63,6 +83,8 @@ PY
 # ssh-keyscan result. All private fixture keys are deleted by the EXIT trap.
 read -r kind key _ < "$work/host_key.pub"
 printf '[127.0.0.1]:%s %s %s\n' "$port" "$kind" "$key" > "$work/known_hosts"
+# Both servers present the same host key; trust the second one's port too.
+printf '[127.0.0.1]:%s %s %s\n' "$noforward_port" "$kind" "$key" >> "$work/known_hosts"
 printf '@revoked [127.0.0.1]:%s %s %s\n' "$port" "$kind" "$key" > "$work/known_hosts.revoked"
 cat "$work/known_hosts" >> "$work/known_hosts.revoked"
 read -r kind key _ < "$work/id_ed25519.pub"
@@ -90,6 +112,7 @@ for _ in $(seq 1 100); do
 done
 [[ "$count" == 2 ]] || { echo 'tmux fixture did not become ready' >&2; exit 1; }
 export STARCOM_TEST_DIR="$work" STARCOM_TEST_USER="$user"
+export STARCOM_NO_FORWARD_PORT="$noforward_port"
 export STARCOM_AGENT_TEST_PUBKEY="$work/id_ed25519.pub"
 # cargo exits 0 when a filter matches nothing, so a renamed test or a changed
 # cfg would leave this whole fixture green having asserted nothing. Require the
@@ -109,5 +132,19 @@ run_fixture() {
     fi
 }
 
-run_fixture 1 timeout 30s cargo test --locked --lib signs_with_isolated_openssh_agent -- --ignored --test-threads=1
-run_fixture 21 timeout 300s cargo test --locked --test ssh_localhost --test ssh_migration -- --ignored --test-threads=1
+# scripts/test-forward.sh passes a --config that repoints Sunset at a patched
+# checkout, which changes dependency resolution, so --locked cannot apply there.
+cargo_args=(--locked)
+integration_tests=21
+if [[ "${STARCOM_FIXTURE_EXTRA_TESTS:-0}" == 1 ]]; then
+    cargo_args=("$@")
+    integration_tests=22
+fi
+
+# Build first, untimed. The per-run timeouts below bound how long a test may
+# take to RUN; letting them also cover compilation makes a cold tree look like
+# a hung test.
+cargo test "${cargo_args[@]}" --lib --test ssh_localhost --test ssh_migration --no-run
+
+run_fixture 1 timeout 30s cargo test "${cargo_args[@]}" --lib signs_with_isolated_openssh_agent -- --ignored --test-threads=1
+run_fixture "$integration_tests" timeout 300s cargo test "${cargo_args[@]}" --test ssh_localhost --test ssh_migration -- --ignored --test-threads=1

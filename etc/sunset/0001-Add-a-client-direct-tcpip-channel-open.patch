@@ -1,0 +1,143 @@
+From 86d0f1b1cd60514ad73c2b75a865c11f299c6f6e Mon Sep 17 00:00:00 2001
+From: Starcom <kvark@fastmail.com>
+Date: Sun, 30 Aug 2026 20:16:38 +0000
+Subject: [PATCH] Add a client direct-tcpip channel open
+
+Sunset can decode and encode direct-tcpip channel opens, and the
+channel-open-confirmation path is already type agnostic, but a client
+has no way to open one: open_client_session is the only opener, and
+inbound direct-tcpip is rejected with a TODO.
+
+Add Runner::open_client_tcpip, which is the channel behind ssh -L and
+ssh -J. Nothing else needs to change to carry its data.
+
+Add Runner::is_channel_finished so a caller waiting on an open can tell
+a refusal from a slow open. A refused open leaves the channel in
+PendingDone rather than removing it, and PendingDone is reported neither
+as eof nor as closed, so without this a rejection is indistinguishable
+from a slow open until the caller's own deadline expires.
+
+Verified against OpenSSH 9.x: a forward carries data both ways, an
+unreachable destination is reported as a refusal, and a server with
+AllowTcpForwarding no is reported as a refusal rather than a timeout.
+---
+ Cargo.toml     |  4 ++++
+ src/channel.rs |  8 ++++++++
+ src/config.rs  |  6 +++++-
+ src/runner.rs  | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 57b7373..6ad1cec 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -113,6 +113,10 @@ embedded-io = ["dep:embedded-io"]
+ # Arbitrary for fuzzing. std is required for derive(Arbitrary)
+ arbitrary = ["dep:arbitrary", "std"]
+ 
++# Raise config::MAX_CHANNELS from 4 to 16. The channel array is fixed size, so
++# this costs memory; it is off by default for `no_std` targets.
++many-channels = []
++
+ # Allocate larger buffers for things such as usernames.
+ # See config.rs for details
+ larger = []
+diff --git a/src/channel.rs b/src/channel.rs
+index a136e97..698dbb3 100644
+--- a/src/channel.rs
++++ b/src/channel.rs
+@@ -228,6 +228,14 @@ impl Channels {
+         self.get(num).is_ok_and(|c| c.valid_send(dt))
+     }
+ 
++    /// Whether a channel can no longer carry data, in any of the ways that can
++    /// happen: refused, closed, or already gone.
++    pub(crate) fn is_finished(&self, num: ChanNum) -> bool {
++        self.get_any(num).is_ok_and(|c| {
++            matches!(c.state, ChanState::PendingDone | ChanState::RecvClose)
++        }) || self.get_any(num).is_err()
++    }
++
+     pub fn progress(&mut self, s: &mut TrafSend) -> DispatchEvent {
+         for ch in self.ch.iter_mut().filter_map(|c| c.as_mut()) {
+             ch.check_send_window_adjust(s);
+diff --git a/src/config.rs b/src/config.rs
+index 12ff8eb..5ae225a 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -13,7 +13,11 @@ pub(crate) const SSH_MAX_PACKET: usize = 35000;
+ //
+ // This size is arbitrary and may be increased, though note that some code paths assume
+ // a linear scan of channels can happen quickly, so may need reworking for performance.
+-pub const MAX_CHANNELS: usize = 4;
++//
++// The channel array is fixed size, so the default stays small for `no_std`
++// targets. Hosts that multiplex several sessions or forwarded connections over
++// one transport can opt in to more with the `many-channels` feature.
++pub const MAX_CHANNELS: usize = if cfg!(feature = "many-channels") { 16 } else { 4 };
+ 
+ // Enough for longest 23 of "screen.konsole-256color" on my system
+ // Unsure if this is specified somewhere
+diff --git a/src/runner.rs b/src/runner.rs
+index 8f5568e..1909486 100644
+--- a/src/runner.rs
++++ b/src/runner.rs
+@@ -681,6 +681,20 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
+         self.conn.channels.valid_send(chan.0, dt)
+     }
+ 
++    /// Returns `true` once the channel can no longer carry data.
++    ///
++    /// This covers a channel the peer refused to open, one that has been closed,
++    /// and one already released. The handle must still be returned with
++    /// [`Runner::channel_done`].
++    ///
++    /// Callers waiting for an open to complete need this to tell "not yet" from
++    /// "never". A refused open leaves the channel in a finished state rather
++    /// than removing it, so without this a rejection is indistinguishable from a
++    /// slow open until the caller's own deadline expires.
++    pub fn is_channel_finished(&self, chan: &ChanHandle) -> bool {
++        self.conn.channels.is_finished(chan.0)
++    }
++
+     /// Must be called when an application has finished with a channel.
+     ///
+     /// Channel numbers will not be re-used without calling this, so
+@@ -887,6 +901,37 @@ impl<'a> Runner<'a, client::Client> {
+         self.wake();
+         Ok(ChanHandle(chan))
+     }
++
++    /// Open a `direct-tcpip` channel, asking the server to connect to
++    /// `address:port` on our behalf.
++    ///
++    /// This is the channel type behind `ssh -L` and `ssh -J`. `origin` and
++    /// `origin_port` describe the local end the server is told about; they are
++    /// informational, and servers commonly log them.
++    ///
++    /// The returned handle is not usable until the server confirms the open.
++    /// [`Runner::is_write_channel_valid`] reports `false` until then, because a
++    /// channel that is still opening is not yet a channel that can carry data.
++    pub fn open_client_tcpip(
++        &mut self,
++        address: &str,
++        port: u16,
++        origin: &str,
++        origin_port: u16,
++    ) -> Result<ChanHandle> {
++        trace!("open_client_tcpip {address}:{port}");
++
++        let ty = packets::ChannelOpenType::DirectTcpip(packets::DirectTcpip {
++            address: address.into(),
++            port: port as u32,
++            origin: origin.into(),
++            origin_port: origin_port as u32,
++        });
++        let (chan, p) = self.conn.channels.open(ty)?;
++        self.traf_out.send_packet(p, &mut self.keys)?;
++        self.wake();
++        Ok(ChanHandle(chan))
++    }
+ }
+ 
+ /// Sets a waker, waking any existing waker

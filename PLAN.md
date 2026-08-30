@@ -84,7 +84,8 @@ mode is the external frontend interface and works with the host's installed tmux
 | SSH | Embedded Sunset + RustCrypto; no libssh2/OpenSSL/ring/AWS-LC backend. |
 | Dependency risk | Owning the SSH stack means owning its advisories: `deny.toml` gates every change and runs weekly. |
 | Automatic retry | Transport loss only. Authentication, trust, missing-session, server-exit, and detach always stop. |
-| Advanced SSH escape hatch | Optional system-SSH transport remains a future option, and is now the only route to ProxyJump. |
+| Advanced SSH escape hatch | Optional system-SSH transport remains a future option, alongside the `etc/sunset` patch. |
+| Third-party patches | Carried as patch files with measured results, never vendored or silently forked. The published crate is what builds by default. |
 | Saved state | Destinations and preferences only. Restoring a tab never authenticates. |
 | Session creation | Only from an explicit action. No failure path may create a session or a server. |
 | Repository | One Rust 2024 package; normal root sources on `main`. |
@@ -232,15 +233,24 @@ verified to fail when automatic retry is disabled.
 - [x] Add explicit session discovery/creation UI without changing attach semantics.
 - [ ] Reuse one SSH connection per host where the SSH backend supports it safely.
   Sunset 0.6 caps a connection at `config::MAX_CHANNELS = 4`, a compile-time
-  constant, so at most four of the sixteen tabs could ever share one. Sharing
-  also couples every tab on a host to one transport, which is the reason this was
-  deferred in the first place. Not worth doing at four tabs and a shared failure.
+  constant, so at most four of the sixteen tabs could ever share one. The
+  `etc/sunset` patch raises that to 16 behind a feature, which removes the cap
+  but not the objection: sharing still couples every tab on a host to one
+  transport, and that is why it was deferred. Decide the coupling question before
+  the channel count.
 - [ ] Add ProxyJump/bastion support or a system-SSH adapter for advanced configs.
-  Sunset 0.6 rejects both `direct-tcpip` and `forwarded-tcpip` outright, with
-  "TODO implement it" in `channel.rs`, and exposes no client-side channel open
-  other than `open_client_session`. An embedded ProxyJump is therefore not
-  implementable on this backend; the remaining option is the system-SSH adapter
-  the decision table already lists as a future escape hatch.
+  The backend blocker is now removed in a patch rather than worked around:
+  `etc/sunset/` carries a 62-line change to Sunset 0.6 adding a client
+  `direct-tcpip` open and a way to tell a refused open from a slow one. It is
+  validated against real OpenSSH — a forward carries data both ways, and both an
+  unreachable destination and a server with `AllowTcpForwarding no` are reported
+  as refusals rather than as timeouts. Starcom's `ssh::Connection::open_forward`
+  sits behind `--cfg sunset_forward`, so the normal build still uses the
+  published crate unchanged.
+  What remains is a decision, not an unknown: upstream the patch, carry a fork
+  the way `blade` is carried, or take the system-SSH adapter instead. Running a
+  second SSH session inside that channel also needs `ssh::Connection` to accept a
+  transport other than a `TcpStream`, which is the larger half of the work.
 - [ ] Improve certificate, hardware-key, custom-agent, and MFA workflows.
   Sunset 0.6's client emits no keyboard-interactive event and has no certificate
   path, so MFA and certificates cannot be driven from it at all. Hardware keys and
@@ -249,8 +259,9 @@ verified to fail when automatic retry is disabled.
 
 Gate: a user with several hosts can reopen yesterday's tabs, see what is running,
 and start what is missing, without Starcom authenticating or creating anything on
-its own. Met for persistence and discovery; the remaining three items need either
-a newer Sunset or the system-SSH adapter, and are a milestone of their own.
+its own. Met for persistence and discovery. The remaining three items are a
+milestone of their own; the forwarding blocker among them is now a decision about
+how to carry a patch rather than an open technical question.
 
 ### M5 — Performance and release hardening
 
@@ -270,11 +281,11 @@ a newer Sunset or the system-SSH adapter, and are a milestone of their own.
 
 ## Immediate work order
 
-1. Begin M5 with the measurement harness, not with optimizations. There is still
+1. Decide how `etc/sunset` is carried: upstream it, pin a fork the way `blade`
+   is pinned, or drop it for the system-SSH adapter. Everything else in
+   ProxyJump waits on that answer, and the patch is written and measured.
+2. Begin M5 with the measurement harness, not with optimizations. There is still
    no recorded startup time, idle CPU, per-pane memory, or input latency.
-2. Decide the route for M4's blocked items: either wait on Sunset for channels
-   and `direct-tcpip`, or build the system-SSH adapter and accept a subprocess
-   for advanced configurations. Both are milestone-sized; neither is started.
 3. Add native macOS/Windows close, clipboard, and input acceptance.
 4. Exercise reconnection on a real network path, not only a killed local client.
 5. Extend SSH configuration only where semantics can be tested end to end.
@@ -297,6 +308,10 @@ cargo test --locked --no-default-features --features ssh --all-targets
 CI also builds and tests at the declared `rust-version`, so that number is a
 tested claim rather than a guess, and runs the dependency-advisory gate weekly as
 well as per change.
+
+`scripts/test-forward.sh` is deliberately outside this list. It clones and
+patches Sunset, so it needs network access and does not run against the published
+crate; it covers the forwarding work described in `etc/sunset/README.md`.
 
 Linux CI additionally creates a disposable loopback sshd and isolated tmux socket.
 It must never touch the user's default tmux server. The fixture asserts how many

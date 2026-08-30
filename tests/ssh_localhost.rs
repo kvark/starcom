@@ -622,3 +622,99 @@ fn discovery_never_starts_a_server_and_creation_is_explicit() {
         .arg("kill-server")
         .status();
 }
+
+/// A patched Sunset can open a `direct-tcpip` channel, and a real OpenSSH
+/// server carries data over it. This is the channel `ssh -J` is built on.
+///
+/// Needs `etc/sunset/*.patch`; `scripts/test-forward.sh` sets that up.
+#[cfg(sunset_forward)]
+#[test]
+#[ignore = "requires the isolated SSH/tmux fixture"]
+fn a_direct_tcpip_channel_carries_data_through_the_server() {
+    use std::{io::Write as _, net, thread};
+
+    // A listener the server will be asked to connect to on our behalf.
+    let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let echo = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut seen = Vec::new();
+        let mut buffer = [0; 256];
+        while seen.len() < 5 {
+            match io::Read::read(&mut stream, &mut buffer) {
+                Ok(0) => break,
+                Ok(count) => seen.extend_from_slice(&buffer[..count]),
+                Err(error) => panic!("forwarded read: {error}"),
+            }
+        }
+        stream.write_all(b"PONG").unwrap();
+        stream.flush().unwrap();
+        seen
+    });
+
+    let mut channel = ssh::Connection::connect(&options())
+        .unwrap()
+        .open_forward("127.0.0.1", port)
+        .expect("the server refused a direct-tcpip channel");
+    channel.write_all(b"HELLO").unwrap();
+    channel.flush().unwrap();
+    let deadline = time::Instant::now() + time::Duration::from_secs(10);
+    let mut received = Vec::new();
+    let mut buffer = [0; 256];
+    while received.len() < 4 {
+        assert!(time::Instant::now() < deadline, "forward stalled");
+        match io::Read::read(&mut channel, &mut buffer) {
+            Ok(0) => break,
+            Ok(count) => received.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                channel.wait(deadline).unwrap()
+            }
+            Err(error) => panic!("forward read: {error}"),
+        }
+    }
+    assert_eq!(received, b"PONG", "the server did not carry the reply back");
+    assert_eq!(
+        echo.join().unwrap(),
+        b"HELLO",
+        "the server did not carry the request out"
+    );
+
+    // Both refusals must be reported promptly rather than waiting out the
+    // operation deadline: a destination the server cannot reach, and a server
+    // that forbids forwarding at all, as a hardened bastion does.
+    let mut refusing = options();
+    refusing.port = env::var("STARCOM_NO_FORWARD_PORT")
+        .expect("run scripts/test-ssh.sh")
+        .parse()
+        .unwrap();
+    // Port 1 is below the ephemeral range, so nothing can drift onto it.
+    for (label, options, target) in [
+        ("an unreachable destination", options(), 1),
+        ("a server that forbids forwarding", refusing, port),
+    ] {
+        let started = time::Instant::now();
+        let Err(error) = ssh::Connection::connect(&options)
+            .unwrap()
+            .open_forward("127.0.0.1", target)
+        else {
+            panic!("{label} must not produce an open forward")
+        };
+        assert_eq!(error.kind, ssh::Kind::Transport, "{label}: {error}");
+        assert!(
+            format!("{error}").contains("refused"),
+            "{label}: unhelpful message: {error}"
+        );
+        assert!(
+            started.elapsed() < options_timeout(),
+            "{label} waited out the deadline instead of reporting: {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// The fixture's per-operation deadline. A refusal must be reported well inside
+/// it, otherwise the caller cannot tell a refusal from an unresponsive host.
+#[cfg(sunset_forward)]
+fn options_timeout() -> time::Duration {
+    options().timeout
+}
