@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Rust still uses the normal platform linker; only native source compilation is blocked.
+  CC: starcom-no-c-compiler
+  CXX: starcom-no-cxx-compiler
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rustcrypto-desktop-v1
+      - name: Linux build and software-rendering dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config openssh-server tmux libxkbcommon-x11-0 libegl1 libvulkan1 mesa-vulkan-drivers vulkan-validationlayers xvfb xauth python3-xlib
+      - name: Format check
+        run: cargo fmt --check
+      - name: Native crypto dependency policy
+        run: python scripts/check-dependencies.py
+      - name: Build
+        run: cargo build --locked --all-features --all-targets
+      - name: Test
+        run: cargo test --locked --all-features --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - name: Core without SSH or GUI
+        run: cargo test --locked --no-default-features --all-targets
+      - name: SSH without GUI
+        run: cargo test --locked --no-default-features --features ssh --all-targets
+      - name: Native Windows OpenSSH-agent signing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Service -Name ssh-agent -StartupType Manual
+          Start-Service ssh-agent
+          python scripts/test-windows-agent.py
+      - name: Isolated Linux SSH and tmux integration
+        if: runner.os == 'Linux'
+        run: scripts/test-ssh.sh
+      - name: Offscreen desktop and native X11 smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp*.json' -print -quit)"
+          test -n "$VK_ICD_FILENAMES"
+          cargo run --locked -- --demo --snapshot target/test-artifacts/desktop.png
+          xvfb-run -a -s '-screen 0 1400x900x24' /usr/bin/python3 scripts/test-desktop.py
+      - name: Upload desktop validation images and logs
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-validation
+          path: target/test-artifacts
+          if-no-files-found: ignore
+          retention-days: 7

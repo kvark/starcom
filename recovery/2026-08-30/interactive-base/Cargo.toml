@@ -1,0 +1,54 @@
+[package]
+name = "starcom"
+version = "0.1.0"
+description = "Session Terminal And Remote COMmander"
+keywords = ["terminal", "tmux", "ssh"]
+categories = ["command-line-utilities"]
+license = "MIT"
+repository = "https://github.com/kvark/starcom"
+authors = ["Dzmitry Malyshau"]
+edition = "2024"
+rust-version = "1.96"
+default-run = "starcom"
+
+[[bin]]
+name = "starcom-inspect"
+path = "src/bin/starcom-inspect.rs"
+required-features = ["ssh"]
+
+[dependencies]
+anyhow = "1.0"
+alacritty_terminal = "0.26"
+tmuxctl = { version = "=0.1.0", default-features = false }
+sunset = { version = "=0.6.0", default-features = false, features = ["std", "rsa", "ecdsa256", "larger"], optional = true }
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "ed25519", "rsa", "p256"], optional = true }
+hmac = { version = "0.13", optional = true }
+sha1 = { version = "0.11", optional = true }
+zeroize = { version = "1", optional = true }
+signature = { version = "3", optional = true }
+polling = { version = "3.11", optional = true }
+base64 = { version = "0.22", optional = true }
+
+blade-egui = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
+egui = { version = "0.34", optional = true }
+egui-winit = { version = "0.34", default-features = false, features = ["clipboard", "wayland", "x11"], optional = true }
+winit = { version = "0.30.5", optional = true }
+png = { version = "0.18", optional = true }
+log = { version = "0.4", optional = true }
+env_logger = { version = "0.11", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", optional = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_Security"] }
+
+[features]
+default = ["ssh", "gui"]
+gui = ["ssh", "dep:blade-egui", "dep:blade-graphics", "dep:egui", "dep:egui-winit", "dep:winit", "dep:png", "dep:log", "dep:env_logger"]
+ssh = ["dep:sunset", "dep:ssh-key", "dep:hmac", "dep:sha1", "dep:zeroize", "dep:signature", "dep:windows-sys", "dep:polling", "dep:base64"]
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(gles)'] }
