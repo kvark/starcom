@@ -58,6 +58,35 @@ def save_png(window, path):
                      + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
 
 
+def find_demo_word(window):
+    """Locate the first cyan terminal word without assuming sidebar geometry."""
+    width, height, data = pixels(window)
+    rows = []
+    for y in range(90, min(height, 500)):
+        matches = []
+        for x in range(width // 2):
+            i = (y * width + x) * 4
+            blue, green, red = data[i], data[i + 1], data[i + 2]
+            if blue >= 140 and green >= 130 and red <= 120 and blue - red >= 40:
+                matches.append(x)
+        if len(matches) >= 4:
+            rows.append((y, min(matches), max(matches), len(matches)))
+
+    bands = []
+    for row in rows:
+        if not bands or row[0] != bands[-1][-1][0] + 1:
+            bands.append([row])
+        else:
+            bands[-1].append(row)
+    band = next((band for band in bands if sum(row[3] for row in band) >= 40), None)
+    if band is None:
+        raise RuntimeError("could not locate cyan demo text")
+    x0 = min(row[1] for row in band)
+    x1 = max(row[2] for row in band)
+    y = (band[0][0] + band[-1][0]) // 2
+    return max(0, x0 - 1), y, min(width - 1, x1 + 2)
+
+
 def move(x, y):
     xtest.fake_input(d, X.MotionNotify, x=x, y=y)
     d.sync()
@@ -88,15 +117,26 @@ with (ARTIFACTS / "desktop.log").open("w") as log:
         time.sleep(0.3)
         save_png(window, ARTIFACTS / "desktop-native.png")
         origin = root.translate_coords(window, 0, 0)
-        # The demo's first terminal row says "Starcom". Selection semantics are
-        # also tested without pixels in ui::tests; here check system clipboard.
-        move(origin.x + 245, origin.y + 122)
+        # The demo's first terminal row says "Starcom". Locate the rendered word
+        # so tab chrome or toolbar changes do not invalidate the native test.
+        start_x, row_y, end_x = find_demo_word(window)
+        move(origin.x + start_x, origin.y + row_y)
         mouse(X.ButtonPress)
-        move(origin.x + 300, origin.y + 122)
+        move(origin.x + end_x, origin.y + row_y)
         mouse(X.ButtonRelease)
+        # Plain Ctrl-C is a terminal interrupt. The local clipboard shortcut is
+        # Ctrl-Shift-C (Cmd-C on macOS, not exercised by this Linux/X11 test).
         ctrl = d.keysym_to_keycode(XK.string_to_keysym("Control_L"))
+        shift = d.keysym_to_keycode(XK.string_to_keysym("Shift_L"))
         c = d.keysym_to_keycode(XK.string_to_keysym("c"))
-        for kind, code in [(X.KeyPress, ctrl), (X.KeyPress, c), (X.KeyRelease, c), (X.KeyRelease, ctrl)]:
+        for kind, code in [
+            (X.KeyPress, ctrl),
+            (X.KeyPress, shift),
+            (X.KeyPress, c),
+            (X.KeyRelease, c),
+            (X.KeyRelease, shift),
+            (X.KeyRelease, ctrl),
+        ]:
             xtest.fake_input(d, kind, detail=code)
         d.sync()
         time.sleep(0.2)
@@ -122,7 +162,8 @@ with (ARTIFACTS / "desktop.log").open("w") as log:
         wait_until(lambda: window.get_geometry().width == 1000)
         time.sleep(0.4)
         save_png(window, ARTIFACTS / "desktop-resized.png")
-        # Close through the normal window-manager message, not a signal.
+        # Close through the normal window-manager message, not a signal. This
+        # reaches the ordered Blade/winit teardown that previously crashed.
         window.send_event(protocol.event.ClientMessage(
             window=window, client_type=d.intern_atom("WM_PROTOCOLS"),
             data=(32, [d.intern_atom("WM_DELETE_WINDOW"), X.CurrentTime, 0, 0, 0])), event_mask=0)
