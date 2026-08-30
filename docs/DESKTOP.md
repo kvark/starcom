@@ -83,6 +83,13 @@ The demo neither reads nor writes this file.
 never bring a tmux server into existence: a host with no tmux running says so.
 Choosing a listed session fills the session field; it does not attach.
 
+Starcom also asks on its own in one case: when a connection fails because that
+session does not exist. You have already asked to connect and already
+authenticated, and the list is exactly the missing information, so it appears
+without a second button press. No other failure triggers it — authentication and
+host-key failures could not list anyway, and the others already say what
+happened. Listing is never a step on the way to attaching.
+
 **Create session** makes the named session on the host, after a confirmation that
 says plainly that this starts a tmux server if none is running. It is the only
 path in Starcom that may start one, it is reachable only from that button, and it
@@ -97,6 +104,12 @@ blocks the window or disturbs a live attachment.
 
 Enable **Allow terminal input** before connecting for an interactive attachment.
 A read-only attachment remains available for inspection.
+
+If **SSH agent** is selected and no agent is reachable, the form says so before
+you connect. A desktop session often does not inherit `SSH_AUTH_SOCK` from a
+shell, so an agent that works in your terminal may be invisible here; start an
+agent in the session that launches Starcom, or choose a key file. The warning
+clears on its own once an agent appears; there is no need to restart Starcom.
 
 Click a pane to focus it. Text and committed IME input are encoded as UTF-8.
 Enter, arrows, Home/End, Page Up/Down, Insert/Delete, Tab, Escape, Backspace, and

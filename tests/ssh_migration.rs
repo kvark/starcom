@@ -888,3 +888,72 @@ fn kill_control_client(session: &str) {
             .status();
     }
 }
+
+/// Attaching to a session that does not exist is the one failure where the list
+/// of sessions is the answer. It must appear without the user asking, and it
+/// must not turn into an attachment or start a server.
+#[cfg(feature = "gui")]
+#[test]
+#[ignore = "requires the isolated SSH/tmux fixture"]
+fn a_missing_session_lists_what_the_host_does_have() {
+    use starcom::{core, desktop, session};
+    use std::sync;
+
+    let client = desktop::Client::new(sync::Arc::new(|| {})).unwrap();
+    client
+        .connect(desktop::Connection {
+            options: options(),
+            session: core::SessionName::new("starcom-does-not-exist").unwrap(),
+            socket: Some(root().join("tmux.sock").to_str().unwrap().to_owned()),
+            history: 20,
+            access: session::Access::ReadOnly,
+            reconnect: true,
+        })
+        .unwrap();
+
+    wait_until(30, "the attach did not fail", || {
+        matches!(
+            client.phase(),
+            desktop::Phase::Failed | desktop::Phase::Disconnected
+        )
+    });
+    assert_eq!(
+        client.failure(),
+        Some(starcom::reconnect::Failure::MissingSession),
+        "a missing session must be classified as such, not retried"
+    );
+    assert!(client.retry().is_none(), "a missing session was retried");
+
+    wait_until(30, "the host was not asked what it does have", || {
+        matches!(
+            client.discovery(),
+            Some(desktop::Discovery::Sessions(_) | desktop::Discovery::Failed(_))
+        )
+    });
+    let Some(desktop::Discovery::Sessions(found)) = client.discovery() else {
+        panic!("expected a session listing, got {:?}", client.discovery())
+    };
+    assert!(
+        found.iter().any(|summary| summary.name == "starcom"),
+        "the listing did not include the fixture session: {found:?}"
+    );
+
+    // Listing must not have attached to anything or invented a session.
+    assert!(
+        matches!(
+            client.phase(),
+            desktop::Phase::Failed | desktop::Phase::Disconnected
+        ),
+        "listing turned into an attachment: {:?}",
+        client.phase()
+    );
+    let sessions = tmux()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&sessions.stdout).contains("starcom-does-not-exist"),
+        "a session was created for a failed attach"
+    );
+    client.disconnect();
+}

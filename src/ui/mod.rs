@@ -216,6 +216,12 @@ pub struct DesktopUi {
     pane_ui: collections::BTreeMap<tmuxctl::PaneId, terminal::PaneUi>,
     pending_paste: Option<(desktop::Target, terminal_input::Paste)>,
     notice: Option<String>,
+    /// Whether a local SSH agent looked reachable, and when that was last
+    /// asked. A hint for the form only; the connection still authenticates as
+    /// configured. Rechecked while the form is open so that starting an agent
+    /// clears the warning without restarting Starcom.
+    agent_available: bool,
+    agent_checked: time::Instant,
     /// Set while the user is confirming that creating a session may start a
     /// tmux server on a host that has none.
     confirm_create: bool,
@@ -246,8 +252,26 @@ impl DesktopUi {
             pane_ui: collections::BTreeMap::new(),
             pending_paste: None,
             notice: None,
+            agent_available: ssh::agent_available(),
+            agent_checked: time::Instant::now(),
             confirm_create: false,
         }
+    }
+
+    /// Whether an SSH agent looks reachable, re-asked at most once a second.
+    ///
+    /// The form is drawn every frame and the probe touches the filesystem, so
+    /// it is throttled; a second of staleness on a warning label is invisible,
+    /// while never re-asking would leave the warning up after the user starts
+    /// an agent.
+    fn agent_probe(&mut self) -> bool {
+        const INTERVAL: time::Duration = time::Duration::from_secs(1);
+        let now = time::Instant::now();
+        if now.duration_since(self.agent_checked) >= INTERVAL {
+            self.agent_available = ssh::agent_available();
+            self.agent_checked = now;
+        }
+        self.agent_available
     }
 
     /// Restore a saved tab into this UI's form, showing the connection screen.
@@ -433,6 +457,15 @@ impl DesktopUi {
                             "Key file",
                         );
                     });
+                    // Say an agent is missing here rather than letting the user
+                    // find out from a failed authentication. A desktop session
+                    // often does not inherit SSH_AUTH_SOCK from a shell.
+                    if self.form.authentication == Authentication::Agent && !self.agent_probe() {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "No SSH agent found. Start one and add a key, or choose a key file.",
+                        );
+                    }
                     if self.form.authentication == Authentication::Key {
                         field(ui, "Private key", &mut self.form.identity);
                     }

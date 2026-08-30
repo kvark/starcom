@@ -623,11 +623,8 @@ fn discovery_never_starts_a_server_and_creation_is_explicit() {
         .status();
 }
 
-/// A patched Sunset can open a `direct-tcpip` channel, and a real OpenSSH
-/// server carries data over it. This is the channel `ssh -J` is built on.
-///
-/// Needs `etc/sunset/*.patch`; `scripts/test-forward.sh` sets that up.
-#[cfg(sunset_forward)]
+/// Sunset can open a `direct-tcpip` channel, and a real OpenSSH server carries
+/// data over it. This is the channel `ssh -J` is built on.
 #[test]
 #[ignore = "requires the isolated SSH/tmux fixture"]
 fn a_direct_tcpip_channel_carries_data_through_the_server() {
@@ -714,7 +711,6 @@ fn a_direct_tcpip_channel_carries_data_through_the_server() {
 
 /// The fixture's per-operation deadline. A refusal must be reported well inside
 /// it, otherwise the caller cannot tell a refusal from an unresponsive host.
-#[cfg(sunset_forward)]
 fn options_timeout() -> time::Duration {
     options().timeout
 }

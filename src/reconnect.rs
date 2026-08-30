@@ -121,6 +121,10 @@ fn narrow(text: &str) -> Option<Failure> {
     if text.contains("can't find session")
         || text.contains("session not found")
         || text.contains("no such session")
+        // Starcom's own wording for an attach that never attached. tmux reports
+        // that inside the control stream before any command is outstanding, so
+        // its text does not survive; this phrase does.
+        || text.contains("could not attach that session")
     {
         return Some(Failure::MissingSession);
     }
@@ -277,6 +281,13 @@ mod tests {
         ))
         .context("remote said: connection reset, please retry, no server running");
         assert_eq!(classify(&error), Failure::HostKey);
+
+        // An attach that never attached is a missing session, not a protocol
+        // fault: tmux ends the control stream and its reason never correlates
+        // to one of our commands, so Starcom's own wording is what classifies it.
+        let error =
+            anyhow::anyhow!("tmux could not attach that session; it may not exist on this server");
+        assert_eq!(classify(&error), Failure::MissingSession);
 
         // An unrecognized failure is never retried.
         assert_eq!(
