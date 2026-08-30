@@ -29,8 +29,8 @@ signature = { version = "3", optional = true }
 polling = { version = "3.11", optional = true }
 base64 = { version = "0.22", optional = true }
 
-blade-egui = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
-blade-graphics = { git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
+blade-egui = { version = "0.8.1", git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
+blade-graphics = { version = "0.8.4", git = "https://github.com/kvark/blade", rev = "f1fbf2a", optional = true }
 egui = { version = "0.34", optional = true }
 egui-winit = { version = "0.34", default-features = false, features = ["clipboard", "wayland", "x11"], optional = true }
 winit = { version = "0.30.5", optional = true }

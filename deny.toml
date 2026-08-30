@@ -1,0 +1,90 @@
+# Supply-chain policy for the embedded SSH stack.
+#
+# Starcom implements its own SSH client instead of linking OpenSSH or OpenSSL.
+# That choice means Starcom owns its dependencies' advisories too, so this file
+# is checked in CI rather than run by hand.
+
+[graph]
+# Check every platform Starcom ships on, not just the runner's own.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+version = 2
+# A security advisory against anything in the SSH, crypto, or terminal path is
+# a build failure, not a warning to scroll past.
+yanked = "deny"
+# Every entry here is an accepted risk with a stated reason and an exit route.
+# Adding one is a deliberate decision, not a way to make CI quiet.
+ignore = [
+    # RSA timing side-channel (Marvin). No fixed release exists in any 0.9/0.10
+    # line, and both sunset and ssh-key pull it in for RSA identity support.
+    # Starcom's exposure is client-side signing on the user's own machine, which
+    # requires a local attacker able to time that operation. Tracked in PLAN.md
+    # as a release blocker: reach a fixed rsa, or ship without the rsa feature.
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; see PLAN.md M5" },
+    # ttf-parser is unmaintained, not vulnerable. It arrives through winit's
+    # Wayland client-side decorations, nowhere near SSH or terminal parsing, and
+    # leaves when the GUI stack moves to a maintained font parser.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained font parser behind winit; not in the SSH or terminal path" },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# The same list check-dependencies.py enforces, restated where the resolver can
+# see it. That script walks the graph; this also fails a *transitive* arrival.
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "openssl-src" },
+    { name = "native-tls" },
+    { name = "ssh2" },
+    { name = "libssh2-sys" },
+    { name = "ring" },
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+    { name = "aws-lc-fips-sys" },
+    { name = "mbedtls" },
+    { name = "mbedtls-sys-auto" },
+    { name = "boring" },
+    { name = "boring-sys" },
+    { name = "wolfssl" },
+    { name = "wolfssl-sys" },
+    { name = "schannel" },
+    { name = "security-framework" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses only: Starcom ships as a signed binary to end users.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "OFL-1.1",
+    "0BSD",
+    "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The GUI stack is pinned to an exact revision of Blade, which is not published.
+# Packaging a release (M5) requires resolving this.
+allow-git = ["https://github.com/kvark/blade"]

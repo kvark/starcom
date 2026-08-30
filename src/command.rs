@@ -1,16 +1,10 @@
 use std::fmt;
 
-use crate::{core, input};
+use crate::input;
 
 /// Small requests keep the control channel responsive. Paste batching is a
 /// separate operation; callers must not silently truncate a larger input.
 pub const MAX_INPUT_BYTES: usize = 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Split {
-    LeftRight,
-    TopBottom,
-}
 
 /// One complete control-mode command, including its terminating newline.
 /// There is intentionally no constructor accepting arbitrary command text.
@@ -18,36 +12,6 @@ pub enum Split {
 pub struct Command(String);
 
 impl Command {
-    pub fn list_panes() -> Self {
-        Self(
-            concat!(
-                "list-panes -s -F ",
-                "'#{pane_id} #{window_id} #{pane_width} #{pane_height}'\n"
-            )
-            .to_owned(),
-        )
-    }
-
-    pub fn select_pane(pane: tmuxctl::PaneId) -> Self {
-        Self(format!("select-pane -t {pane}\n"))
-    }
-
-    pub fn split_pane(pane: tmuxctl::PaneId, direction: Split) -> Self {
-        let flag = match direction {
-            Split::LeftRight => "-h",
-            Split::TopBottom => "-v",
-        };
-        Self(format!("split-window {flag} -t {pane}\n"))
-    }
-
-    pub fn resize_pane(pane: tmuxctl::PaneId, size: core::Size) -> Self {
-        Self(format!(
-            "resize-pane -t {pane} -x {} -y {}\n",
-            size.columns(),
-            size.rows()
-        ))
-    }
-
     /// Encode raw terminal key bytes, not tmux key names or command syntax.
     /// This does not add bracketed-paste markers or implement mouse encoding.
     pub fn send_bytes(pane: tmuxctl::PaneId, bytes: &[u8]) -> Result<Self, InputSizeError> {
@@ -124,13 +88,6 @@ impl Command {
     }
 }
 
-/// POSIX-shell command for a non-PTY SSH exec channel on a Linux host.
-/// Exact tmux targeting and shell quoting are separate requirements.
-pub fn attach_command(session: &core::SessionName) -> String {
-    let quoted_name = session.as_str().replace('\'', "'\"'\"'");
-    format!("exec tmux -C attach-session -t '={quoted_name}'")
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputSizeError;
 
@@ -161,28 +118,5 @@ mod tests {
         assert!(Command::send_bytes(tmuxctl::PaneId(0), &[]).is_err());
         assert!(Command::send_bytes(tmuxctl::PaneId(0), &[0; MAX_INPUT_BYTES + 1]).is_err());
         assert!(Command::send_bytes(tmuxctl::PaneId(0), &[0; MAX_INPUT_BYTES]).is_ok());
-    }
-
-    #[test]
-    fn attach_uses_exact_target_and_quotes_shell_metacharacters() {
-        let session = core::SessionName::new("work's; $(id)").unwrap();
-        assert_eq!(
-            attach_command(&session),
-            "exec tmux -C attach-session -t '=work'\"'\"'s; $(id)'"
-        );
-    }
-
-    #[test]
-    fn pane_actions_use_typed_targets() {
-        let pane = tmuxctl::PaneId(42);
-        assert_eq!(Command::select_pane(pane).as_str(), "select-pane -t %42\n");
-        assert_eq!(
-            Command::split_pane(pane, Split::LeftRight).as_str(),
-            "split-window -h -t %42\n"
-        );
-        assert_eq!(
-            Command::resize_pane(pane, core::Size::new(100, 30).unwrap()).as_str(),
-            "resize-pane -t %42 -x 100 -y 30\n"
-        );
     }
 }

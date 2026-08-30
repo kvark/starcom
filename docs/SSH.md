@@ -114,6 +114,27 @@ Cancellation invalidates publication immediately and wakes active socket waits.
 A worker stuck in an uncancellable OS call is detached during shutdown rather than
 freezing window closure; stale results cannot enter a stopped/new connection.
 
+## Reconnection
+
+A dropped attachment is classified before anything is retried. Only transport
+loss — a reset socket, an operation deadline, or a control channel that ended
+without tmux announcing an exit — is retried automatically. Authentication and
+host-key failures are never retried, so a wrong key or an untrusted host cannot
+become an endless security retry. A missing or destroyed session, a tmux server
+that exited, and an explicit detach also stop, because reattaching by name after
+any of those can land on a different session.
+
+Classification prefers typed transport errors over remote text. Where tmux's own
+stderr is consulted, it may only *narrow* a failure to a non-retriable one; it can
+never promote a failure to retriable. Remote output is untrusted, so it is allowed
+to stop Starcom from retrying but never to make it retry.
+
+Retries use exponential backoff from 500 ms to a 30 s ceiling with per-connection
+jitter, and the wait is cancellable at any point. Each attempt takes a fresh
+connection epoch, which invalidates every outstanding input token, and rebuilds
+all pane models from a new snapshot boundary. Nothing typed while disconnected is
+queued, and no write with uncertain delivery is repeated.
+
 Sunset currently has a small receive window and a narrower algorithm set than
 OpenSSH. High-latency throughput and compatibility with additional servers need
 measurement before broad support claims.

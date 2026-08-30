@@ -24,7 +24,9 @@ shows either its connection form or its tmux windows—not both side by side.
 
 The desktop currently supports local scrollback, selection and copying, plus the
 experimental interactive path and opt-in shared tmux pane resizing. Multiline
-paste requires confirmation. Automatic reconnect remains pending.
+paste requires confirmation. Transport loss reconnects automatically with visible,
+cancellable backoff; authentication, trust, and missing-session failures stop and
+wait for you.
 
 SSH and cryptography use Rust libraries; OpenSSL is not a build dependency.
 Host keys must already be trusted.

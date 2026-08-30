@@ -32,6 +32,7 @@ pub struct Form {
     socket: String,
     history: usize,
     interactive: bool,
+    reconnect: bool,
     unsupported: Vec<String>,
     profile_error: Option<String>,
 }
@@ -52,6 +53,7 @@ impl Default for Form {
             socket: String::new(),
             history: 200,
             interactive: true,
+            reconnect: true,
             unsupported: Vec::new(),
             profile_error: None,
         }
@@ -127,8 +129,17 @@ impl Form {
             } else {
                 session::Access::ReadOnly
             },
+            reconnect: self.reconnect,
         })
     }
+}
+
+/// One terminal step in the order the user produced it. A clipboard read cannot
+/// happen inside the egui closure, so a paste request stays an ordered step
+/// rather than replacing the frame's other input.
+pub(crate) enum Step {
+    Send(desktop::Target, terminal_input::Action),
+    RequestPaste(desktop::Target),
 }
 
 pub enum Action {
@@ -136,8 +147,9 @@ pub enum Action {
     Connect(desktop::Connection),
     Disconnect,
     Demo,
-    Send(Vec<(desktop::Target, terminal_input::Action)>),
-    RequestPaste(desktop::Target),
+    /// Every terminal step this frame produced, in order. Never a subset: a
+    /// frame that cannot deliver all of its steps reports that to the user.
+    Frame(Vec<Step>),
     ReloadConfig,
 }
 
@@ -221,25 +233,28 @@ impl DesktopUi {
             })
     }
 
-    pub fn clipboard_paste(
+    /// Resolve one clipboard read into an ordered action, or arm the multiline
+    /// confirmation. Returning None never means "silently dropped": every path
+    /// that declines to send leaves a notice for the user.
+    pub(crate) fn clipboard_paste(
         &mut self,
         state: &desktop::State,
         target: desktop::Target,
         text: &str,
-    ) -> Action {
+    ) -> Option<terminal_input::Action> {
         if state.target(target.pane()) != Some(target) {
             self.notice = Some("Paste target changed; nothing was sent.".to_owned());
-            return Action::None;
+            return None;
         }
         match terminal_input::Paste::new(text) {
             Ok(paste) if paste.is_multiline() => {
                 self.pending_paste = Some((target, paste));
-                Action::None
+                None
             }
-            Ok(paste) => Action::Send(vec![(target, terminal_input::Action::Paste(paste))]),
+            Ok(paste) => Some(terminal_input::Action::Paste(paste)),
             Err(error) => {
                 self.notice = Some(error.to_string());
-                Action::None
+                None
             }
         }
     }
@@ -332,6 +347,14 @@ impl DesktopUi {
                     field(ui, "User", &mut self.form.user);
                     field(ui, "tmux session", &mut self.form.session);
                     ui.checkbox(&mut self.form.interactive, "Allow terminal input");
+                    ui.checkbox(
+                        &mut self.form.reconnect,
+                        "Reconnect automatically after connection loss",
+                    )
+                    .on_hover_text(
+                        "Only transport loss is retried. Authentication, host-key, \
+                         missing-session and detach failures always stop and wait for you.",
+                    );
                     ui.horizontal(|ui| {
                         ui.radio_value(
                             &mut self.form.authentication,
@@ -433,8 +456,10 @@ impl DesktopUi {
 
     fn show_terminal(&mut self, root: &mut egui::Ui, state: &mut desktop::State) -> Action {
         self.rebuild_layout(state);
+        // Navigation and terminal steps are separate results, so a button press
+        // can never quietly consume the keystrokes collected in the same frame.
         let mut action = Action::None;
-        let mut outgoing = Vec::new();
+        let mut steps: Vec<Step> = Vec::new();
         let connection_epoch = state.epoch();
 
         egui::Panel::top("toolbar").show_inside(root, |ui| {
@@ -454,15 +479,23 @@ impl DesktopUi {
                     self.screen = Screen::Connection;
                     self.cancel_transient();
                 }
+                // Cancelling a scheduled retry is the same operation as
+                // disconnecting: it ends this connection and keeps the last view.
+                let reconnecting = state.phase == desktop::Phase::Reconnecting;
                 if ui
                     .add_enabled(
-                        matches!(
-                            state.phase,
-                            desktop::Phase::Connecting
-                                | desktop::Phase::Watching
-                                | desktop::Phase::Resynchronizing
-                        ),
-                        egui::Button::new("Disconnect"),
+                        reconnecting
+                            || matches!(
+                                state.phase,
+                                desktop::Phase::Connecting
+                                    | desktop::Phase::Watching
+                                    | desktop::Phase::Resynchronizing
+                            ),
+                        egui::Button::new(if reconnecting {
+                            "Stop reconnecting"
+                        } else {
+                            "Disconnect"
+                        }),
                     )
                     .clicked()
                 {
@@ -508,7 +541,7 @@ impl DesktopUi {
                         .clicked()
                         && let Some(target) = self.focused.and_then(|pane| state.target(pane))
                     {
-                        action = Action::RequestPaste(target);
+                        steps.push(Step::RequestPaste(target));
                     }
                 });
             });
@@ -523,6 +556,26 @@ impl DesktopUi {
                 } else {
                     "Wheel to scroll · Drag to select · Right-click to copy"
                 });
+                if let Some(retry) = state.retry {
+                    // The countdown is the only thing on screen that changes on
+                    // its own, so ask for exactly the frames it needs.
+                    ui.ctx().request_repaint_after(
+                        retry.remaining().min(time::Duration::from_millis(250)),
+                    );
+                    ui.separator();
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!(
+                            "Reconnecting: attempt {} in {:.0}s. Nothing you type now is queued.",
+                            retry.attempt,
+                            retry.remaining().as_secs_f32().ceil()
+                        ),
+                    );
+                }
+                if let Some(ref continuity) = state.continuity {
+                    ui.separator();
+                    ui.colored_label(ui.visuals().warn_fg_color, continuity);
+                }
                 if let Some(ref notice) = self.notice {
                     ui.separator();
                     ui.small(notice);
@@ -590,7 +643,7 @@ impl DesktopUi {
                 );
                 for (pane, resize) in resizes {
                     if let Some(target) = state.target(pane) {
-                        outgoing.push((target, terminal_input::Action::Resize(resize)));
+                        steps.push(Step::Send(target, terminal_input::Action::Resize(resize)));
                     }
                 }
             }
@@ -603,20 +656,23 @@ impl DesktopUi {
                 for event in &events {
                     match input::translate(event, modifiers) {
                         Ok(Some(input::Event::Input(actions))) => {
-                            outgoing.extend(actions.into_iter().map(|action| (target, action)));
+                            steps.extend(
+                                actions.into_iter().map(|action| Step::Send(target, action)),
+                            );
                         }
                         Ok(Some(input::Event::Copy)) => self.copy_selection(root.ctx(), state),
                         Ok(Some(input::Event::Paste(paste))) => {
                             if paste.is_multiline() {
                                 self.pending_paste = Some((target, paste));
                             } else {
-                                outgoing.push((target, terminal_input::Action::Paste(paste)));
+                                steps
+                                    .push(Step::Send(target, terminal_input::Action::Paste(paste)));
                             }
                         }
+                        // Keeps its place in the frame; the clipboard read that
+                        // resolves it happens outside this closure.
                         Ok(Some(input::Event::RequestPaste)) => {
-                            if outgoing.is_empty() {
-                                action = Action::RequestPaste(target);
-                            }
+                            steps.push(Step::RequestPaste(target))
                         }
                         Ok(None) => {}
                         Err(error) => self.notice = Some(error.to_string()),
@@ -657,13 +713,21 @@ impl DesktopUi {
                 self.pending_paste = None;
             } else if send {
                 self.pending_paste = None;
-                outgoing.push((target, terminal_input::Action::Paste(paste)));
+                steps.push(Step::Send(target, terminal_input::Action::Paste(paste)));
             }
         }
 
-        if matches!(action, Action::None) && !outgoing.is_empty() {
-            Action::Send(outgoing)
+        if matches!(action, Action::None) && !steps.is_empty() {
+            Action::Frame(steps)
         } else {
+            if !steps.is_empty() {
+                // Only reachable if a navigation button and a terminal step land
+                // in one frame. Say so rather than discarding input in silence.
+                self.notice = Some(
+                    "Terminal input was not sent because this frame changed the connection instead. Nothing was retried."
+                        .to_owned(),
+                );
+            }
             action
         }
     }
@@ -734,5 +798,67 @@ mod tests {
     fn new_ui_starts_on_connection_form() {
         let ui = DesktopUi::default();
         assert_eq!(ui.screen, Screen::Connection);
+    }
+
+    /// A frame that produces a paste request AND keystrokes must deliver both,
+    /// in order. Returning one action per frame used to discard the keystrokes.
+    #[test]
+    fn a_paste_request_does_not_displace_the_same_frame_keystrokes() {
+        let ctx = egui::Context::default();
+        crate::window::configure(&ctx);
+        let mut state = desktop::State::interactive_demo().unwrap();
+        let pane = tmuxctl::PaneId(0);
+        let target = state.target(pane).expect("interactive demo target");
+        let mut ui = DesktopUi::default();
+        ui.open_terminal();
+        let screen = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        // Lay the pane out and let the focus request settle. rebuild_layout
+        // clears the focused pane on its first pass, so ask again each frame.
+        for _ in 0..4 {
+            let _ = ctx.run_ui(screen(), |root| {
+                ui.show(root, &mut state);
+            });
+            ui.focused = Some(pane);
+            ctx.memory_mut(|memory| {
+                memory.request_focus(egui::Id::new(("terminal", ui.generation, pane.0)))
+            });
+        }
+        assert!(
+            ui.terminal_focused(&ctx),
+            "the pane must hold focus or this test proves nothing"
+        );
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::Key {
+                    key: egui::Key::Insert,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+                egui::Event::Text("ls".to_owned()),
+            ],
+            modifiers: egui::Modifiers::SHIFT,
+            ..screen()
+        };
+        let mut action = Action::None;
+        let _ = ctx.run_ui(input, |root| {
+            action = ui.show(root, &mut state);
+        });
+        let Action::Frame(steps) = action else {
+            panic!("expected an ordered terminal frame")
+        };
+        assert!(
+            matches!(steps.as_slice(), [Step::RequestPaste(a), Step::Send(b, _)]
+                if *a == target && *b == target),
+            "the paste request and the keystrokes must both survive, in order"
+        );
+        assert!(ui.notice.is_none(), "nothing should have been dropped");
     }
 }

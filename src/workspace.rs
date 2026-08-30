@@ -229,16 +229,33 @@ impl Workspace {
                             tab.client.disconnect();
                             Ok(())
                         }
-                        ui::Action::Send(actions) => tab.client.submit_batch(actions),
-                        ui::Action::RequestPaste(target) => {
-                            if let Some(text) = clipboard() {
-                                let next =
-                                    tab.ui.clipboard_paste(&tab.client.lock(), target, &text);
-                                if let ui::Action::Send(actions) = next {
-                                    tab.client.submit_batch(actions)?;
+                        // Resolve clipboard reads in place so the whole frame
+                        // still reaches the worker as one ordered, atomic batch.
+                        ui::Action::Frame(steps) => {
+                            let mut actions = Vec::with_capacity(steps.len());
+                            for step in steps {
+                                match step {
+                                    ui::Step::Send(target, action) => {
+                                        actions.push((target, action))
+                                    }
+                                    ui::Step::RequestPaste(target) => {
+                                        if let Some(text) = clipboard()
+                                            && let Some(action) = tab.ui.clipboard_paste(
+                                                &tab.client.lock(),
+                                                target,
+                                                &text,
+                                            )
+                                        {
+                                            actions.push((target, action));
+                                        }
+                                    }
                                 }
                             }
-                            Ok(())
+                            if actions.is_empty() {
+                                Ok(())
+                            } else {
+                                tab.client.submit_batch(actions)
+                            }
                         }
                         ui::Action::ReloadConfig => {
                             self.reload_config();
