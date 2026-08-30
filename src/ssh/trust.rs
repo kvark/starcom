@@ -112,15 +112,21 @@ impl Store {
         let public = ssh_key::PublicKey::from_bytes(key)
             .map_err(|_| Error::new(Kind::Transport, "invalid server public key"))?;
         let fingerprint = public.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+        // OpenSSH lowercases the host before matching known_hosts, and hashes the
+        // lowercased name. Matching case-sensitively would reject a trusted entry
+        // as unknown, which reads as a changed-key warning to the user.
+        let host = host.to_ascii_lowercase();
         let lookup = if port == 22 {
-            host.to_owned()
+            host
         } else {
             format!("[{host}]:{port}")
         };
         let mut found_host = false;
         for entry in &self.entries {
             let matches = match entry.hosts {
-                Hosts::Exact(ref names) => names.iter().any(|name| name == &lookup),
+                Hosts::Exact(ref names) => {
+                    names.iter().any(|name| name.eq_ignore_ascii_case(&lookup))
+                }
                 Hosts::Hashed { ref salt, ref hash } => {
                     let mut mac =
                         hmac::Hmac::<sha1::Sha1>::new_from_slice(salt).map_err(configuration)?;
@@ -194,6 +200,32 @@ mod tests {
         assert_eq!(
             bare.verify("example.test", 2222, &key).unwrap_err().kind,
             Kind::UnknownHostKey
+        );
+    }
+
+    #[test]
+    fn host_names_match_without_regard_to_case() {
+        let key = key(11);
+        let store = Store::parse(&line("Build.Example.Test", &key)).unwrap();
+        assert!(store.verify("build.example.test", 22, &key).is_ok());
+        assert!(store.verify("BUILD.example.TEST", 22, &key).is_ok());
+        let salt = [23; 20];
+        let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(&salt).unwrap();
+        mac.update(b"[build.example.test]:2222");
+        let names = format!(
+            "|1|{}|{}",
+            base64::engine::general_purpose::STANDARD.encode(salt),
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+        );
+        let hashed = Store::parse(&line(&names, &key)).unwrap();
+        assert!(hashed.verify("Build.Example.Test", 2222, &key).is_ok());
+        // Case folding must not weaken which key is accepted for that host.
+        assert_eq!(
+            store
+                .verify("BUILD.example.TEST", 22, &self::key(12))
+                .unwrap_err()
+                .kind,
+            Kind::ChangedHostKey
         );
     }
 

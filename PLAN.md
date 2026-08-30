@@ -2,12 +2,15 @@
 
 Updated: 2026-08-30.
 
-**Current status:** M0 and M1 are implemented for the tested configuration. M2's
-functional implementation is present: connection tabs, SSH-config discovery,
-interactive terminal input, guarded paste, opt-in tmux pane resizing, and native
-Blade/egui rendering. The M2 acceptance gate remains open until the real Codex/TUI
-workflow and native macOS/Windows interaction are exercised. M3, trustworthy
-automatic reconnection, is the next development milestone.
+**Current status:** M0, M1, and M2's functional implementation are present, and
+M3's implementation now lands with them: transport loss is classified apart from
+authentication, trust, missing-session, server-exit, and detach; retries use
+cancellable jittered backoff with visible state; every attempt takes a fresh
+epoch and rebuilds models; session replacement and history truncation are
+reported. The M2 acceptance gate remains open until the real Codex/TUI workflow
+and native macOS/Windows interaction are exercised, and M3's own gate stays open
+until loss during paste and during a remote layout change is covered. M4 is the
+next development milestone.
 
 Development targets `main` directly. CI runs for pull requests and updates to
 `main`. Routine milestone branches, generated recovery trees, and shadow copies
@@ -76,6 +79,8 @@ mode is the external frontend interface and works with the host's installed tmux
 | Terminal model | `alacritty_terminal`; do not implement a VT emulator. |
 | Control protocol | `tmuxctl` with runtime/spawn defaults disabled. |
 | SSH | Embedded Sunset + RustCrypto; no libssh2/OpenSSL/ring/AWS-LC backend. |
+| Dependency risk | Owning the SSH stack means owning its advisories: `deny.toml` gates every change and runs weekly. |
+| Automatic retry | Transport loss only. Authentication, trust, missing-session, server-exit, and detach always stop. |
 | Advanced SSH escape hatch | Optional system-SSH transport remains a future option. |
 | Repository | One Rust 2024 package; normal root sources on `main`. |
 
@@ -92,6 +97,8 @@ The following are correctness rules, not optional polish:
 - Input is enabled only after a coherent snapshot is published. Nothing typed
   while disconnected is queued for later replay.
 - A write with uncertain delivery is never retried automatically.
+- Only transport loss is retried automatically, and remote text may narrow a
+  failure to non-retriable but never promote one to retriable.
 - Multiline paste requires explicit confirmation. Paste content is data, never
   concatenated into tmux command syntax.
 - Targeted input is blocked when `synchronize-panes` could broadcast it. Starcom
@@ -142,6 +149,10 @@ terminal checkpoint.
 - Local divider dragging and explicit opt-in shared tmux pane resizing.
 - Event-driven redraw and a worker thread that does no network I/O under the UI
   model lock.
+- Automatic reconnection after transport loss: classification, cancellable
+  jittered backoff, a visible attempt/countdown with a stop control, a fresh
+  epoch and rebuilt models per attempt, and reports when the reattached session
+  or its scrollback is not continuous with what was on screen.
 - Ordered shutdown and a native Linux/X11 close-path test.
 
 ## Milestones
@@ -180,15 +191,19 @@ terminal checkpoint.
 Gate: normal shell and Codex work should be comfortable without tmux keybindings,
 and closing/reopening the client must not affect jobs or misdirect input.
 
-### M3 — Trustworthy automatic reconnection: next
+### M3 — Trustworthy automatic reconnection: implemented, coverage still growing
 
-- [ ] Classify transient transport loss separately from auth, trust, missing-session,
+- [x] Classify transient transport loss separately from auth, trust, missing-session,
   tmux-restart, and explicit user detach.
-- [ ] Cancellable exponential backoff with jitter and visible retry state.
-- [ ] Reattach and reconstruct fresh models for every new epoch.
-- [ ] Preserve the last view but never queue offline input or replay uncertain writes.
-- [ ] Test connection loss during output, input, paste, and remote layout changes.
-- [ ] Expose history truncation and server/session replacement clearly.
+- [x] Cancellable exponential backoff with jitter and visible retry state.
+- [x] Reattach and reconstruct fresh models for every new epoch.
+- [x] Preserve the last view but never queue offline input or replay uncertain writes.
+- [x] Test connection loss during live output and pending input against a real
+  fixture; verify the test fails when automatic retry is disabled.
+- [x] Expose history truncation and server/session replacement clearly.
+- [ ] Test connection loss during a paste transaction and during a remote layout
+  change.
+- [ ] Exercise a genuinely restarted tmux server, not only a destroyed session.
 
 Gate: repeated network loss produces no duplicate command, hidden gap, stale-pane
 write, endless security retry, or phantom successful reconnection.
@@ -203,20 +218,32 @@ write, endless security retry, or phantom successful reconnection.
 
 ### M5 — Performance and release hardening
 
-- [ ] Measure startup, clean-build time, binary size, idle CPU, RAM per pane/history,
-  sustained-output throughput, and input latency.
+- [ ] Measure startup, idle CPU, RAM per pane/history, sustained-output throughput,
+  and input latency. First baselines, x86-64 Linux, thin LTO: a clean release
+  build takes about 3 minutes and produces a 14.4 MiB stripped binary.
 - [ ] Stress many panes, long lines, slow readers, reconnects, and repeated resizes.
 - [ ] Fuzz hostile control/config transcripts and audit terminal side effects.
 - [ ] Publish a tested tmux/platform compatibility matrix.
+- [ ] Leave every release-candidate crypto dependency behind. `ssh-key` and the
+  `rsa` crate it pulls in are both pre-release, and `rsa` carries RUSTSEC-2023-0071
+  with no fixed version published. Either reach a fixed release or ship without
+  the `rsa` feature; `deny.toml` records the accepted exposure until then.
+- [ ] Replace the pinned `blade` git revision with published crates. Git
+  dependencies cannot be published to crates.io, so this blocks packaging.
 - [ ] Package signed Linux, macOS, and Windows builds.
 
 ## Immediate work order
 
-1. Implement M3 reconnect classification, scheduler, and UI states.
-2. Run the original Codex workflow and representative shell/editor/TUI sessions.
-3. Add native macOS/Windows close, clipboard, and input acceptance.
-4. Extend SSH configuration only where semantics can be tested end to end.
-5. Measure before optimizing the renderer or replacing dependencies.
+1. Close M3's remaining coverage: loss during a paste transaction, loss during a
+   remote layout change, and a genuinely restarted tmux server.
+2. Decide what closes the M2 gate and who signs it. "Real Codex acceptance" and
+   "native macOS/Windows interaction" currently have no mechanism behind them, so
+   name the artifact each produces — a committed transcript, a screenshot, a
+   scripted run — or the gate cannot be closed by anyone.
+3. Run the original Codex workflow and representative shell/editor/TUI sessions.
+4. Add native macOS/Windows close, clipboard, and input acceptance.
+5. Extend SSH configuration only where semantics can be tested end to end.
+6. Measure before optimizing the renderer or replacing dependencies.
 
 ## Validation policy
 
@@ -225,6 +252,7 @@ Every update must keep these paths green:
 ```sh
 cargo fmt --check
 python scripts/check-dependencies.py
+cargo deny --all-features check
 cargo build --locked --all-features --all-targets
 cargo test --locked --all-features --all-targets
 cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -232,8 +260,14 @@ cargo test --locked --no-default-features --all-targets
 cargo test --locked --no-default-features --features ssh --all-targets
 ```
 
+CI also builds and tests at the declared `rust-version`, so that number is a
+tested claim rather than a guess, and runs the dependency-advisory gate weekly as
+well as per change.
+
 Linux CI additionally creates a disposable loopback sshd and isolated tmux socket.
-It must never touch the user's default tmux server. Native Linux/X11 automation
+It must never touch the user's default tmux server. The fixture asserts how many
+tests actually ran, because `cargo test` exits successfully when a filter matches
+nothing and would otherwise report a green run that asserted nothing. Native Linux/X11 automation
 covers rendering, system clipboard, window resize, and normal WM close. Windows
 CI exercises the native OpenSSH-agent named pipe. Compilation is not considered a
 substitute for native interaction testing on platforms where that test is absent.

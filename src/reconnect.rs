@@ -1,0 +1,299 @@
+//! Reconnection policy: what may be retried, and how long to wait first.
+//!
+//! There are no sockets, clocks, sleeps, or queued input here. The caller
+//! supplies the observed failure and performs the cancellable wait, so every
+//! decision is decided by pure code and tested without a network.
+//!
+//! The classifier is deliberately asymmetric: unrecognized failures are NOT
+//! retried. Remote text may only narrow a failure to a non-retriable one, never
+//! promote one to retriable, because that text is attacker-influenced output.
+
+use std::time;
+
+#[cfg(feature = "ssh")]
+use crate::ssh;
+
+/// Why an attachment ended. Only `Transport` is retried automatically; the rest
+/// need a decision Starcom must not make on the user's behalf.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Failure {
+    /// The transport dropped with nothing known to be wrong.
+    Transport,
+    Authentication,
+    HostKey,
+    MissingSession,
+    /// The remote tmux server exited or restarted underneath the attachment.
+    ServerExit,
+    /// This control client was detached, here or by another tmux client.
+    Detached,
+    Configuration,
+    Protocol,
+}
+
+impl Failure {
+    /// Automatic retry is for transport loss alone. Retrying authentication or
+    /// host-key failures would be an endless security retry; retrying a missing
+    /// session or a detach would fight the user's own decision.
+    pub fn retriable(self) -> bool {
+        self == Self::Transport
+    }
+
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::Transport => "The connection dropped.",
+            Self::Authentication => "Authentication failed. Starcom will not retry it.",
+            Self::HostKey => "The host key is not trusted. Starcom will not retry it.",
+            Self::MissingSession => {
+                "That tmux session no longer exists. Starcom never creates a replacement."
+            }
+            Self::ServerExit => {
+                "The remote tmux server exited. Any session it held is gone; reattaching \
+                 would attach to a different server."
+            }
+            Self::Detached => "This client was detached. Reconnect when you want it back.",
+            Self::Configuration => "The connection settings were rejected.",
+            Self::Protocol => "The tmux control stream was not usable.",
+        }
+    }
+}
+
+/// Classify a failed attachment or poll.
+#[cfg(feature = "ssh")]
+pub fn classify(error: &anyhow::Error) -> Failure {
+    // A typed transport error is authoritative: it is produced by our own code
+    // from the SSH state machine, not from remote output.
+    if let Some(failure) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ssh::Error>())
+        .map(|error| match error.kind {
+            ssh::Kind::Transport | ssh::Kind::Timeout => Failure::Transport,
+            ssh::Kind::Authentication => Failure::Authentication,
+            ssh::Kind::UnknownHostKey | ssh::Kind::ChangedHostKey => Failure::HostKey,
+            ssh::Kind::Configuration => Failure::Configuration,
+        })
+    {
+        // tmux may still have told us the session is gone while the channel was
+        // ending. That narrows a retriable failure; it never widens one.
+        if failure == Failure::Transport
+            && let Some(narrowed) = narrow(&format!("{error:#}"))
+        {
+            return narrowed;
+        }
+        return failure;
+    }
+    narrow(&format!("{error:#}")).unwrap_or(Failure::Protocol)
+}
+
+/// Recognize tmux's own refusals in an error chain. Returns only non-retriable
+/// classifications, so a hostile string can suppress a retry but never force one.
+fn narrow(text: &str) -> Option<Failure> {
+    let text = text.to_ascii_lowercase();
+    if text.contains("can't find session")
+        || text.contains("session not found")
+        || text.contains("no such session")
+    {
+        return Some(Failure::MissingSession);
+    }
+    if text.contains("no server running") || text.contains("server exited") {
+        return Some(Failure::ServerExit);
+    }
+    None
+}
+
+/// Classify tmux's orderly `%exit` reason. tmux sends this when the control
+/// client is going away for a reason it already knows.
+pub fn classify_exit(reason: Option<&str>) -> Failure {
+    let Some(reason) = reason else {
+        // A bare %exit is an ordinary detach, not a transport fault.
+        return Failure::Detached;
+    };
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("server exited") || reason.contains("lost server") {
+        Failure::ServerExit
+    } else if reason.contains("session destroyed") || reason.contains("no such session") {
+        Failure::MissingSession
+    } else {
+        Failure::Detached
+    }
+}
+
+/// First wait after a drop; short enough that a brief blip is invisible.
+pub const FIRST_DELAY: time::Duration = time::Duration::from_millis(500);
+/// Ceiling for a single wait. A laptop that slept for an hour still comes back
+/// within this bound instead of drifting into a multi-minute backoff.
+pub const MAX_DELAY: time::Duration = time::Duration::from_secs(30);
+
+/// Exponential backoff with deterministic +/-25% jitter.
+///
+/// It never gives up on its own. A retry loop ends because the user cancelled it
+/// or because the failure stopped being retriable — not because a counter ran
+/// out, which would silently abandon a session the user still wants.
+pub struct Backoff {
+    attempt: u32,
+    state: u64,
+}
+
+impl Backoff {
+    /// `seed` only decorrelates the jitter between tabs; it is not a secret and
+    /// nothing about the connection may be derived from the delays it produces.
+    pub fn new(seed: u64) -> Self {
+        Self {
+            attempt: 0,
+            // Never seed the generator with zero: xorshift would stay there.
+            state: seed | 1,
+        }
+    }
+
+    /// How many attempts have been scheduled, starting at 1 after the first call.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// A successful, fully restored attachment starts the schedule over.
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
+
+    pub fn next_delay(&mut self) -> time::Duration {
+        self.attempt = self.attempt.saturating_add(1);
+        let steps = self.attempt.saturating_sub(1).min(16);
+        let base = FIRST_DELAY
+            .saturating_mul(1u32 << steps)
+            .min(MAX_DELAY)
+            .as_millis() as u64;
+        // xorshift64: a few lines of arithmetic instead of a dependency, and
+        // reproducible from the seed so the schedule is testable.
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        // Uniform over [75%, 125%] of the base delay, then clamped.
+        let spread = base / 2;
+        let jittered = base.saturating_sub(spread / 2) + (self.state % (spread + 1));
+        time::Duration::from_millis(jittered.max(1)).min(MAX_DELAY)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_transport_loss_is_retried_automatically() {
+        assert!(Failure::Transport.retriable());
+        for failure in [
+            Failure::Authentication,
+            Failure::HostKey,
+            Failure::MissingSession,
+            Failure::ServerExit,
+            Failure::Detached,
+            Failure::Configuration,
+            Failure::Protocol,
+        ] {
+            assert!(!failure.retriable(), "{failure:?} must not auto-retry");
+        }
+    }
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn transport_errors_are_retriable_and_security_errors_are_not() {
+        let cases = [
+            (ssh::Kind::Transport, Failure::Transport),
+            (ssh::Kind::Timeout, Failure::Transport),
+            (ssh::Kind::Authentication, Failure::Authentication),
+            (ssh::Kind::UnknownHostKey, Failure::HostKey),
+            (ssh::Kind::ChangedHostKey, Failure::HostKey),
+            (ssh::Kind::Configuration, Failure::Configuration),
+        ];
+        for (kind, expected) in cases {
+            let error = anyhow::Error::new(ssh::Error::for_test(kind, "boom"))
+                .context("attach the control session");
+            assert_eq!(classify(&error), expected, "{kind:?}");
+        }
+    }
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn remote_text_can_stop_a_retry_but_never_start_one() {
+        // tmux refusing the session must not become an endless reattach loop.
+        let error = anyhow::Error::new(ssh::Error::for_test(
+            ssh::Kind::Transport,
+            "SSH control channel ended",
+        ))
+        .context("tmux request failed; remote stderr: \"can't find session: work\"");
+        assert_eq!(classify(&error), Failure::MissingSession);
+
+        // The reverse must not hold: remote output claiming a transient fault
+        // cannot turn a host-key failure into something Starcom retries.
+        let error = anyhow::Error::new(ssh::Error::for_test(
+            ssh::Kind::ChangedHostKey,
+            "host key is not trusted",
+        ))
+        .context("remote said: connection reset, please retry, no server running");
+        assert_eq!(classify(&error), Failure::HostKey);
+
+        // An unrecognized failure is never retried.
+        assert_eq!(
+            classify(&anyhow::anyhow!("something new and unexplained")),
+            Failure::Protocol
+        );
+    }
+
+    #[test]
+    fn tmux_exit_reasons_separate_detach_from_server_loss() {
+        assert_eq!(classify_exit(None), Failure::Detached);
+        assert_eq!(classify_exit(Some("detached")), Failure::Detached);
+        assert_eq!(classify_exit(Some("server exited")), Failure::ServerExit);
+        assert_eq!(
+            classify_exit(Some("server exited unexpectedly")),
+            Failure::ServerExit
+        );
+        assert_eq!(
+            classify_exit(Some("session destroyed")),
+            Failure::MissingSession
+        );
+    }
+
+    #[test]
+    fn delays_grow_stay_bounded_and_are_jittered_per_connection() {
+        let mut backoff = Backoff::new(0x5eed);
+        let mut previous = time::Duration::ZERO;
+        for attempt in 1..=12 {
+            let delay = backoff.next_delay();
+            assert_eq!(backoff.attempt(), attempt);
+            assert!(delay <= MAX_DELAY, "delay {delay:?} exceeds the ceiling");
+            assert!(delay >= time::Duration::from_millis(1));
+            if attempt <= 6 {
+                assert!(
+                    delay >= previous,
+                    "attempt {attempt} did not back off: {delay:?} after {previous:?}"
+                );
+            }
+            previous = delay;
+        }
+        // Late attempts sit at the ceiling rather than growing without bound.
+        for _ in 0..8 {
+            assert!(backoff.next_delay() <= MAX_DELAY);
+        }
+        // Two tabs failing at once must not line up on identical schedules.
+        let mut a = Backoff::new(1);
+        let mut b = Backoff::new(2);
+        let left: Vec<_> = (0..6).map(|_| a.next_delay()).collect();
+        let right: Vec<_> = (0..6).map(|_| b.next_delay()).collect();
+        assert_ne!(left, right, "jitter must decorrelate connections");
+        // The same seed reproduces the same schedule, so this stays testable.
+        let mut again = Backoff::new(1);
+        assert_eq!(left, (0..6).map(|_| again.next_delay()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_restored_attachment_starts_the_schedule_over() {
+        let mut backoff = Backoff::new(7);
+        for _ in 0..5 {
+            backoff.next_delay();
+        }
+        assert_eq!(backoff.attempt(), 5);
+        backoff.reset();
+        assert_eq!(backoff.attempt(), 0);
+        assert!(backoff.next_delay() <= FIRST_DELAY.saturating_mul(2));
+    }
+}

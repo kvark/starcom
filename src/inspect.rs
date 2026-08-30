@@ -329,7 +329,14 @@ impl Inspector {
             if bytes != 0 {
                 return Ok(Some((events, bytes)));
             }
-            anyhow::ensure!(!self.channel.eof(), "SSH control channel ended");
+            // EOF without a preceding %exit means the channel died under us.
+            // tmux announces an orderly end; reaching here does not.
+            if self.channel.eof() {
+                return Err(ssh::Error::transport(
+                    "SSH control channel ended before tmux reported an exit",
+                )
+                .into());
+            }
             if let Err(error) = self.channel.wait(deadline) {
                 if error.kind == ssh::Kind::Timeout {
                     return Ok(None);

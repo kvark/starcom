@@ -96,6 +96,19 @@ impl Error {
             detail: detail.to_string(),
         }
     }
+
+    /// Report a transport fault raised outside this module, so reconnection
+    /// policy classifies it from a type rather than from remote text.
+    pub(crate) fn transport(detail: impl fmt::Display) -> Self {
+        Self::new(Kind::Transport, detail)
+    }
+
+    /// Build any failure kind without a socket, so reconnection policy can be
+    /// tested against all of them offline.
+    #[cfg(test)]
+    pub(crate) fn for_test(kind: Kind, detail: impl fmt::Display) -> Self {
+        Self::new(kind, detail)
+    }
 }
 
 impl fmt::Display for Error {

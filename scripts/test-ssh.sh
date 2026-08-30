@@ -91,5 +91,23 @@ done
 [[ "$count" == 2 ]] || { echo 'tmux fixture did not become ready' >&2; exit 1; }
 export STARCOM_TEST_DIR="$work" STARCOM_TEST_USER="$user"
 export STARCOM_AGENT_TEST_PUBKEY="$work/id_ed25519.pub"
-timeout 30s cargo test --locked --lib signs_with_isolated_openssh_agent -- --ignored --test-threads=1
-timeout 120s cargo test --locked --test ssh_localhost --test ssh_migration -- --ignored --test-threads=1
+# cargo exits 0 when a filter matches nothing, so a renamed test or a changed
+# cfg would leave this whole fixture green having asserted nothing. Require the
+# tests to actually run, and update the counts when tests are added.
+run_fixture() {
+    local expected=$1 log
+    shift
+    log=$(mktemp "$work/testlog.XXXXXX")
+    "$@" 2>&1 | tee "$log"
+    local status=${PIPESTATUS[0]}
+    [[ "$status" == 0 ]] || return "$status"
+    local passed
+    passed=$(awk '/^test result: ok\./ { total += $4 } END { print total + 0 }' "$log")
+    if [[ "$passed" != "$expected" ]]; then
+        echo "fixture ran $passed tests, expected $expected: a test was renamed, skipped, or cfg'd out" >&2
+        return 1
+    fi
+}
+
+run_fixture 1 timeout 30s cargo test --locked --lib signs_with_isolated_openssh_agent -- --ignored --test-threads=1
+run_fixture 17 timeout 300s cargo test --locked --test ssh_localhost --test ssh_migration -- --ignored --test-threads=1

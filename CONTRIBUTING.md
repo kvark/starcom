@@ -45,6 +45,7 @@ cargo fmt --check
 cargo clippy --locked --all-features --all-targets -- -D warnings
 cargo test --locked --all-features --all-targets
 python3 scripts/check-dependencies.py
+cargo deny --all-features check
 ```
 
 CI should exercise Linux, macOS, and Windows clients. Tests requiring a real tmux
@@ -79,6 +80,17 @@ the native window and system clipboard. Do not equate these checks with native
 macOS/Windows/Wayland/IME acceptance or call local viewport resizing remote pane
 resizing. Keep CI triggers on PRs and main; no repository-writing preparation
 jobs belong in the final workflow.
+
+## Dependency advisories
+
+Starcom implements its own SSH client, so it owns its dependencies' advisories.
+`deny.toml` is checked on every change and on a weekly schedule, because an
+advisory can land against a lockfile nobody touched.
+
+An entry in `advisories.ignore` is an accepted risk, not a way to quiet CI. Each
+one states why the exposure is tolerable and how it ends. Do not add one to make
+a build pass; raise it instead. Release-candidate crypto dependencies are release
+blockers tracked in PLAN.md, not permanent fixtures.
 
 ## Native dependency policy
 

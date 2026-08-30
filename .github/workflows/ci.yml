@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Catch advisories filed against a lockfile nobody touched.
+    - cron: "17 6 * * 1"
 
 permissions:
   contents: read
@@ -81,3 +84,42 @@ jobs:
           path: target/test-artifacts
           if-no-files-found: ignore
           retention-days: 7
+
+  # The declared rust-version is a promise to packagers. Build it, or it is a guess.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+      - name: Build and test at the declared minimum
+        run: |
+          cargo build --locked --all-features --all-targets
+          cargo test --locked --all-features --all-targets
+
+  # Starcom implements its own SSH client, so it owns its dependencies'
+  # advisories. Scheduled as well as per-change: an advisory can land on an
+  # unchanged lockfile.
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Advisories, bans, licenses, and sources
+        run: cargo deny --all-features check

@@ -1,9 +1,13 @@
 # Snapshot-to-live synchronization
 
-This increment adds a read-only live-model path to `starcom-inspect --watch N`.
-It reconstructs observable pane state and then consumes `%output` notifications.
-It is not a GUI, an interactive terminal, or a complete serialization of tmux's
+This describes the snapshot-to-live path shared by the desktop client and
+`starcom-inspect --watch N`. It reconstructs observable pane state and then
+consumes `%output` notifications. It is not a complete serialization of tmux's
 terminal parser. `Watching` is a stream state, not a claim of perfect fidelity.
+
+Every attachment runs this path from the beginning, including each automatic
+reconnection: models are rebuilt from a fresh boundary under a new epoch and are
+never appended to the models of a lost attachment.
 
 ## Capture boundary
 
@@ -24,8 +28,9 @@ terminal parser. `Watching` is a stream state, not a claim of perfect fidelity.
    a synchronization boundary. Publish the new view only after reconstruction.
 
 The design relies on tmux executing this list of synchronous commands without
-returning to its event loop, and on its ordered control-output queue. The 3.3a
-source explicitly implements both behaviors. This is a source-supported design,
+returning to its event loop, and on its ordered control-output queue. The tmux
+source explicitly implements both behaviors; this was read in 3.3a and the
+behavior is exercised against the 3.4 build the integration fixture uses. This is a source-supported design,
 not a new atomic-snapshot guarantee in tmux's public API. Runtime ordering tests
 must pass on every advertised tmux version before it is called supported.
 

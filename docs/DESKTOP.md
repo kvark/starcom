@@ -5,8 +5,8 @@ existing tmux session, reconstructs each pane into an Alacritty terminal model,
 and presents tmux windows and panes through Blade/egui.
 
 The implementation is usable enough for focused testing, but it is not yet a
-finished terminal: automatic reconnect, application mouse reporting, broad TUI
-compatibility, and native macOS/Windows interaction acceptance remain open.
+finished terminal: application mouse reporting, broad TUI compatibility, and
+native macOS/Windows interaction acceptance remain open.
 
 ## Start
 
@@ -121,8 +121,29 @@ block the resize transaction.
 ## Disconnect and exit behavior
 
 Disconnecting preserves the last received view for reading and copying, marks it
-stale, and disables input. Manual reconnect currently starts a new attachment;
-automatic retry/backoff is M3.
+stale, and disables input.
+
+**Reconnect automatically after connection loss** is on by default in the
+connection form. Only transport loss is retried. Authentication failures, host-key
+failures, a missing or destroyed session, a tmux server that exited, and an
+explicit detach all stop and wait for you, because retrying any of them would
+either loop on a security decision or quietly attach somewhere else.
+
+Each retry waits a little longer, up to 30 seconds, with jitter so several tabs
+that drop together do not reconnect in lockstep. The status bar shows the attempt
+number and the remaining wait, and **Stop reconnecting** ends the schedule at any
+time. A successful attachment resets the schedule.
+
+While disconnected, the last view stays readable and copyable, but no input token
+is issued: nothing typed during an outage is queued for later delivery, and a
+write whose delivery was uncertain is never repeated. Each attempt reattaches
+under a new connection epoch and rebuilds every pane model from a fresh snapshot.
+
+Because attaching resolves the session by name, a restarted tmux server can hand
+back a different session that merely shares that name. Starcom compares the
+session identity across the reconnect and says so when it changed. It also
+reports when tmux could not supply the full scrollback, so a shorter view after
+reconnecting reads as a known limit rather than as lost output.
 
 Window closure disables repaint callbacks, invalidates and wakes all workers, and
 releases Blade surface/painter/encoder resources while the winit event loop and
@@ -167,8 +188,10 @@ cargo run --locked --no-default-features --features ssh --bin starcom-inspect --
 
 Linux CI runs a disposable loopback sshd and isolated tmux server. It exercises
 real interactive input, paste-once behavior, pane resizing/resynchronization,
-`synchronize-panes` blocking, process preservation, snapshot continuity, and
-timeouts. A native X11/Xvfb test covers rendering, selection, the system clipboard,
+`synchronize-panes` blocking, process preservation, snapshot continuity,
+automatic reconnection after an abrupt transport loss, refusal to reattach to a
+destroyed session, and timeouts. The fixture asserts how many tests actually ran,
+so a renamed or cfg-excluded test fails instead of passing silently. A native X11/Xvfb test covers rendering, selection, the system clipboard,
 window resize, and normal-window clean close. Windows CI tests its OpenSSH-agent
 named pipe. macOS and Windows compile/test the full desktop but do not yet have
 native GUI automation.

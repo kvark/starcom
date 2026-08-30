@@ -309,6 +309,20 @@ pub struct View {
     pub session: tmuxctl::SessionId,
     panes: collections::BTreeMap<tmuxctl::PaneId, Pane>,
     status: Status,
+    /// tmux's own `%exit` reason, when it gave one. Reconnection policy needs to
+    /// tell an orderly detach apart from a server that went away.
+    exit: Option<ExitReason>,
+}
+
+/// `%exit` carries no reason on older servers; the distinction matters, so an
+/// absent reason is kept distinct from a missing exit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExitReason(Option<String>);
+
+impl ExitReason {
+    pub fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
 }
 
 impl View {
@@ -338,6 +352,7 @@ impl View {
             session,
             panes: map,
             status: Status::Watching,
+            exit: None,
         })
     }
 
@@ -363,10 +378,18 @@ impl View {
         self.status = Status::Disconnected;
     }
 
+    /// Why tmux ended this control session, if it said. `None` means the view
+    /// was disconnected locally (cancelled, or the transport dropped first).
+    pub fn exit_reason(&self) -> Option<&ExitReason> {
+        self.exit.as_ref()
+    }
+
     pub fn apply(&mut self, notification: tmuxctl::Notification) {
         // A detach must remain observable even if a preceding layout change
         // already invalidated the models in this same network read.
-        if matches!(notification, tmuxctl::Notification::Exit(_)) {
+        if let tmuxctl::Notification::Exit(ref reason) = notification {
+            // Keep the FIRST reason: it explains why the session is ending.
+            self.exit.get_or_insert_with(|| ExitReason(reason.clone()));
             self.disconnect();
             return;
         }

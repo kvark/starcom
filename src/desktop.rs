@@ -5,7 +5,7 @@
 
 use std::{collections, env, path, sync, thread, time};
 
-use crate::{core, input, session, snapshot, ssh, terminal, ui, window};
+use crate::{core, input, reconnect, session, snapshot, ssh, terminal, ui, window};
 
 #[derive(Clone)]
 pub struct Connection {
@@ -14,6 +14,9 @@ pub struct Connection {
     pub socket: Option<String>,
     pub history: usize,
     pub access: session::Access,
+    /// Retry transport loss automatically. Only transport loss: authentication,
+    /// trust, missing-session, and detach never retry regardless of this.
+    pub reconnect: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +25,9 @@ pub enum Phase {
     Connecting,
     Watching,
     Resynchronizing,
+    /// Waiting out a backoff delay before another attachment attempt. The last
+    /// view stays readable; nothing typed here is queued for later delivery.
+    Reconnecting,
     Disconnected,
     Failed,
     Demo,
@@ -34,10 +40,27 @@ impl Phase {
             Self::Connecting => "Connecting",
             Self::Watching => "Connected",
             Self::Resynchronizing => "Resynchronizing",
+            Self::Reconnecting => "Reconnecting",
             Self::Disconnected => "Disconnected",
             Self::Failed => "Connection failed",
             Self::Demo => "Demo data",
         }
+    }
+}
+
+/// Visible retry state. The UI shows the attempt and the remaining wait so an
+/// automatic reconnection is never something happening silently behind the user.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Retry {
+    pub attempt: u32,
+    pub resume_at: time::Instant,
+    pub failure: reconnect::Failure,
+}
+
+impl Retry {
+    pub fn remaining(self) -> time::Duration {
+        self.resume_at
+            .saturating_duration_since(time::Instant::now())
     }
 }
 
@@ -75,6 +98,12 @@ pub(crate) struct State {
     pub error: Option<String>,
     pub access: session::Access,
     pub allow_resize: bool,
+    /// Set while an automatic reconnection is scheduled. Cleared as soon as an
+    /// attempt starts, so a stale countdown is never displayed.
+    pub retry: Option<Retry>,
+    /// A one-shot report that the reattached session is not the one that was
+    /// lost, or that its scrollback is shorter than what was on screen.
+    pub continuity: Option<String>,
     actions: collections::VecDeque<Pending>,
     action_bytes: usize,
     io_wake: Option<ssh::Wake>,
@@ -93,6 +122,8 @@ impl Default for State {
             error: None,
             access: session::Access::ReadOnly,
             allow_resize: false,
+            retry: None,
+            continuity: None,
             actions: collections::VecDeque::new(),
             action_bytes: 0,
             io_wake: None,
@@ -108,6 +139,8 @@ impl State {
             .expect("connection epoch exhausted");
         self.pending = None;
         self.error = None;
+        self.retry = None;
+        self.continuity = None;
         self.discard_actions();
         self.access = session::Access::ReadOnly;
         self.allow_resize = false;
@@ -121,6 +154,18 @@ impl State {
 
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// An interactive demo view for tests that need input tokens without a
+    /// network connection. Never reachable from a running application.
+    #[cfg(test)]
+    pub(crate) fn interactive_demo() -> anyhow::Result<Self> {
+        Ok(Self {
+            phase: Phase::Watching,
+            view: Some(demo_view()?),
+            access: session::Access::Interactive,
+            ..Self::default()
+        })
     }
 
     pub(crate) fn input_ready(&self) -> bool {
@@ -187,6 +232,26 @@ impl State {
 
     fn accepts(&self, epoch: u64) -> bool {
         !self.stopping && self.epoch == epoch
+    }
+
+    /// Take a fresh epoch for the next attachment attempt, unless the user has
+    /// already superseded this connection. Every outstanding input token becomes
+    /// invalid, so nothing produced against the lost attachment can be delivered.
+    ///
+    /// Unlike `cancel`, this keeps the user's per-connection resize consent: it
+    /// is the same profile and session, and every resize is still guarded
+    /// server-side against the exact geometry it was aimed at.
+    fn renew(&mut self, previous: u64) -> Option<u64> {
+        if !self.accepts(previous) {
+            return None;
+        }
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .expect("connection epoch exhausted");
+        self.discard_actions();
+        self.retry = None;
+        Some(self.epoch)
     }
 }
 
@@ -304,6 +369,23 @@ impl Client {
         self.lock().phase
     }
 
+    /// Bumped for every reconstructed view. A change means the models were
+    /// rebuilt from a fresh snapshot, never appended to the previous ones.
+    pub fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    /// The scheduled reconnection attempt, when one is pending.
+    pub fn retry(&self) -> Option<Retry> {
+        self.lock().retry
+    }
+
+    /// A one-shot report that the reattached session or its scrollback is not
+    /// continuous with what was on screen before.
+    pub fn continuity(&self) -> Option<String> {
+        self.lock().continuity.clone()
+    }
+
     /// Inspect models without exposing the lock or allowing a borrowed view to
     /// outlive it. No networking runs under this lock.
     pub fn with_view<R>(&self, read: impl FnOnce(Option<&snapshot::View>) -> R) -> R {
@@ -336,9 +418,17 @@ impl Drop for Client {
     }
 }
 
+/// Why one attachment stopped running.
+enum Outcome {
+    /// The user replaced or cancelled this connection. Say nothing further.
+    Cancelled,
+    /// tmux ended the control session and said why.
+    Ended(reconnect::Failure),
+}
+
 fn worker_loop(shared: Shared, wake: Wake) {
     loop {
-        let (epoch, connection) = {
+        let (mut epoch, connection) = {
             let state = shared
                 .0
                 .lock()
@@ -355,29 +445,178 @@ fn worker_loop(shared: Shared, wake: Wake) {
                 state.pending.take().expect("request checked above"),
             )
         };
-        if let Err(error) = watch(&shared, &wake, epoch, &connection) {
-            let mut state = shared
-                .0
-                .lock()
-                .unwrap_or_else(sync::PoisonError::into_inner);
-            if state.accepts(epoch) {
-                if let Some(ref mut view) = state.view {
-                    view.disconnect();
-                }
-                state.discard_actions();
-                state.io_wake = None;
-                state.phase = Phase::Failed;
-                // Do not emit credentials or remote output to logs. Error
-                // display is plain GUI text, bounded independently of the wire.
-                state.error = Some(format!("{error:#}").chars().take(2048).collect());
-                drop(state);
-                wake();
+        // One backoff schedule per user-requested connection, so a session that
+        // flaps repeatedly keeps backing off instead of hammering every 500 ms.
+        let mut backoff = reconnect::Backoff::new(jitter_seed(epoch));
+        let mut previous_session = None;
+        loop {
+            let result = watch(
+                &shared,
+                &wake,
+                epoch,
+                &connection,
+                &mut previous_session,
+                &mut backoff,
+            );
+            let (failure, detail) = match result {
+                Ok(Outcome::Cancelled) => break,
+                Ok(Outcome::Ended(failure)) => (failure, failure.summary().to_owned()),
+                Err(error) => (
+                    reconnect::classify(&error),
+                    // Do not emit credentials or remote output to logs. Error
+                    // display is plain GUI text, bounded independently of the wire.
+                    format!("{error:#}").chars().take(2048).collect(),
+                ),
+            };
+            let retriable = failure.retriable() && connection.reconnect;
+            let delay = retriable.then(|| backoff.next_delay());
+            let Some(next) = report_failure(
+                &shared,
+                &wake,
+                epoch,
+                failure,
+                &detail,
+                delay.map(|delay| (backoff.attempt(), delay)),
+            ) else {
+                break;
+            };
+            if !wait_for_retry(&shared, epoch, next) {
+                break;
+            }
+            match renew_epoch(&shared, &wake, epoch) {
+                Some(renewed) => epoch = renewed,
+                None => break,
             }
         }
     }
 }
 
-fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> anyhow::Result<()> {
+/// Report scrollback that tmux could not supply in full, so a shorter view
+/// after a reattach reads as a known limit rather than as lost output.
+fn truncation_notice(view: &snapshot::View) -> Option<String> {
+    let truncated = view
+        .panes()
+        .values()
+        .filter(|pane| pane.history_may_be_truncated)
+        .count();
+    (truncated != 0).then(|| {
+        format!(
+            "Scrollback is incomplete in {truncated} of {} panes: tmux had already \
+             discarded the earlier output, or the pane is on its alternate screen.",
+            view.panes().len()
+        )
+    })
+}
+
+/// Decorrelate one tab's retry schedule from another's. This is a scheduling
+/// nicety, not a secret: nothing about the connection is derivable from it.
+fn jitter_seed(epoch: u64) -> u64 {
+    let since = time::SystemTime::now()
+        .duration_since(time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos() as u64);
+    since.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ epoch.wrapping_add(1)
+}
+
+/// Publish why the attachment ended. Returns the instant of the next attempt
+/// when one is scheduled, or None when this connection is finished.
+fn report_failure(
+    shared: &Shared,
+    wake: &Wake,
+    epoch: u64,
+    failure: reconnect::Failure,
+    detail: &str,
+    retry: Option<(u32, time::Duration)>,
+) -> Option<time::Instant> {
+    let mut state = shared
+        .0
+        .lock()
+        .unwrap_or_else(sync::PoisonError::into_inner);
+    if !state.accepts(epoch) {
+        return None;
+    }
+    // The last view stays readable and copyable; only its liveness is revoked.
+    if let Some(ref mut view) = state.view {
+        view.disconnect();
+    }
+    // Nothing typed against the lost attachment is kept for later delivery.
+    state.discard_actions();
+    state.io_wake = None;
+    let scheduled = retry.map(|(attempt, delay)| {
+        let resume_at = time::Instant::now() + delay;
+        state.phase = Phase::Reconnecting;
+        state.retry = Some(Retry {
+            attempt,
+            resume_at,
+            failure,
+        });
+        resume_at
+    });
+    if scheduled.is_none() {
+        state.retry = None;
+        state.phase = match failure {
+            // An orderly detach is not an error to apologize for.
+            reconnect::Failure::Detached => Phase::Disconnected,
+            _ => Phase::Failed,
+        };
+    }
+    state.error = Some(
+        format!("{} {detail}", failure.summary())
+            .chars()
+            .take(2048)
+            .collect(),
+    );
+    drop(state);
+    wake();
+    scheduled
+}
+
+/// Sleep until `until`, waking immediately if the user cancels or reconnects.
+/// Returns false when this connection was superseded while waiting.
+fn wait_for_retry(shared: &Shared, epoch: u64, until: time::Instant) -> bool {
+    let mut state = shared
+        .0
+        .lock()
+        .unwrap_or_else(sync::PoisonError::into_inner);
+    loop {
+        if !state.accepts(epoch) {
+            return false;
+        }
+        let Some(remaining) = until.checked_duration_since(time::Instant::now()) else {
+            return true;
+        };
+        if remaining.is_zero() {
+            return true;
+        }
+        state = shared
+            .1
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(sync::PoisonError::into_inner)
+            .0;
+    }
+}
+
+/// Move to a fresh epoch and announce the attempt. Returns None if the user
+/// superseded this connection between the wait and the retry.
+fn renew_epoch(shared: &Shared, wake: &Wake, epoch: u64) -> Option<u64> {
+    let mut state = shared
+        .0
+        .lock()
+        .unwrap_or_else(sync::PoisonError::into_inner);
+    let renewed = state.renew(epoch)?;
+    state.phase = Phase::Connecting;
+    drop(state);
+    wake();
+    Some(renewed)
+}
+
+fn watch(
+    shared: &Shared,
+    wake: &Wake,
+    epoch: u64,
+    connection: &Connection,
+    previous_session: &mut Option<tmuxctl::SessionId>,
+    backoff: &mut reconnect::Backoff,
+) -> anyhow::Result<Outcome> {
     let attached = session::Session::attach_with_access(
         &connection.options,
         &connection.session,
@@ -387,13 +626,22 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
     )?;
     let (mut inspector, view) = attached.into_parts();
     let session_id = view.session;
+    // Attaching is by name, so a restarted server hands back a session that
+    // merely shares that name. Say so rather than presenting it as continuous.
+    let continuity = match *previous_session {
+        Some(lost) if lost != session_id => Some(format!(
+            "Reattached to a different tmux session ({session_id} replaced {lost}).              The earlier session and its scrollback are gone."
+        )),
+        _ => truncation_notice(&view),
+    };
+    *previous_session = Some(session_id);
     {
         let mut state = shared
             .0
             .lock()
             .unwrap_or_else(sync::PoisonError::into_inner);
         if !state.accepts(epoch) {
-            return Ok(());
+            return Ok(Outcome::Cancelled);
         }
         state.view = Some(view);
         state.access = connection.access;
@@ -406,7 +654,13 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
             connection.session.as_str()
         );
         state.phase = Phase::Watching;
+        state.retry = None;
+        state.error = None;
+        state.continuity = continuity;
     }
+    // A fully restored attachment earns a fresh schedule: the next drop starts
+    // from the short delay again instead of inheriting an old backoff.
+    backoff.reset();
     wake();
     loop {
         let status = {
@@ -415,24 +669,31 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
                 .lock()
                 .unwrap_or_else(sync::PoisonError::into_inner);
             if !state.accepts(epoch) {
-                return Ok(());
+                return Ok(Outcome::Cancelled);
             }
             state.view.as_ref().expect("view published").status()
         };
         match status {
             snapshot::Status::Disconnected => {
-                let mut state = shared
+                // tmux ended the control session. Its reason decides whether
+                // reattaching would restore this session or silently land on a
+                // different one; the caller applies the retry policy.
+                let state = shared
                     .0
                     .lock()
                     .unwrap_or_else(sync::PoisonError::into_inner);
-                if state.accepts(epoch) {
-                    state.discard_actions();
-                    state.io_wake = None;
-                    state.phase = Phase::Disconnected;
+                if !state.accepts(epoch) {
+                    return Ok(Outcome::Cancelled);
                 }
+                let failure = reconnect::classify_exit(
+                    state
+                        .view
+                        .as_ref()
+                        .and_then(snapshot::View::exit_reason)
+                        .and_then(snapshot::ExitReason::as_deref),
+                );
                 drop(state);
-                wake();
-                return Ok(());
+                return Ok(Outcome::Ended(failure));
             }
             snapshot::Status::NeedsResync => {
                 {
@@ -441,7 +702,7 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
                         .lock()
                         .unwrap_or_else(sync::PoisonError::into_inner);
                     if !state.accepts(epoch) {
-                        return Ok(());
+                        return Ok(Outcome::Cancelled);
                     }
                     if !state.actions.is_empty() {
                         state.error = Some(
@@ -464,11 +725,12 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
                     .lock()
                     .unwrap_or_else(sync::PoisonError::into_inner);
                 if !state.accepts(epoch) {
-                    return Ok(());
+                    return Ok(Outcome::Cancelled);
                 }
                 state.view = Some(restored);
                 state.generation += 1;
                 state.phase = Phase::Watching;
+                state.continuity = truncation_notice(state.view.as_ref().expect("just set"));
                 drop(state);
                 wake();
             }
@@ -479,7 +741,7 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
                         .lock()
                         .unwrap_or_else(sync::PoisonError::into_inner);
                     if !state.accepts(epoch) {
-                        return Ok(());
+                        return Ok(Outcome::Cancelled);
                     }
                     if let Some(pending) = state.actions.pop_front() {
                         state.action_bytes -= pending.action.size();
@@ -540,7 +802,7 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
                         .lock()
                         .unwrap_or_else(sync::PoisonError::into_inner);
                     if !state.accepts(epoch) {
-                        return Ok(());
+                        return Ok(Outcome::Cancelled);
                     }
                     for event in outcome.notifications {
                         state.view.as_mut().expect("view published").apply(event);
@@ -565,7 +827,7 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
                     .lock()
                     .unwrap_or_else(sync::PoisonError::into_inner);
                 if !state.accepts(epoch) {
-                    return Ok(());
+                    return Ok(Outcome::Cancelled);
                 }
                 let view = state.view.as_mut().expect("view published");
                 for notification in notifications {
@@ -674,12 +936,7 @@ mod tests {
     }
 
     fn editable() -> State {
-        State {
-            phase: Phase::Watching,
-            view: Some(demo_view().unwrap()),
-            access: session::Access::Interactive,
-            ..State::default()
-        }
+        State::interactive_demo().unwrap()
     }
 
     #[test]

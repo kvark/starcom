@@ -4,12 +4,12 @@
 //! Optional SSH and desktop modules add explicitly authorized live sessions.
 
 pub mod command;
-pub mod connection;
 pub mod control;
 pub mod core;
 pub mod input;
 #[cfg(feature = "ssh")]
 pub mod inspect;
+pub mod reconnect;
 pub mod replay;
 #[cfg(feature = "ssh")]
 pub mod session;
