@@ -4,6 +4,7 @@ use std::{path, sync};
 
 use crate::{desktop, ui, window_runtime, workspace};
 
+#[cfg(test)]
 pub(crate) fn configure(ctx: &egui::Context) {
     window_runtime::configure(ctx);
 }
