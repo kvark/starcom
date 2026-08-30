@@ -4,8 +4,7 @@
 
 A small native client for persistent remote tmux sessions. Linux, macOS, and
 Windows clients; Linux hosts with stock SSH and tmux. No remote Starcom service.
-A sister project to [FileMan](https://github.com/kvark/fileman), built with Rust,
-Blade, egui, and Alacritty's terminal core.
+Built with Rust, Blade, egui, and Alacritty's terminal core.
 
 ![Starcom desktop showing two terminal panes](etc/screenshot.png)
 
@@ -15,23 +14,20 @@ Blade, egui, and Alacritty's terminal core.
 
 ```sh
 cargo run --release --locked
-# Explore without connecting:
 cargo run --release --locked -- --demo
 ```
 
-Requires Rust 1.96+, the platform Rust linker, and a supported graphics driver.
+Use **+** to open a connection tab. Starcom suggests literal `Host` entries from
+`~/.ssh/config`, resolves supported user/host/port/key settings, and reports
+unsupported routing or authentication policy instead of bypassing it. Each tab
+shows either its connection form or its tmux windows—not both side by side.
+
+The desktop currently supports local scrollback, selection and copying, plus the
+experimental interactive path and opt-in shared tmux pane resizing. Multiline
+paste requires confirmation. Automatic reconnect remains pending.
+
 SSH and cryptography use Rust libraries; OpenSSL is not a build dependency.
+Host keys must already be trusted.
 
-Use **+** to open a connection tab. Choose an alias from your `~/.ssh/config`
-and an existing tmux session. Each tab owns its connection; the connection form
-replaces the terminal area rather than sitting beside it. Host keys must already
-be trusted. Unsupported proxy/authentication options are reported, never bypassed.
-
-Type into a focused pane; drag to select and scroll normally. Use the Copy/Paste
-buttons, Ctrl-Shift-C/V, or Cmd-C/V on macOS. Multiline paste needs confirmation.
-Enable **Resize remote panes** before dragging shared tmux dividers. Read-only
-connections remain available. Automatic reconnect is not implemented yet.
-
-[Desktop usage](docs/DESKTOP.md) · [SSH inspection](docs/SSH.md) ·
-[Synchronization limits](docs/SYNCHRONIZATION.md) · [Roadmap](PLAN.md) ·
-[Contributing](CONTRIBUTING.md)
+[Desktop usage](docs/DESKTOP.md) · [SSH details](docs/SSH.md) ·
+[Synchronization limits](docs/SYNCHRONIZATION.md) · [Roadmap](PLAN.md)

@@ -1,11 +1,11 @@
-//! Desktop state and a single cancellable, read-only SSH worker.
+//! Desktop state and a single cancellable SSH worker with bounded user input.
 //!
 //! The worker never holds the model mutex during SSH or snapshot requests.
 //! A replaced request cannot publish into the next connection's view.
 
-use std::{env, path, sync, thread, time};
+use std::{collections, env, path, sync, thread, time};
 
-use crate::{core, session, snapshot, ssh, terminal, ui, window};
+use crate::{core, input, session, snapshot, ssh, terminal, ui, window};
 
 #[derive(Clone)]
 pub struct Connection {
@@ -13,6 +13,7 @@ pub struct Connection {
     pub session: core::SessionName,
     pub socket: Option<String>,
     pub history: usize,
+    pub access: session::Access,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,13 +32,36 @@ impl Phase {
         match self {
             Self::Idle => "Not connected",
             Self::Connecting => "Connecting",
-            Self::Watching => "Watching",
+            Self::Watching => "Connected",
             Self::Resynchronizing => "Resynchronizing",
             Self::Disconnected => "Disconnected",
             Self::Failed => "Connection failed",
             Self::Demo => "Demo data",
         }
     }
+}
+
+const MAX_PENDING_ACTIONS: usize = 64;
+const MAX_PENDING_BYTES: usize = 128 * 1024;
+
+/// A UI action is bound to the exact connection and reconstructed view in which
+/// it originated. Pane IDs alone are unsafe across a new tmux server/connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Target {
+    epoch: u64,
+    generation: u64,
+    pane: tmuxctl::PaneId,
+}
+
+impl Target {
+    pub fn pane(self) -> tmuxctl::PaneId {
+        self.pane
+    }
+}
+
+struct Pending {
+    target: Target,
+    action: input::Action,
 }
 
 pub(crate) struct State {
@@ -49,6 +73,11 @@ pub(crate) struct State {
     pub view: Option<snapshot::View>,
     pub view_label: String,
     pub error: Option<String>,
+    pub access: session::Access,
+    pub allow_resize: bool,
+    actions: collections::VecDeque<Pending>,
+    action_bytes: usize,
+    io_wake: Option<ssh::Wake>,
 }
 
 impl Default for State {
@@ -62,6 +91,11 @@ impl Default for State {
             view: None,
             view_label: String::new(),
             error: None,
+            access: session::Access::ReadOnly,
+            allow_resize: false,
+            actions: collections::VecDeque::new(),
+            action_bytes: 0,
+            io_wake: None,
         }
     }
 }
@@ -74,9 +108,81 @@ impl State {
             .expect("connection epoch exhausted");
         self.pending = None;
         self.error = None;
+        self.discard_actions();
+        self.access = session::Access::ReadOnly;
+        self.allow_resize = false;
+        if let Some(wake) = self.io_wake.take() {
+            wake.notify();
+        }
         if let Some(ref mut view) = self.view {
             view.disconnect();
         }
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) fn input_ready(&self) -> bool {
+        self.phase == Phase::Watching
+            && self.access == session::Access::Interactive
+            && self
+                .view
+                .as_ref()
+                .is_some_and(|view| view.status() == snapshot::Status::Watching)
+    }
+
+    pub(crate) fn target(&self, pane: tmuxctl::PaneId) -> Option<Target> {
+        (self.input_ready() && self.view.as_ref()?.panes().contains_key(&pane)).then_some(Target {
+            epoch: self.epoch,
+            generation: self.generation,
+            pane,
+        })
+    }
+
+    fn discard_actions(&mut self) {
+        self.actions.clear();
+        self.action_bytes = 0;
+    }
+
+    pub(crate) fn enqueue(&mut self, target: Target, action: input::Action) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.target(target.pane) == Some(target),
+            "input was not sent: the connection or layout is no longer current"
+        );
+        anyhow::ensure!(
+            !matches!(action, input::Action::Resize(_)) || self.allow_resize,
+            "remote resizing is disabled; it changes the shared tmux layout"
+        );
+        session::validate_action(
+            self.view.as_ref().expect("target validated"),
+            target.pane,
+            &action,
+        )?;
+        let size = action.size();
+        anyhow::ensure!(
+            self.actions.len() < MAX_PENDING_ACTIONS
+                && self.action_bytes + size <= MAX_PENDING_BYTES,
+            "input queue is full; this action was not sent"
+        );
+        // Coalesce ordinary text, without moving it past a key/paste/resize.
+        if let input::Action::Bytes(ref bytes) = action
+            && let Some(Pending {
+                target: previous,
+                action: input::Action::Bytes(queued),
+            }) = self.actions.back_mut()
+            && *previous == target
+            && queued.len() + bytes.len() <= crate::command::MAX_INPUT_BYTES
+        {
+            queued.extend_from_slice(bytes);
+        } else {
+            self.actions.push_back(Pending { target, action });
+        }
+        self.action_bytes += size;
+        if let Some(ref wake) = self.io_wake {
+            wake.notify();
+        }
+        Ok(())
     }
 
     fn accepts(&self, epoch: u64) -> bool {
@@ -147,6 +253,53 @@ impl Client {
         Ok(())
     }
 
+    /// Obtain a token only after restoration. Keep it with any delayed GUI
+    /// action (such as paste confirmation); never recreate a token on retry.
+    pub fn target(&self, pane: tmuxctl::PaneId) -> Option<Target> {
+        self.lock().target(pane)
+    }
+
+    pub fn submit(&self, target: Target, action: input::Action) -> anyhow::Result<()> {
+        self.lock().enqueue(target, action)
+    }
+
+    /// Admit a GUI frame atomically, so a full queue cannot accept half of a
+    /// committed UTF-8 string or reorder a paste and its following keys.
+    pub(crate) fn submit_batch(&self, actions: Vec<(Target, input::Action)>) -> anyhow::Result<()> {
+        let mut state = self.lock();
+        let size: usize = actions.iter().map(|(_, action)| action.size()).sum();
+        anyhow::ensure!(
+            state.actions.len() + actions.len() <= MAX_PENDING_ACTIONS
+                && state.action_bytes + size <= MAX_PENDING_BYTES,
+            "input queue is full; this frame's actions were not sent"
+        );
+        for (target, action) in &actions {
+            anyhow::ensure!(
+                state.target(target.pane) == Some(*target),
+                "input target changed; nothing was sent"
+            );
+            anyhow::ensure!(
+                !matches!(action, input::Action::Resize(_)) || state.allow_resize,
+                "remote resizing is disabled"
+            );
+            session::validate_action(
+                state.view.as_ref().expect("target checked"),
+                target.pane,
+                action,
+            )?;
+        }
+        for (target, action) in actions {
+            state.enqueue(target, action)?;
+        }
+        Ok(())
+    }
+
+    /// Explicit per-connection consent; automatic window sizing remains off.
+    pub fn allow_remote_resize(&self, allow: bool) {
+        let mut state = self.lock();
+        state.allow_resize = allow && state.input_ready();
+    }
+
     pub fn phase(&self) -> Phase {
         self.lock().phase
     }
@@ -211,6 +364,8 @@ fn worker_loop(shared: Shared, wake: Wake) {
                 if let Some(ref mut view) = state.view {
                     view.disconnect();
                 }
+                state.discard_actions();
+                state.io_wake = None;
                 state.phase = Phase::Failed;
                 // Do not emit credentials or remote output to logs. Error
                 // display is plain GUI text, bounded independently of the wire.
@@ -223,11 +378,12 @@ fn worker_loop(shared: Shared, wake: Wake) {
 }
 
 fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> anyhow::Result<()> {
-    let attached = session::Session::attach(
+    let attached = session::Session::attach_with_access(
         &connection.options,
         &connection.session,
         connection.socket.as_deref(),
         connection.history,
+        connection.access,
     )?;
     let (mut inspector, view) = attached.into_parts();
     let session_id = view.session;
@@ -240,6 +396,8 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
             return Ok(());
         }
         state.view = Some(view);
+        state.access = connection.access;
+        state.io_wake = Some(inspector.waker());
         state.generation += 1;
         state.view_label = format!(
             "{}@{} / {}",
@@ -268,6 +426,8 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
                     .lock()
                     .unwrap_or_else(sync::PoisonError::into_inner);
                 if state.accepts(epoch) {
+                    state.discard_actions();
+                    state.io_wake = None;
                     state.phase = Phase::Disconnected;
                 }
                 drop(state);
@@ -283,10 +443,22 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
                     if !state.accepts(epoch) {
                         return Ok(());
                     }
+                    if !state.actions.is_empty() {
+                        state.error = Some(
+                            "Layout changed; queued input was discarded, not replayed.".to_owned(),
+                        );
+                    }
+                    state.discard_actions();
                     state.phase = Phase::Resynchronizing;
                 }
                 wake();
-                let restored = session::restore(&mut inspector, session_id, connection.history)?;
+                let mut restored =
+                    session::restore(&mut inspector, session_id, connection.history)?;
+                if connection.access == session::Access::Interactive {
+                    for event in inspector.enable_input(&restored)? {
+                        restored.apply(event);
+                    }
+                }
                 let mut state = shared
                     .0
                     .lock()
@@ -301,10 +473,90 @@ fn watch(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) -> a
                 wake();
             }
             snapshot::Status::Watching => {
+                let pending = {
+                    let mut state = shared
+                        .0
+                        .lock()
+                        .unwrap_or_else(sync::PoisonError::into_inner);
+                    if !state.accepts(epoch) {
+                        return Ok(());
+                    }
+                    if let Some(pending) = state.actions.pop_front() {
+                        state.action_bytes -= pending.action.size();
+                        if state.target(pending.target.pane) != Some(pending.target)
+                            || (matches!(pending.action, input::Action::Resize(_))
+                                && !state.allow_resize)
+                        {
+                            continue;
+                        }
+                        let target = session::action_target(
+                            state.view.as_ref().expect("view published"),
+                            pending.target.pane,
+                        )?;
+                        let resizing = matches!(pending.action, input::Action::Resize(_));
+                        let ordinary = matches!(
+                            pending.action,
+                            input::Action::Bytes(_) | input::Action::Key(..)
+                        );
+                        let mut actions = vec![pending.action];
+                        // Pipeline adjacent keystrokes in one tmux transaction,
+                        // without moving them across a paste/resize or pane switch.
+                        while ordinary
+                            && actions.len() < 32
+                            && state.actions.front().is_some_and(|next| {
+                                next.target == pending.target
+                                    && matches!(
+                                        next.action,
+                                        input::Action::Bytes(_) | input::Action::Key(..)
+                                    )
+                            })
+                        {
+                            let next = state.actions.pop_front().expect("front checked");
+                            state.action_bytes -= next.action.size();
+                            actions.push(next.action);
+                        }
+                        if resizing {
+                            state.view.as_mut().expect("view published").invalidate();
+                            state.phase = Phase::Resynchronizing;
+                            if !state.actions.is_empty() {
+                                state.error = Some(
+                                    "Resize started; queued input was discarded, not replayed."
+                                        .to_owned(),
+                                );
+                            }
+                            state.discard_actions();
+                        }
+                        Some((target, actions))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((target, actions)) = pending {
+                    // The pop above is the dispatch boundary. Cancellation may
+                    // follow while I/O is in flight; these actions are NEVER requeued.
+                    let outcome = inspector.interact(target, &actions)?;
+                    let mut state = shared
+                        .0
+                        .lock()
+                        .unwrap_or_else(sync::PoisonError::into_inner);
+                    if !state.accepts(epoch) {
+                        return Ok(());
+                    }
+                    for event in outcome.notifications {
+                        state.view.as_mut().expect("view published").apply(event);
+                    }
+                    if !outcome.applied {
+                        state.error = Some("tmux blocked this action: the pane changed, is in a mode, or synchronize-panes/zoom is enabled. Nothing was retried.".to_owned());
+                        state.view.as_mut().expect("view published").invalidate();
+                    }
+                    drop(state);
+                    wake();
+                    continue;
+                }
                 // Socket readiness wait, not a repaint timer. Idle reads do not
                 // wake the UI. All network I/O is outside the model mutex.
                 let notifications =
-                    inspector.poll(time::Instant::now() + time::Duration::from_millis(100))?;
+                    inspector.poll(time::Instant::now() + time::Duration::from_secs(30))?;
                 if notifications.is_empty() {
                     continue;
                 }
@@ -419,5 +671,85 @@ mod tests {
         client.disconnect();
         assert_eq!(client.phase(), Phase::Disconnected);
         client.with_view(|view| assert_eq!(view.unwrap().status(), snapshot::Status::Disconnected));
+    }
+
+    fn editable() -> State {
+        State {
+            phase: Phase::Watching,
+            view: Some(demo_view().unwrap()),
+            access: session::Access::Interactive,
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn queue_is_bounded_and_cancellation_invalidates_all_actions() {
+        let mut state = editable();
+        let target = state.target(tmuxctl::PaneId(0)).unwrap();
+        for _ in 0..MAX_PENDING_ACTIONS {
+            state
+                .enqueue(
+                    target,
+                    input::Action::Key(input::Key::Enter, input::Modifiers::default()),
+                )
+                .unwrap();
+        }
+        assert!(
+            state
+                .enqueue(target, input::Action::Bytes(b"overflow".to_vec()))
+                .is_err()
+        );
+        assert_eq!(state.actions.len(), MAX_PENDING_ACTIONS);
+        state.cancel();
+        assert!(state.actions.is_empty());
+        assert_eq!(state.action_bytes, 0);
+        assert!(
+            state
+                .enqueue(target, input::Action::Bytes(b"stale".to_vec()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn queue_coalesces_bytes_without_crossing_a_key_or_pane_boundary() {
+        let mut state = editable();
+        let a = state.target(tmuxctl::PaneId(0)).unwrap();
+        let b = state.target(tmuxctl::PaneId(1)).unwrap();
+        for bytes in [b"one".to_vec(), b"two".to_vec()] {
+            state.enqueue(a, input::Action::Bytes(bytes)).unwrap();
+        }
+        state
+            .enqueue(
+                a,
+                input::Action::Key(input::Key::Enter, input::Modifiers::default()),
+            )
+            .unwrap();
+        state
+            .enqueue(b, input::Action::Bytes(b"three".to_vec()))
+            .unwrap();
+        assert_eq!(state.actions.len(), 3);
+        assert!(
+            matches!(&state.actions[0].action, input::Action::Bytes(bytes) if bytes == b"onetwo")
+        );
+        assert_eq!(state.actions[2].target, b);
+        assert_eq!(state.action_bytes, 6 + 32 + 5);
+    }
+
+    #[test]
+    fn a_gui_batch_is_rejected_as_a_whole_when_it_would_overflow() {
+        let client = Client::new(sync::Arc::new(|| {})).unwrap();
+        *client.lock() = editable();
+        let target = client.target(tmuxctl::PaneId(0)).unwrap();
+        let actions = (0..=MAX_PENDING_ACTIONS)
+            .map(|_| {
+                (
+                    target,
+                    input::Action::Key(input::Key::Enter, input::Modifiers::default()),
+                )
+            })
+            .collect();
+        assert!(client.submit_batch(actions).is_err());
+        assert!(client.lock().actions.is_empty());
+        assert_eq!(client.lock().action_bytes, 0);
     }
 }

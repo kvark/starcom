@@ -4,7 +4,7 @@
 //! bounded queues preserve stdout/stderr separation and apply backpressure. The
 //! system resolver and local file/agent connection setup can still block.
 
-use std::{collections, fmt, io, net, path, time};
+use std::{collections, fmt, io, net, path, sync, time};
 
 mod agent;
 mod auth;
@@ -106,10 +106,28 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Wake a socket readiness wait when the UI enqueues input or cancels a session.
+/// This carries no credentials and cannot read or write the SSH channel.
+#[cfg(feature = "gui")]
+#[derive(Clone)]
+pub(crate) struct Wake {
+    poller: sync::Arc<polling::Poller>,
+    pending: sync::Arc<sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "gui")]
+impl Wake {
+    pub(crate) fn notify(&self) {
+        self.pending.store(true, sync::atomic::Ordering::Release);
+        let _ = self.poller.notify();
+    }
+}
+
 pub struct Connection {
     runner: sunset::Runner<'static, sunset::Client>,
     socket: net::TcpStream,
-    poller: polling::Poller,
+    poller: sync::Arc<polling::Poller>,
+    wake_pending: sync::Arc<sync::atomic::AtomicBool>,
     events: polling::Events,
     options: Options,
     trust: trust::Store,
@@ -150,13 +168,14 @@ impl Connection {
         let socket = socket.ok_or_else(|| transport(last_error))?;
         socket.set_nodelay(true).map_err(transport)?;
         socket.set_nonblocking(true).map_err(transport)?;
-        let poller = polling::Poller::new().map_err(transport)?;
+        let poller = sync::Arc::new(polling::Poller::new().map_err(transport)?);
         // SAFETY: Connection owns this socket and deregisters it before drop.
         unsafe { poller.add(&socket, polling::Event::readable(0)) }.map_err(transport)?;
         let mut connection = Self {
             runner: sunset::Runner::new_client_owned(),
             socket,
             poller,
+            wake_pending: sync::Arc::new(sync::atomic::AtomicBool::new(false)),
             events: polling::Events::new(),
             options: options.clone(),
             trust,
@@ -433,6 +452,7 @@ impl Connection {
                 .wait(&mut self.events, Some(remaining(deadline)?))
             {
                 Ok(count) if count != 0 => return Ok(()),
+                Ok(_) if self.wake_pending.load(sync::atomic::Ordering::Acquire) => return Ok(()),
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(transport(error)),
@@ -460,6 +480,20 @@ pub struct Channel {
 }
 
 impl Channel {
+    #[cfg(feature = "gui")]
+    pub(crate) fn waker(&self) -> Wake {
+        Wake {
+            poller: sync::Arc::clone(&self.connection.poller),
+            pending: sync::Arc::clone(&self.connection.wake_pending),
+        }
+    }
+
+    pub(crate) fn take_wakeup(&self) -> bool {
+        self.connection
+            .wake_pending
+            .swap(false, sync::atomic::Ordering::AcqRel)
+    }
+
     pub fn timeout(&self) -> time::Duration {
         self.connection.options.timeout
     }

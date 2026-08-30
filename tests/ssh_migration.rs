@@ -54,14 +54,16 @@ fn rustcrypto_identity_algorithms_and_rekeyed_stream_work() {
 #[test]
 #[ignore = "requires the isolated SSH/tmux fixture"]
 fn desktop_worker_publishes_live_view_and_rejects_cancelled_requests() {
-    use starcom::{core, desktop};
+    use starcom::{core, desktop, session};
     use std::{sync, thread};
+
     let client = desktop::Client::new(sync::Arc::new(|| {})).unwrap();
     let connection = desktop::Connection {
         options: options(),
         session: core::SessionName::new("starcom").unwrap(),
         socket: Some(root().join("tmux.sock").to_str().unwrap().to_owned()),
         history: 20,
+        access: session::Access::Interactive,
     };
     client.connect(connection.clone()).unwrap();
     let deadline = time::Instant::now() + time::Duration::from_secs(10);

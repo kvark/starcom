@@ -27,4 +27,6 @@ mod ui;
 #[cfg(feature = "gui")]
 mod window;
 #[cfg(feature = "gui")]
+mod window_runtime;
+#[cfg(feature = "gui")]
 mod workspace;

@@ -1,12 +1,42 @@
 //! Reconstruct the split hierarchy from tmux's pane rectangles.
-//! Ratios are local viewport sizes; dragging NEVER resizes a remote pane.
+//! Local dividers optionally request a single tmux resize on release. The
+//! server owns the final geometry; no window-size option is modified.
 
-use crate::snapshot;
+use crate::{input, snapshot};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Axis {
     Horizontal,
     Vertical,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Boundary {
+    pane: tmuxctl::PaneId,
+    pane_cells: usize,
+    first_cells: usize,
+    available_cells: usize,
+}
+
+impl Boundary {
+    fn resize(self, axis: Axis, ratio: f32) -> Option<(tmuxctl::PaneId, input::Resize)> {
+        if !ratio.is_finite() {
+            return None;
+        }
+        let desired = (ratio * self.available_cells as f32).round() as isize;
+        let cells = (self.pane_cells as isize + desired - self.first_cells as isize).clamp(1, 4096)
+            as usize;
+        (cells != self.pane_cells).then_some((
+            self.pane,
+            input::Resize {
+                axis: match axis {
+                    Axis::Horizontal => input::Axis::Columns,
+                    Axis::Vertical => input::Axis::Rows,
+                },
+                cells,
+            },
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -15,6 +45,7 @@ pub enum Node {
     Split {
         axis: Axis,
         ratio: f32,
+        boundary: Option<Boundary>,
         first: Box<Node>,
         second: Box<Node>,
     },
@@ -57,9 +88,33 @@ impl Node {
                 if first.is_empty() || second.is_empty() {
                     continue;
                 }
+                let first_end = first.iter().map(end).max()?;
+                // A normal tmux split has exactly one separator cell. Unusual
+                // border/status layouts remain viewable but cannot be resized
+                // from an inferred boundary without a more complete layout model.
+                // A leaf must span the entire first side along this axis.
+                // Otherwise resize-pane can select a nearer nested split and
+                // move the wrong boundary. Such dividers stay local-only.
+                let boundary = if first_end + 1 == cut {
+                    first
+                        .iter()
+                        .find(|pane| start(pane) == low && end(pane) == first_end)
+                        .map(|pane| Boundary {
+                            pane: pane.state.pane,
+                            pane_cells: match axis {
+                                Axis::Horizontal => pane.state.size.columns(),
+                                Axis::Vertical => pane.state.size.rows(),
+                            },
+                            first_cells: first_end - low,
+                            available_cells: high - low - 1,
+                        })
+                } else {
+                    None
+                };
                 return Some(Self::Split {
                     axis,
-                    ratio: (cut - low) as f32 / (high - low) as f32,
+                    ratio: (first_end - low) as f32 / (high - low - (cut - first_end)) as f32,
+                    boundary,
                     first: Box::new(Self::from_panes(&first)?),
                     second: Box::new(Self::from_panes(&second)?),
                 });
@@ -73,6 +128,8 @@ impl Node {
         ui: &mut egui::Ui,
         rect: egui::Rect,
         id: egui::Id,
+        remote_resize: bool,
+        resizes: &mut Vec<(tmuxctl::PaneId, input::Resize)>,
         pane: &mut impl FnMut(&mut egui::Ui, egui::Rect, tmuxctl::PaneId),
     ) {
         match *self {
@@ -80,6 +137,7 @@ impl Node {
             Self::Split {
                 axis,
                 ref mut ratio,
+                boundary: remote_boundary,
                 ref mut first,
                 ref mut second,
             } => {
@@ -113,7 +171,11 @@ impl Node {
                         Axis::Horizontal => egui::CursorIcon::ResizeHorizontal,
                         Axis::Vertical => egui::CursorIcon::ResizeVertical,
                     })
-                    .on_hover_text("Resize local views only. Remote tmux geometry is unchanged.");
+                    .on_hover_text(if remote_resize && remote_boundary.is_some() {
+                        "Release to resize this shared tmux divider. Other clients see the change."
+                    } else {
+                        "Resize local views only. Remote tmux geometry is unchanged."
+                    });
                 if response.dragged()
                     && available > 0.0
                     && let Some(position) = response.interact_pointer_pos()
@@ -125,6 +187,13 @@ impl Node {
                     *ratio = ((position - gap * 0.5) / available).clamp(0.05, 0.95);
                     ui.ctx().request_repaint();
                 }
+                if remote_resize
+                    && response.drag_stopped()
+                    && let Some(resize) =
+                        remote_boundary.and_then(|boundary| boundary.resize(axis, *ratio))
+                {
+                    resizes.push(resize);
+                }
                 if response.hovered() || response.dragged() {
                     ui.painter().rect_filled(
                         divider.shrink(1.0),
@@ -132,8 +201,8 @@ impl Node {
                         ui.visuals().widgets.hovered.bg_fill,
                     );
                 }
-                first.draw(ui, a, id.with(0), pane);
-                second.draw(ui, b, id.with(1), pane);
+                first.draw(ui, a, id.with(0), remote_resize, resizes, pane);
+                second.draw(ui, b, id.with(1), remote_resize, resizes, pane);
             }
         }
     }
@@ -142,6 +211,27 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn divider_changes_one_axis_relative_to_observed_cells() {
+        let boundary = Boundary {
+            pane: tmuxctl::PaneId(2),
+            pane_cells: 40,
+            first_cells: 81,
+            available_cells: 122,
+        };
+        let (pane, resize) = boundary.resize(Axis::Horizontal, 91.0 / 122.0).unwrap();
+        assert_eq!(pane, tmuxctl::PaneId(2));
+        assert_eq!(
+            resize,
+            input::Resize {
+                axis: input::Axis::Columns,
+                cells: 50
+            }
+        );
+        assert!(boundary.resize(Axis::Horizontal, 81.0 / 122.0).is_none());
+        assert!(boundary.resize(Axis::Vertical, f32::NAN).is_none());
+    }
+
     #[test]
     fn demo_recovers_independent_window_splits() {
         let view = crate::desktop::demo_view().unwrap();
