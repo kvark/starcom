@@ -484,11 +484,19 @@ impl DesktopUi {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("+").on_hover_text("Larger terminal text").clicked() {
+                    if ui
+                        .button("+")
+                        .on_hover_text("Larger terminal text")
+                        .clicked()
+                    {
                         self.font_size = (self.font_size + 1.0).min(28.0);
                     }
                     ui.label(format!("{} pt", self.font_size as u32));
-                    if ui.button("−").on_hover_text("Smaller terminal text").clicked() {
+                    if ui
+                        .button("−")
+                        .on_hover_text("Smaller terminal text")
+                        .clicked()
+                    {
                         self.font_size = (self.font_size - 1.0).max(10.0);
                     }
                     if ui.button("Copy selection").clicked() {
@@ -572,15 +580,10 @@ impl DesktopUi {
                     &mut resizes,
                     &mut |ui, rect, pane_id| {
                         if let Some(pane) = view.panes_mut().get_mut(&pane_id) {
-                            pane_ui.entry(pane_id).or_default().show(
-                                ui,
-                                rect,
-                                pane,
-                                generation,
-                                font_size,
-                                focused,
-                                notice,
-                            );
+                            pane_ui
+                                .entry(pane_id)
+                                .or_default()
+                                .show(ui, rect, pane, generation, font_size, focused, notice);
                         }
                     },
                 );
