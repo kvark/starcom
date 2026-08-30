@@ -69,6 +69,10 @@ pub struct Inspector {
     stderr: Vec<u8>,
     input_buffer_prefix: Option<String>,
     input_sequence: u64,
+    /// Set once tmux has answered anything at all. Until then, an ending control
+    /// session means the attach never happened, which is a different failure
+    /// from a session that ended later.
+    answered: bool,
 }
 
 impl Inspector {
@@ -97,6 +101,7 @@ impl Inspector {
             stderr: Vec::new(),
             input_buffer_prefix: None,
             input_sequence: 0,
+            answered: false,
         })
     }
 
@@ -155,6 +160,7 @@ impl Inspector {
     /// numbers its first session `$0` again, so a replaced server would look
     /// like the same session. The server's pid and the session's creation time
     /// are what actually distinguish a replacement from a continuation.
+    #[cfg(feature = "gui")]
     pub(crate) fn identity(&mut self) -> anyhow::Result<Identity> {
         let reply =
             self.request("display-message -p '#{pid}|#{session_id}|#{session_created}'\n")?;
@@ -278,8 +284,18 @@ impl Inspector {
                                 })?
                                 .lines,
                         );
+                        self.answered = true;
                     }
                     tmuxctl::Incoming::Notification(tmuxctl::Notification::Exit(reason)) => {
+                        // tmux reports a failed attach inside the control stream
+                        // (a %begin/%error block) and then exits, before any of
+                        // our commands are outstanding, so those lines are not
+                        // correlated to anything and are dropped. What is
+                        // certain is that nothing was ever attached.
+                        anyhow::ensure!(
+                            self.answered,
+                            "tmux could not attach that session; it may not exist on this server"
+                        );
                         anyhow::bail!("tmux attachment ended ({reason:?})");
                     }
                     tmuxctl::Incoming::Notification(notification) => {
@@ -613,6 +629,9 @@ impl Drop for Inspector {
 }
 
 /// What makes one attachment the same session as the last one.
+///
+/// Only the desktop reconnects, so this is dead weight in a build without it.
+#[cfg(feature = "gui")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Identity {
     pub server: u32,

@@ -46,15 +46,15 @@ default = ["ssh", "gui"]
 gui = ["ssh", "dep:blade-egui", "dep:blade-graphics", "dep:egui", "dep:egui-winit", "dep:winit", "dep:png", "dep:log", "dep:env_logger"]
 ssh = ["dep:sunset", "dep:ssh-key", "dep:hmac", "dep:sha1", "dep:zeroize", "dep:signature", "dep:windows-sys", "dep:polling", "dep:base64"]
 
+# The client direct-tcpip open that ProxyJump needs is not in a published
+# Sunset. etc/sunset/ holds the patch as sent upstream; until it lands, build
+# against the fork carrying exactly that patch, pinned by revision.
+[patch.crates-io]
+sunset = { git = "https://github.com/kvark/sunset", rev = "15b1695" }
+
 [profile.release]
 lto = "thin"
 strip = true
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(gles)',
-    # Set when building against a Sunset carrying etc/sunset/*.patch, which adds
-    # the client direct-tcpip open that ProxyJump needs. Off by default so the
-    # normal build uses the published crate unchanged.
-    'cfg(sunset_forward)',
-] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(gles)'] }

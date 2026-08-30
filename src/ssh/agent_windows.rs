@@ -19,11 +19,31 @@ use super::remaining;
 
 pub struct Stream(fs::File);
 
+const DEFAULT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
+
+/// A local check, with no connection and no blocking: is an agent plausibly
+/// there? Used to warn on the connection form before a connection is tried.
+///
+/// The pipe directory is enumerated rather than opened. Opening a pipe to ask
+/// whether it exists connects to an instance, and the agent has a finite number
+/// of them. When the directory cannot be read at all, say nothing: a wrong
+/// warning is worse than no warning.
+pub fn available() -> bool {
+    let path = env::var_os("SSH_AUTH_SOCK").unwrap_or_else(|| DEFAULT_PIPE.into());
+    let path = std::path::Path::new(&path);
+    let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
+        return true;
+    };
+    match fs::read_dir(directory) {
+        Ok(entries) => entries.flatten().any(|entry| entry.file_name() == name),
+        Err(_) => true,
+    }
+}
+
 impl Stream {
     pub fn connect(deadline: time::Instant) -> io::Result<Self> {
         remaining(deadline).map_err(io::Error::other)?;
-        let path =
-            env::var_os("SSH_AUTH_SOCK").unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".into());
+        let path = env::var_os("SSH_AUTH_SOCK").unwrap_or_else(|| DEFAULT_PIPE.into());
         if !path.to_string_lossy().starts_with(r"\\.\pipe\") {
             return Err(io::Error::other(
                 "Windows SSH_AUTH_SOCK must name a local pipe",
@@ -35,7 +55,15 @@ impl Stream {
             .read(true)
             .write(true)
             .custom_flags(files::FILE_FLAG_OVERLAPPED)
-            .open(path)?;
+            .open(&path)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "the SSH agent at {} could not be reached ({error}). Start the \
+                     OpenSSH Authentication Agent service and add a key with \
+                     `ssh-add`, or choose a private-key file instead.",
+                    path.to_string_lossy()
+                ))
+            })?;
         Ok(Self(file))
     }
 

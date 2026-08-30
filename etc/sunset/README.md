@@ -4,9 +4,10 @@
 `sunset-0.6.0` (upstream `https://github.com/mkj/sunset`). It is 62 lines across
 four files and adds nothing to the wire format Sunset does not already encode.
 
-Starcom does not build against it by default. The published crate is used
-unchanged unless `--cfg sunset_forward` is set; `scripts/test-forward.sh` sets
-the whole thing up and runs the coverage below.
+Starcom builds against it. `Cargo.toml` carries a `[patch.crates-io]` entry
+pinning `kvark/sunset` at the revision holding exactly this patch, the same way
+the GUI stack pins `kvark/blade`. This file is the change as it should reach
+upstream; the fork is how it is carried until it does.
 
 ## Why
 
@@ -34,7 +35,7 @@ it`. That is the whole of what blocks `ProxyJump` on the embedded transport.
 
 ## What was measured
 
-Against OpenSSH 9.x on Linux, through `scripts/test-forward.sh`:
+Against OpenSSH 9.x on Linux, in the normal fixture run:
 
 - A forward to a live listener carries data both ways.
 - An unreachable destination is reported as a refusal, promptly. OpenSSH sends
@@ -53,21 +54,18 @@ git -C sunset checkout sunset-0.6.0
 git -C sunset am /path/to/starcom/etc/sunset/*.patch
 ```
 
-Then point Cargo at it and build Starcom with the cfg:
+To test a change against a local checkout instead of the pinned fork:
 
 ```sh
-cargo build --config 'patch.crates-io.sunset.path="/path/to/sunset"' \
-    --all-features
-RUSTFLAGS='--cfg sunset_forward' cargo test --all-features
+cargo test --config 'patch.crates-io.sunset.path="/path/to/sunset"' --all-features
 ```
-
-Switching between the patched and published builds changes `RUSTFLAGS`, so Cargo
-rebuilds the whole tree each way. `scripts/test-forward.sh` restores `Cargo.lock`
-when it exits, because repointing Sunset rewrites it.
 
 ## Status
 
-This is a patch, not a dependency. Landing `ProxyJump` in Starcom needs a
-decision recorded in PLAN.md first: upstream it, carry a fork, or take the
-system-SSH adapter instead. Until then Starcom builds against published Sunset
-and reports `ProxyJump` as unsupported rather than half-supporting it.
+The patch is carried, not landed. `ssh::Connection::open_forward` exists and is
+covered against a real server, but `ProxyJump` is still reported as unsupported:
+running a second SSH session inside the channel needs `ssh::Connection` to accept
+a transport other than a `TcpStream`, which is not written.
+
+Remove the `[patch.crates-io]` entry, this directory, and the `allow-git` entry
+in `deny.toml` once the change reaches a published Sunset release.

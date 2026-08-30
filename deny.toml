@@ -87,4 +87,9 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # The GUI stack is pinned to an exact revision of Blade, which is not published.
 # Packaging a release (M5) requires resolving this.
-allow-git = ["https://github.com/kvark/blade"]
+allow-git = [
+    "https://github.com/kvark/blade",
+    # Sunset plus etc/sunset/*.patch, pinned by revision. Remove once the patch
+    # is in a published release.
+    "https://github.com/kvark/sunset",
+]

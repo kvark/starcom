@@ -3230,8 +3230,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sunset"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b52312b804ac95f10d3963f6ef5889117ad678bd6ce977be4aa4cf491bad78f"
+source = "git+https://github.com/kvark/sunset?rev=15b1695#15b1695d9b690e206f4d8afc1393ca8cb5604fc5"
 dependencies = [
  "aes",
  "ascii",
@@ -3262,8 +3261,7 @@ dependencies = [
 [[package]]
 name = "sunset-sshwire-derive"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d40354cdc622342c11b742e91a5c151ebd59cbd3bc507f6146e9e6de6791f75f"
+source = "git+https://github.com/kvark/sunset?rev=15b1695#15b1695d9b690e206f4d8afc1393ca8cb5604fc5"
 dependencies = [
  "virtue",
 ]

@@ -460,6 +460,12 @@ impl Client {
         self.lock().failure
     }
 
+    /// The last failure's text, as shown to the user. Bounded, and already
+    /// escaped where it came from the remote host.
+    pub fn error(&self) -> Option<String> {
+        self.lock().error.clone()
+    }
+
     /// A one-shot report that the reattached session or its scrollback is not
     /// continuous with what was on screen before.
     pub fn continuity(&self) -> Option<String> {
@@ -588,14 +594,24 @@ fn worker_loop(shared: Shared, wake: Wake) {
             };
             let retriable = failure.retriable() && connection.reconnect;
             let delay = retriable.then(|| backoff.next_delay());
-            let Some(next) = report_failure(
+            let scheduled = report_failure(
                 &shared,
                 &wake,
                 epoch,
                 failure,
                 &detail,
                 delay.map(|delay| (backoff.attempt(), delay)),
-            ) else {
+            );
+            // "That session does not exist" is the one failure where the list of
+            // sessions is the missing information. The user already asked to
+            // connect and already authenticated, so ask once and show it rather
+            // than making them press a button to learn what went wrong. Every
+            // other failure either cannot list (auth, trust) or already says
+            // what happened, so nothing else triggers this.
+            if scheduled.is_none() && failure == reconnect::Failure::MissingSession {
+                list_after_missing_session(&shared, &wake, epoch, &connection);
+            }
+            let Some(next) = scheduled else {
                 break;
             };
             if !wait_for_retry(&shared, epoch, next) {
@@ -687,6 +703,41 @@ fn report_failure(
     drop(state);
     wake();
     scheduled
+}
+
+/// Ask the host what sessions it does have, after an attach found none.
+///
+/// This is a read-only `tmux -N` query on its own short-lived connection: it
+/// cannot start a server, and it never becomes an attachment. It runs only
+/// after a user-initiated connect failed for this one reason.
+fn list_after_missing_session(shared: &Shared, wake: &Wake, epoch: u64, connection: &Connection) {
+    {
+        let mut state = shared
+            .0
+            .lock()
+            .unwrap_or_else(sync::PoisonError::into_inner);
+        if !state.accepts(epoch) {
+            return;
+        }
+        state.discovery = Some(Discovery::Running);
+    }
+    wake();
+    let found = sessions::list(&connection.options, connection.socket.as_deref());
+    let mut state = shared
+        .0
+        .lock()
+        .unwrap_or_else(sync::PoisonError::into_inner);
+    if !state.accepts(epoch) {
+        return;
+    }
+    state.discovery = Some(match found {
+        Ok(found) => Discovery::Sessions(found),
+        // The attach failure is the headline; this is a failed follow-up, so
+        // do not overwrite the error the user is already reading.
+        Err(error) => Discovery::Failed(format!("{error:#}").chars().take(1024).collect()),
+    });
+    drop(state);
+    wake();
 }
 
 /// Sleep until `until`, waking immediately if the user cancels or reconnects.

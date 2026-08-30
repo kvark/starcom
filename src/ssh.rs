@@ -136,6 +136,15 @@ impl Wake {
     }
 }
 
+/// Whether a local SSH agent looks reachable, without connecting to it.
+///
+/// The connection form uses this to say so before a connection is attempted,
+/// rather than letting the user find out from a failed authentication. It is a
+/// hint, never a decision: Starcom still authenticates exactly as configured.
+pub fn agent_available() -> bool {
+    agent::available()
+}
+
 pub struct Connection {
     runner: sunset::Runner<'static, sunset::Client>,
     socket: net::TcpStream,
@@ -249,7 +258,6 @@ impl Connection {
         Ok(Channel { connection: self })
     }
 
-    #[cfg(sunset_forward)]
     /// Open a `direct-tcpip` channel: ask the server to connect to
     /// `address:port` on our behalf, and carry that TCP stream on the channel.
     ///
@@ -298,7 +306,6 @@ impl Connection {
         Ok(Channel { connection: self })
     }
 
-    #[cfg(sunset_forward)]
     fn forward_ready(&self) -> bool {
         self.handle.as_ref().is_some_and(|handle| {
             self.runner
@@ -306,7 +313,6 @@ impl Connection {
         })
     }
 
-    #[cfg(sunset_forward)]
     fn forward_finished(&self) -> bool {
         self.handle
             .as_ref()
@@ -545,17 +551,7 @@ impl Connection {
                     // A refused or released channel is neither "eof" nor
                     // "closed" to Sunset, but it will never carry data again.
                     // Without this a reader waits out its whole deadline.
-                    // Needs the etc/sunset patch; see docs/SSH.md.
-                    || {
-                        #[cfg(sunset_forward)]
-                        {
-                            self.runner.is_channel_finished(handle)
-                        }
-                        #[cfg(not(sunset_forward))]
-                        {
-                            false
-                        }
-                    }
+                    || self.runner.is_channel_finished(handle)
             })
     }
 }

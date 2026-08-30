@@ -132,14 +132,8 @@ run_fixture() {
     fi
 }
 
-# scripts/test-forward.sh passes a --config that repoints Sunset at a patched
-# checkout, which changes dependency resolution, so --locked cannot apply there.
 cargo_args=(--locked)
-integration_tests=21
-if [[ "${STARCOM_FIXTURE_EXTRA_TESTS:-0}" == 1 ]]; then
-    cargo_args=("$@")
-    integration_tests=22
-fi
+integration_tests=23
 
 # Build first, untimed. The per-run timeouts below bound how long a test may
 # take to RUN; letting them also cover compilation makes a cold tree look like

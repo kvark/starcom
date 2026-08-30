@@ -11,6 +11,14 @@ pub(super) struct Agent {
     stream: platform::Stream,
 }
 
+/// Whether a local agent looks reachable, without connecting to it.
+///
+/// This is a hint for the connection form, not a guarantee: the agent can still
+/// refuse, hold no keys, or disappear between this check and the connection.
+pub(crate) fn available() -> bool {
+    platform::available()
+}
+
 impl Agent {
     pub fn connect(deadline: time::Instant) -> Result<Self, Error> {
         Ok(Self {
@@ -30,6 +38,12 @@ impl Agent {
         let count = wire.number()?;
         if count > MAX_IDENTITIES {
             return Err(authentication("agent returned more than 64 identities"));
+        }
+        if count == 0 {
+            return Err(authentication(
+                "the SSH agent is running but holds no keys. Add one with \
+                 `ssh-add`, or choose a private-key file instead.",
+            ));
         }
         let mut keys = collections::VecDeque::new();
         for _ in 0..count {
@@ -156,7 +170,20 @@ fn authentication(detail: impl std::fmt::Display) -> Error {
 #[cfg(unix)]
 mod platform {
     use super::*;
-    use std::{env, io, os::unix::net};
+    use std::{env, io, os::unix::net, path};
+
+    pub(super) const UNSET: &str = "no SSH agent is available: SSH_AUTH_SOCK is not set. \
+        Start one and add a key (`eval $(ssh-agent)` then `ssh-add`), or choose \
+        a private-key file in the connection form instead. A desktop session \
+        often does not inherit SSH_AUTH_SOCK from a shell.";
+
+    /// A local check, with no connection and no blocking: is an agent plausibly
+    /// there? Used to warn on the connection form before a connection is tried.
+    pub fn available() -> bool {
+        env::var_os("SSH_AUTH_SOCK")
+            .filter(|path| !path.is_empty())
+            .is_some_and(|path| path::Path::new(&path).exists())
+    }
 
     pub struct Stream(net::UnixStream);
 
@@ -165,8 +192,16 @@ mod platform {
             remaining(deadline).map_err(io::Error::other)?;
             let path = env::var_os("SSH_AUTH_SOCK")
                 .filter(|path| !path.is_empty())
-                .ok_or_else(|| io::Error::other("SSH_AUTH_SOCK is not set"))?;
-            Ok(Self(net::UnixStream::connect(path)?))
+                .ok_or_else(|| io::Error::other(UNSET))?;
+            net::UnixStream::connect(&path).map(Self).map_err(|error| {
+                // Name the socket: a stale SSH_AUTH_SOCK left by an exited agent
+                // looks identical to a missing one until you see the path.
+                io::Error::other(format!(
+                    "the SSH agent at {} could not be reached ({error}). Start an \
+                     agent and add a key, or choose a private-key file instead.",
+                    path.to_string_lossy()
+                ))
+            })
         }
         pub fn read_exact(
             &mut self,
@@ -209,10 +244,28 @@ mod platform;
 mod tests {
     use super::*;
 
+    /// The message a user sees when no agent is running is the whole fix for
+    /// "SSH_AUTH_SOCK is not set", so pin what it has to tell them.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_agent_says_what_to_do_about_it() {
+        let text = platform::UNSET;
+        for expected in ["ssh-agent", "ssh-add", "private-key file", "SSH_AUTH_SOCK"] {
+            assert!(text.contains(expected), "missing {expected:?} in: {text}");
+        }
+        // A desktop launcher usually does not inherit the shell's agent, which
+        // is the part that makes this confusing rather than obvious.
+        assert!(text.contains("desktop session"));
+    }
+
     #[test]
     #[ignore = "requires a disposable OpenSSH agent; scripts/test-ssh.sh or scripts/test-windows-agent.py"]
     fn signs_with_isolated_openssh_agent() {
         let path = std::env::var_os("STARCOM_AGENT_TEST_PUBKEY").expect("use the agent fixture");
+        // An agent is reachable here by construction, so the form's pre-flight
+        // check must agree. This is the only place the Windows named-pipe probe
+        // runs against a real agent.
+        assert!(available(), "a reachable agent was reported as absent");
         let key = ssh_key::PublicKey::read_openssh_file(path).unwrap();
         let wire = key.to_bytes().unwrap();
         let deadline = time::Instant::now() + time::Duration::from_secs(5);

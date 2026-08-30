@@ -53,14 +53,12 @@ select a different key, or ignore those semantics.
 An optional system-SSH transport remains a future escape hatch for advanced
 enterprise/cluster configurations.
 
-`ProxyJump` needs a `direct-tcpip` channel, which Sunset 0.6 rejects outright.
-`etc/sunset/` carries a small patch adding the client-side open, validated
-against real OpenSSH; see its README for what was measured. Starcom's
-`open_forward` is behind `--cfg sunset_forward` and the normal build uses the
-published crate unchanged, so `ProxyJump` is still reported as unsupported rather
-than half-supported. Running a second SSH session inside such a channel also
-needs the transport to accept something other than a `TcpStream`, which is not
-written yet.
+`ProxyJump` needs a `direct-tcpip` channel, which published Sunset 0.6 rejects
+outright. Starcom builds against `kvark/sunset` pinned at the revision carrying
+`etc/sunset/*.patch`, which adds the client-side open; see that README for what
+was measured. `ProxyJump` is still reported as unsupported rather than
+half-supported: running a second SSH session inside such a channel needs the
+transport to accept something other than a `TcpStream`, which is not written.
 
 Sunset 0.6 emits no keyboard-interactive event and has no certificate path, which
 is what blocks MFA and host/user certificates rather than any decision here.
@@ -92,6 +90,14 @@ connect is not a supported workaround. Full marker/pattern policy needs its own
 implementation or a system-SSH adapter.
 
 ## Authentication
+
+If no agent is reachable, the connection form says so before you press Connect,
+and the failure names the socket it tried and what to do about it. A desktop
+session frequently does not inherit `SSH_AUTH_SOCK` from a shell, so an agent
+that works in a terminal can be invisible to a launcher-started Starcom; that is
+the usual cause. An agent that is running but holds no keys is reported as such
+rather than as a generic authentication failure. Starcom never falls back to a
+different key on its own.
 
 Supported identity sources:
 
