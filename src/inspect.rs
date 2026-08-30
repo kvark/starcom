@@ -149,6 +149,30 @@ impl Inspector {
         parse_panes(&lines)
     }
 
+    /// Identify the attached server and session.
+    ///
+    /// A session id is NOT sufficient on its own: a freshly started tmux server
+    /// numbers its first session `$0` again, so a replaced server would look
+    /// like the same session. The server's pid and the session's creation time
+    /// are what actually distinguish a replacement from a continuation.
+    pub(crate) fn identity(&mut self) -> anyhow::Result<Identity> {
+        let reply =
+            self.request("display-message -p '#{pid}|#{session_id}|#{session_created}'\n")?;
+        anyhow::ensure!(reply.len() == 1, "invalid tmux identity reply");
+        let fields: Vec<_> = reply[0].split('|').collect();
+        anyhow::ensure!(fields.len() == 3, "invalid tmux identity reply");
+        Ok(Identity {
+            server: fields[0].parse().context("invalid tmux server pid")?,
+            session: tmuxctl::SessionId(
+                fields[1]
+                    .strip_prefix('$')
+                    .context("invalid session id")?
+                    .parse()?,
+            ),
+            created: fields[2].parse().context("invalid session creation time")?,
+        })
+    }
+
     pub(crate) fn request(&mut self, command: &str) -> anyhow::Result<Vec<String>> {
         let mut batch = self.request_batch(&[command.to_owned()])?;
         Ok(batch.replies.remove(0))
@@ -543,10 +567,19 @@ impl Inspector {
         }
         // Server errors may echo command arguments. Never surface input or
         // clipboard contents. Failure cannot be distinguished from delivery.
-        let batch = result.map_err(|_| {
-            anyhow::anyhow!(
-                "interactive request failed; delivery may be uncertain and was not retried"
-            )
+        //
+        // Discard the message but keep our own transport classification: without
+        // it, a channel that died mid-transaction looks like an unrecognized
+        // protocol fault and reconnection policy would refuse to retry it. The
+        // dropped action itself is still never resubmitted.
+        const OPAQUE: &str =
+            "interactive request failed; delivery may be uncertain and was not retried";
+        let batch = result.map_err(|error| {
+            if crate::reconnect::classify(&error) == crate::reconnect::Failure::Transport {
+                anyhow::Error::new(ssh::Error::transport(OPAQUE))
+            } else {
+                anyhow::anyhow!(OPAQUE)
+            }
         })?;
         let last = batch
             .replies
@@ -577,6 +610,14 @@ impl Drop for Inspector {
         let _ = self.control.finish(|_| {});
         self.channel.abort();
     }
+}
+
+/// What makes one attachment the same session as the last one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Identity {
+    pub server: u32,
+    pub session: tmuxctl::SessionId,
+    pub created: u64,
 }
 
 fn shell_quote(value: &str) -> String {

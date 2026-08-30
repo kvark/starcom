@@ -5,7 +5,7 @@
 
 use std::{collections, env, path, sync, thread, time};
 
-use crate::{core, input, reconnect, session, snapshot, ssh, terminal, ui, window};
+use crate::{core, input, inspect, reconnect, session, snapshot, ssh, terminal, ui, window};
 
 #[derive(Clone)]
 pub struct Connection {
@@ -104,6 +104,8 @@ pub(crate) struct State {
     /// A one-shot report that the reattached session is not the one that was
     /// lost, or that its scrollback is shorter than what was on screen.
     pub continuity: Option<String>,
+    /// How the last attachment ended, once it has ended.
+    pub failure: Option<reconnect::Failure>,
     actions: collections::VecDeque<Pending>,
     action_bytes: usize,
     io_wake: Option<ssh::Wake>,
@@ -124,6 +126,7 @@ impl Default for State {
             allow_resize: false,
             retry: None,
             continuity: None,
+            failure: None,
             actions: collections::VecDeque::new(),
             action_bytes: 0,
             io_wake: None,
@@ -141,6 +144,7 @@ impl State {
         self.error = None;
         self.retry = None;
         self.continuity = None;
+        self.failure = None;
         self.discard_actions();
         self.access = session::Access::ReadOnly;
         self.allow_resize = false;
@@ -380,6 +384,11 @@ impl Client {
         self.lock().retry
     }
 
+    /// How the last attachment ended. `None` while an attachment is healthy.
+    pub fn failure(&self) -> Option<reconnect::Failure> {
+        self.lock().failure
+    }
+
     /// A one-shot report that the reattached session or its scrollback is not
     /// continuous with what was on screen before.
     pub fn continuity(&self) -> Option<String> {
@@ -448,14 +457,14 @@ fn worker_loop(shared: Shared, wake: Wake) {
         // One backoff schedule per user-requested connection, so a session that
         // flaps repeatedly keeps backing off instead of hammering every 500 ms.
         let mut backoff = reconnect::Backoff::new(jitter_seed(epoch));
-        let mut previous_session = None;
+        let mut previous_identity = None;
         loop {
             let result = watch(
                 &shared,
                 &wake,
                 epoch,
                 &connection,
-                &mut previous_session,
+                &mut previous_identity,
                 &mut backoff,
             );
             let (failure, detail) = match result {
@@ -559,6 +568,7 @@ fn report_failure(
             _ => Phase::Failed,
         };
     }
+    state.failure = Some(failure);
     state.error = Some(
         format!("{} {detail}", failure.summary())
             .chars()
@@ -614,7 +624,7 @@ fn watch(
     wake: &Wake,
     epoch: u64,
     connection: &Connection,
-    previous_session: &mut Option<tmuxctl::SessionId>,
+    previous: &mut Option<inspect::Identity>,
     backoff: &mut reconnect::Backoff,
 ) -> anyhow::Result<Outcome> {
     let attached = session::Session::attach_with_access(
@@ -627,14 +637,26 @@ fn watch(
     let (mut inspector, view) = attached.into_parts();
     let session_id = view.session;
     // Attaching is by name, so a restarted server hands back a session that
-    // merely shares that name. Say so rather than presenting it as continuous.
-    let continuity = match *previous_session {
-        Some(lost) if lost != session_id => Some(format!(
-            "Reattached to a different tmux session ({session_id} replaced {lost}).              The earlier session and its scrollback are gone."
-        )),
+    // merely shares that name. A session id alone cannot see that: a fresh tmux
+    // server numbers its first session $0 again. Compare the whole identity.
+    let identity = inspector.identity()?;
+    anyhow::ensure!(
+        identity.session == session_id,
+        "the attached session changed while identifying it"
+    );
+    let continuity = match *previous {
+        Some(lost) if lost != identity => Some(if lost.server == identity.server {
+            format!(
+                "Reattached to a different tmux session ({} replaced {}). The earlier session and its scrollback are gone.",
+                identity.session, lost.session
+            )
+        } else {
+            "The remote tmux server restarted. This is a new session that only shares the old name; the earlier session and its scrollback are gone."
+                .to_owned()
+        }),
         _ => truncation_notice(&view),
     };
-    *previous_session = Some(session_id);
+    *previous = Some(identity);
     {
         let mut state = shared
             .0
@@ -656,6 +678,7 @@ fn watch(
         state.phase = Phase::Watching;
         state.retry = None;
         state.error = None;
+        state.failure = None;
         state.continuity = continuity;
     }
     // A fully restored attachment earns a fresh schedule: the next drop starts

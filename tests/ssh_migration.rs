@@ -582,3 +582,296 @@ fn wait_until(seconds: u64, message: &str, mut ready: impl FnMut() -> bool) {
         std::thread::sleep(time::Duration::from_millis(20));
     }
 }
+
+/// A drop in the middle of a paste transaction must never deliver that paste
+/// twice. Uncertain delivery is not retried, so at most one copy may appear.
+#[cfg(feature = "gui")]
+#[test]
+#[ignore = "requires the isolated SSH/tmux fixture"]
+fn loss_during_a_paste_never_delivers_it_twice() {
+    use starcom::{core, desktop, input, session};
+    use std::sync;
+
+    let session_name = "starcom-paste-loss";
+    reset_session(session_name, "cat > /dev/null");
+    let client = desktop::Client::new(sync::Arc::new(|| {})).unwrap();
+    client
+        .connect(desktop::Connection {
+            options: options(),
+            session: core::SessionName::new(session_name).unwrap(),
+            socket: Some(root().join("tmux.sock").to_str().unwrap().to_owned()),
+            history: 40,
+            access: session::Access::Interactive,
+            reconnect: true,
+        })
+        .unwrap();
+
+    // Several rounds, killed at different points, so at least one lands inside
+    // the multi-command set-buffer/paste-buffer transaction.
+    for round in 0..3 {
+        wait_until(60, "worker did not attach", || {
+            client.phase() == desktop::Phase::Watching
+        });
+        let pane = client.with_view(|view| *view.unwrap().panes().keys().next().unwrap());
+        let Some(target) = client.target(pane) else {
+            continue;
+        };
+        let marker = format!("PASTE-{round}");
+        // Large enough to be chunked across many tmux commands.
+        let body = format!("{marker}{}\n", "x".repeat(20_000));
+        let paste = input::Paste::new(&body).unwrap();
+        let submitted = client.submit(target, input::Action::Paste(paste)).is_ok();
+        std::thread::sleep(time::Duration::from_millis(round * 12));
+        kill_control_client(session_name);
+        // A drop inside the multi-command paste transaction is still transport
+        // loss, so it must reconnect rather than stop as an unclassified fault.
+        wait_until(60, "worker did not recover from a mid-paste drop", || {
+            client.phase() == desktop::Phase::Watching
+        });
+        let seen = pane_text(session_name).matches(&marker).count();
+        assert!(
+            seen <= 1,
+            "round {round}: paste appeared {seen} times after a mid-transaction drop"
+        );
+        assert!(submitted || seen == 0);
+    }
+    client.disconnect();
+    let _ = tmux().args(["kill-session", "-t", session_name]).status();
+}
+
+/// Losing the connection while the remote layout is changing must reconstruct
+/// the layout tmux actually has, not the one from before the change.
+#[cfg(feature = "gui")]
+#[test]
+#[ignore = "requires the isolated SSH/tmux fixture"]
+fn loss_during_a_remote_layout_change_reconstructs_the_new_layout() {
+    use starcom::{core, desktop, session};
+    use std::sync;
+
+    let session_name = "starcom-layout-loss";
+    reset_session(session_name, "cat > /dev/null");
+    let client = desktop::Client::new(sync::Arc::new(|| {})).unwrap();
+    client
+        .connect(desktop::Connection {
+            options: options(),
+            session: core::SessionName::new(session_name).unwrap(),
+            socket: Some(root().join("tmux.sock").to_str().unwrap().to_owned()),
+            history: 20,
+            access: session::Access::ReadOnly,
+            reconnect: true,
+        })
+        .unwrap();
+    wait_until(30, "worker did not attach", || {
+        client.phase() == desktop::Phase::Watching
+    });
+    assert_eq!(client.with_view(|view| view.unwrap().panes().len()), 1);
+
+    // Change the layout from another client and drop the connection immediately,
+    // so the resync and the transport loss race each other.
+    assert!(
+        tmux()
+            .args(["split-window", "-h", "-t", session_name, "cat > /dev/null"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    kill_control_client(session_name);
+
+    wait_until(60, "worker did not recover the new layout", || {
+        client.phase() == desktop::Phase::Watching
+            && client.with_view(|view| view.is_some_and(|view| view.panes().len() == 2))
+    });
+    // The reconstructed geometry must be the server's, not a guess.
+    let observed: Vec<_> = client.with_view(|view| {
+        view.unwrap()
+            .panes()
+            .values()
+            .map(|pane| (pane.state.left, pane.state.size.columns()))
+            .collect()
+    });
+    let expected = tmux()
+        .args([
+            "list-panes",
+            "-t",
+            session_name,
+            "-F",
+            "#{pane_left} #{pane_width}",
+        ])
+        .output()
+        .unwrap();
+    let expected: Vec<_> = String::from_utf8_lossy(&expected.stdout)
+        .lines()
+        .map(|line| {
+            let mut parts = line.split_whitespace();
+            (
+                parts.next().unwrap().parse::<usize>().unwrap(),
+                parts.next().unwrap().parse::<usize>().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        observed, expected,
+        "reconstructed geometry is not the server's"
+    );
+
+    client.disconnect();
+    let _ = tmux().args(["kill-session", "-t", session_name]).status();
+}
+
+/// A restarted tmux server numbers its first session `$0` again, so a session id
+/// alone cannot tell a replacement from a continuation. Reattaching must say so.
+#[cfg(feature = "gui")]
+#[test]
+#[ignore = "requires the isolated SSH/tmux fixture"]
+fn a_restarted_server_is_reported_as_a_replacement() {
+    use starcom::{core, desktop, session};
+    use std::{process::Command, sync};
+
+    // A private socket: this test kills its whole server.
+    let socket = root().join("restart.sock");
+    let private = || {
+        let mut command = Command::new("tmux");
+        command.arg("-S").arg(&socket);
+        // Killing a server that is not running is expected here; keep the
+        // fixture's output about the tests rather than about that.
+        command.stderr(std::process::Stdio::null());
+        command
+    };
+    let start = || {
+        assert!(
+            private()
+                .env_remove("TMUX")
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "restarted",
+                    "-x",
+                    "80",
+                    "-y",
+                    "24",
+                    "cat > /dev/null",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let _ = private().args(["kill-server"]).status();
+    start();
+
+    let client = desktop::Client::new(sync::Arc::new(|| {})).unwrap();
+    client
+        .connect(desktop::Connection {
+            options: options(),
+            session: core::SessionName::new("restarted").unwrap(),
+            socket: Some(socket.to_str().unwrap().to_owned()),
+            history: 20,
+            access: session::Access::ReadOnly,
+            reconnect: true,
+        })
+        .unwrap();
+    wait_until(30, "worker did not attach", || {
+        client.phase() == desktop::Phase::Watching
+    });
+    let first_session = client.with_view(|view| view.unwrap().session);
+
+    // SIGKILL the control client so the channel dies without a %exit, then
+    // replace the server before the first retry fires.
+    let clients = private()
+        .args(["list-clients", "-t", "restarted", "-F", "#{client_pid}"])
+        .output()
+        .unwrap();
+    let pid = String::from_utf8_lossy(&clients.stdout)
+        .split_whitespace()
+        .next()
+        .expect("control client attached")
+        .to_owned();
+    assert!(
+        Command::new("kill")
+            .args(["-9", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Replace the server well inside the first backoff delay, so the retry has
+    // something to attach to and the identity comparison is exercised.
+    let replaced = time::Instant::now();
+    let _ = private().args(["kill-server"]).status();
+    start();
+    assert!(
+        replaced.elapsed() < time::Duration::from_millis(350),
+        "replacing the server took {:?}, longer than the first backoff delay",
+        replaced.elapsed()
+    );
+
+    wait_until(90, "worker did not settle after the server restart", || {
+        matches!(
+            client.phase(),
+            desktop::Phase::Watching | desktop::Phase::Failed | desktop::Phase::Disconnected
+        ) && client.retry().is_none()
+    });
+    // Either outcome is correct: the retry can land before the replacement
+    // server exists, in which case it stops on "no server running". Only the
+    // reattached case can prove the replacement is reported, so require it.
+    assert_eq!(
+        client.phase(),
+        desktop::Phase::Watching,
+        "the retry did not land on the replacement server; failure was {:?}",
+        client.failure()
+    );
+    // The fresh server reuses $0, so identity must come from more than that.
+    assert_eq!(
+        client.with_view(|view| view.unwrap().session),
+        first_session,
+        "this fixture depends on tmux reusing the first session id"
+    );
+    let continuity = client
+        .continuity()
+        .expect("a replaced server must be reported, not presented as continuous");
+    assert!(
+        continuity.contains("restarted"),
+        "unexpected continuity report: {continuity}"
+    );
+    client.disconnect();
+    let _ = private().args(["kill-server"]).status();
+}
+
+/// Recreate a single-pane fixture session, replacing any leftover of the same name.
+fn reset_session(name: &str, command: &str) {
+    let _ = tmux().args(["kill-session", "-t", name]).status();
+    assert!(
+        tmux()
+            .env_remove("TMUX")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                command,
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+/// Kill the tmux client process behind Starcom's control channel. The channel
+/// dies with no %exit, which is what an abrupt transport loss looks like.
+fn kill_control_client(session: &str) {
+    let clients = tmux()
+        .args(["list-clients", "-t", session, "-F", "#{client_pid}"])
+        .output()
+        .unwrap();
+    for pid in String::from_utf8_lossy(&clients.stdout).split_whitespace() {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", pid])
+            .status();
+    }
+}
