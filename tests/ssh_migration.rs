@@ -104,11 +104,7 @@ fn desktop_worker_publishes_live_view_and_rejects_cancelled_requests() {
 #[ignore = "requires the isolated SSH/tmux fixture"]
 fn desktop_worker_delivers_input_paste_and_resize_once() {
     use starcom::{core, desktop, input, session};
-    use std::{
-        os::unix::fs::PermissionsExt as _,
-        process::Command,
-        sync, thread,
-    };
+    use std::{os::unix::fs::PermissionsExt as _, process::Command, sync, thread};
 
     let test_root = root();
     let socket = test_root.join("tmux.sock");
@@ -178,7 +174,10 @@ exec sleep 600
         if String::from_utf8_lossy(&output.stdout).contains("INPUT_READY") {
             break;
         }
-        assert!(time::Instant::now() < ready_deadline, "input pane did not start");
+        assert!(
+            time::Instant::now() < ready_deadline,
+            "input pane did not start"
+        );
         thread::sleep(time::Duration::from_millis(20));
     }
 
@@ -214,7 +213,10 @@ exec sleep 600
     client.connect(connection.clone()).unwrap();
     let attach_deadline = time::Instant::now() + time::Duration::from_secs(10);
     while client.phase() != desktop::Phase::Watching {
-        assert!(time::Instant::now() < attach_deadline, "desktop worker did not attach");
+        assert!(
+            time::Instant::now() < attach_deadline,
+            "desktop worker did not attach"
+        );
         thread::sleep(time::Duration::from_millis(10));
     }
 
@@ -238,17 +240,21 @@ exec sleep 600
     let result_deadline = time::Instant::now() + time::Duration::from_secs(10);
     loop {
         let present = client.with_view(|view| {
-            view.and_then(|view| view.panes().get(&pane)).is_some_and(|pane| {
-                pane.terminal
-                    .screen_lines()
-                    .iter()
-                    .any(|line| line.contains("INPUT_RESULT:<hello>|<world>"))
-            })
+            view.and_then(|view| view.panes().get(&pane))
+                .is_some_and(|pane| {
+                    pane.terminal
+                        .screen_lines()
+                        .iter()
+                        .any(|line| line.contains("INPUT_RESULT:<hello>|<world>"))
+                })
         });
         if present {
             break;
         }
-        assert!(time::Instant::now() < result_deadline, "terminal input or paste was lost");
+        assert!(
+            time::Instant::now() < result_deadline,
+            "terminal input or paste was lost"
+        );
         thread::sleep(time::Duration::from_millis(10));
     }
 
@@ -275,19 +281,15 @@ exec sleep 600
         if resized {
             break;
         }
-        assert!(time::Instant::now() < resize_deadline, "remote pane was not resynchronized");
+        assert!(
+            time::Instant::now() < resize_deadline,
+            "remote pane was not resynchronized"
+        );
         thread::sleep(time::Duration::from_millis(10));
     }
 
     let capture = tmux()
-        .args([
-            "capture-pane",
-            "-p",
-            "-S",
-            "-50",
-            "-t",
-            "starcom-input:0.0",
-        ])
+        .args(["capture-pane", "-p", "-S", "-50", "-t", "starcom-input:0.0"])
         .output()
         .unwrap();
     assert!(capture.status.success());
