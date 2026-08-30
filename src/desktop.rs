@@ -5,7 +5,9 @@
 
 use std::{collections, env, path, sync, thread, time};
 
-use crate::{core, input, inspect, reconnect, session, snapshot, ssh, terminal, ui, window};
+use crate::{
+    core, input, inspect, reconnect, session, sessions, snapshot, ssh, terminal, ui, window,
+};
 
 #[derive(Clone)]
 pub struct Connection {
@@ -87,9 +89,28 @@ struct Pending {
     action: input::Action,
 }
 
+/// What the worker has been asked to do next. Discovery and creation are
+/// one-shot queries; they neither disturb nor become an attachment.
+pub(crate) enum Request {
+    Attach(Connection),
+    ListSessions(Connection),
+    /// Explicitly start a session, which starts a server if none is running.
+    /// Only a button produces this; no failure path ever does.
+    CreateSession(Connection, core::Size),
+}
+
+/// The outcome of the last discovery request, for the connection form.
+#[derive(Clone, Debug)]
+pub enum Discovery {
+    Running,
+    Sessions(Vec<sessions::Summary>),
+    Created(String),
+    Failed(String),
+}
+
 pub(crate) struct State {
     epoch: u64,
-    pending: Option<Connection>,
+    pending: Option<Request>,
     stopping: bool,
     pub generation: u64,
     pub phase: Phase,
@@ -106,6 +127,8 @@ pub(crate) struct State {
     pub continuity: Option<String>,
     /// How the last attachment ended, once it has ended.
     pub failure: Option<reconnect::Failure>,
+    /// The last session-discovery result, shown on the connection form.
+    pub discovery: Option<Discovery>,
     actions: collections::VecDeque<Pending>,
     action_bytes: usize,
     io_wake: Option<ssh::Wake>,
@@ -127,6 +150,7 @@ impl Default for State {
             retry: None,
             continuity: None,
             failure: None,
+            discovery: None,
             actions: collections::VecDeque::new(),
             action_bytes: 0,
             io_wake: None,
@@ -292,11 +316,58 @@ impl Client {
         let mut state = self.lock();
         state.cancel();
         state.phase = Phase::Connecting;
-        state.pending = Some(connection);
+        state.pending = Some(Request::Attach(connection));
         drop(state);
         self.shared.1.notify_one();
         (self.wake)();
         Ok(())
+    }
+
+    /// Ask the host which sessions exist. This runs on the worker, opens its own
+    /// short-lived connection, and cannot start a tmux server.
+    pub fn list_sessions(&self, connection: Connection) -> anyhow::Result<()> {
+        self.query(Request::ListSessions(connection))
+    }
+
+    /// Explicitly create a session. Unlike every other path in Starcom, this may
+    /// start a tmux server — which is why only a deliberate action reaches it.
+    pub fn create_session(&self, connection: Connection, size: core::Size) -> anyhow::Result<()> {
+        self.query(Request::CreateSession(connection, size))
+    }
+
+    fn query(&self, request: Request) -> anyhow::Result<()> {
+        let connection = match request {
+            Request::Attach(ref connection)
+            | Request::ListSessions(ref connection)
+            | Request::CreateSession(ref connection, _) => connection,
+        };
+        connection.options.validate()?;
+        let mut state = self.lock();
+        anyhow::ensure!(
+            !matches!(
+                state.phase,
+                Phase::Connecting | Phase::Watching | Phase::Resynchronizing | Phase::Reconnecting
+            ),
+            "disconnect before asking the host about its sessions"
+        );
+        anyhow::ensure!(
+            state.pending.is_none(),
+            "a request to this host is already running"
+        );
+        state.discovery = Some(Discovery::Running);
+        state.pending = Some(request);
+        drop(state);
+        self.shared.1.notify_one();
+        (self.wake)();
+        Ok(())
+    }
+
+    pub fn discovery(&self) -> Option<Discovery> {
+        self.lock().discovery.clone()
+    }
+
+    pub fn clear_discovery(&self) {
+        self.lock().discovery = None;
     }
 
     pub fn disconnect(&self) {
@@ -437,7 +508,7 @@ enum Outcome {
 
 fn worker_loop(shared: Shared, wake: Wake) {
     loop {
-        let (mut epoch, connection) = {
+        let (mut epoch, request) = {
             let state = shared
                 .0
                 .lock()
@@ -453,6 +524,44 @@ fn worker_loop(shared: Shared, wake: Wake) {
                 state.epoch,
                 state.pending.take().expect("request checked above"),
             )
+        };
+        let connection = match request {
+            Request::Attach(connection) => connection,
+            // One-shot queries: run, publish the answer, wait for the next
+            // request. Neither one becomes or disturbs an attachment.
+            other => {
+                let outcome = match other {
+                    Request::ListSessions(ref connection) => {
+                        sessions::list(&connection.options, connection.socket.as_deref())
+                            .map(Discovery::Sessions)
+                    }
+                    Request::CreateSession(ref connection, size) => sessions::create(
+                        &connection.options,
+                        connection.socket.as_deref(),
+                        &connection.session,
+                        size,
+                    )
+                    .map(|()| Discovery::Created(connection.session.as_str().to_owned())),
+                    Request::Attach(_) => unreachable!("attach handled above"),
+                };
+                let mut state = shared
+                    .0
+                    .lock()
+                    .unwrap_or_else(sync::PoisonError::into_inner);
+                if state.accepts(epoch) {
+                    state.discovery = Some(match outcome {
+                        Ok(discovery) => discovery,
+                        // Bounded plain text for a GUI label; the remote half is
+                        // already escaped where it was read.
+                        Err(error) => {
+                            Discovery::Failed(format!("{error:#}").chars().take(1024).collect())
+                        }
+                    });
+                }
+                drop(state);
+                wake();
+                continue;
+            }
         };
         // One backoff schedule per user-requested connection, so a session that
         // flaps repeatedly keeps backing off instead of hammering every 500 ms.

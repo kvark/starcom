@@ -110,4 +110,4 @@ run_fixture() {
 }
 
 run_fixture 1 timeout 30s cargo test --locked --lib signs_with_isolated_openssh_agent -- --ignored --test-threads=1
-run_fixture 20 timeout 300s cargo test --locked --test ssh_localhost --test ssh_migration -- --ignored --test-threads=1
+run_fixture 21 timeout 300s cargo test --locked --test ssh_localhost --test ssh_migration -- --ignored --test-threads=1

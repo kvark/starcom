@@ -124,7 +124,13 @@ fn narrow(text: &str) -> Option<Failure> {
     {
         return Some(Failure::MissingSession);
     }
-    if text.contains("no server running") || text.contains("server exited") {
+    // tmux words this two ways: "no server running on <default socket>", and
+    // "error connecting to <path>" for an explicit -S socket. Both mean the
+    // server is gone, and retrying either would loop against nothing.
+    if text.contains("no server running")
+        || text.contains("server exited")
+        || text.contains("error connecting to")
+    {
         return Some(Failure::ServerExit);
     }
     None
@@ -251,6 +257,17 @@ mod tests {
         ))
         .context("tmux request failed; remote stderr: \"can't find session: work\"");
         assert_eq!(classify(&error), Failure::MissingSession);
+
+        // An explicit -S socket with no server behind it must not retry forever.
+        let error = anyhow::Error::new(ssh::Error::for_test(
+            ssh::Kind::Transport,
+            "SSH control channel ended",
+        ))
+        .context(
+            "tmux request failed; remote stderr: \"error connecting to /tmp/x.sock \
+             (No such file or directory)\"",
+        );
+        assert_eq!(classify(&error), Failure::ServerExit);
 
         // The reverse must not hold: remote output claiming a transient fault
         // cannot turn a host-key failure into something Starcom retries.

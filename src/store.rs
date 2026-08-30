@@ -1,0 +1,406 @@
+//! Persisted, non-secret connection tabs.
+//!
+//! This file records where to connect and how, never anything that would let a
+//! reader connect: no keys, no passphrases, no agent handles, no host-key
+//! material, and no terminal contents. Restoring a tab reopens its form with
+//! the fields filled in; it never authenticates on its own.
+//!
+//! The format is a few bounded lines rather than a serialization dependency,
+//! for the same reason the SSH-config reader is: reading it must not be able to
+//! run anything, and every limit must be visible in one place.
+
+use std::{collections, env, fs, io, path};
+
+use anyhow::Context;
+
+/// Refuse a file that has grown beyond anything this program writes.
+const MAX_BYTES: u64 = 64 * 1024;
+const MAX_VALUE: usize = 4096;
+/// A key, a space, and the longest value this program writes.
+const MAX_LINE: usize = MAX_VALUE + 128;
+pub const MAX_TABS: usize = 16;
+
+/// One saved tab. Every field is a destination or a preference; none of it is
+/// a credential. Paths name a file the user already chose, never its contents.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Tab {
+    pub destination: String,
+    pub host: String,
+    pub user: String,
+    pub session: String,
+    pub port: u16,
+    /// `true` selects the local SSH agent, `false` an identity file.
+    pub agent: bool,
+    pub identity: String,
+    pub known_hosts: String,
+    pub socket: String,
+    pub history: usize,
+    pub interactive: bool,
+    pub reconnect: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Workspace {
+    pub tabs: Vec<Tab>,
+    pub active: usize,
+}
+
+/// `~/.config/starcom/workspace.conf`, or the platform equivalent. Returns None
+/// when there is no home directory to anchor it to; the desktop then runs
+/// without persistence rather than inventing a location.
+pub fn path(home: &path::Path) -> path::PathBuf {
+    let base = if cfg!(windows) {
+        env::var_os("APPDATA").map(path::PathBuf::from)
+    } else {
+        env::var_os("XDG_CONFIG_HOME")
+            .map(path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    base.unwrap_or_else(|| home.join(".config"))
+        .join("starcom")
+        .join("workspace.conf")
+}
+
+/// A missing file is the normal first-run state. An existing but unreadable or
+/// malformed file is an error the UI reports; nothing is invented to replace it.
+pub fn load(file: &path::Path) -> anyhow::Result<Option<Workspace>> {
+    let data = match fs::metadata(file) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        _ => {
+            let mut data = String::new();
+            io::Read::read_to_string(
+                &mut io::Read::take(fs::File::open(file)?, MAX_BYTES + 1),
+                &mut data,
+            )
+            .with_context(|| format!("read {}", file.display()))?;
+            anyhow::ensure!(
+                data.len() as u64 <= MAX_BYTES,
+                "saved workspace exceeds {MAX_BYTES} bytes"
+            );
+            data
+        }
+    };
+    parse(&data).map(Some)
+}
+
+fn parse(text: &str) -> anyhow::Result<Workspace> {
+    let mut workspace = Workspace::default();
+    let mut fields: Option<collections::BTreeMap<&str, &str>> = None;
+    for (number, line) in text.lines().enumerate() {
+        let where_ = || format!("line {}", number + 1);
+        anyhow::ensure!(line.len() <= MAX_LINE, "{}: line too long", where_());
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "[tab]" {
+            anyhow::ensure!(
+                workspace.tabs.len() < MAX_TABS,
+                "saved workspace holds more than {MAX_TABS} tabs"
+            );
+            if let Some(fields) = fields.take() {
+                workspace.tabs.push(tab(&fields).with_context(where_)?);
+            }
+            fields = Some(collections::BTreeMap::new());
+            continue;
+        }
+        let (key, value) = line
+            .split_once(' ')
+            .map_or((line, ""), |(key, value)| (key, value.trim_start()));
+        anyhow::ensure!(value.len() <= MAX_VALUE, "{}: value too long", where_());
+        anyhow::ensure!(
+            !value.chars().any(char::is_control),
+            "{}: control character in value",
+            where_()
+        );
+        match fields {
+            Some(ref mut fields) => {
+                anyhow::ensure!(
+                    fields.insert(key, value).is_none(),
+                    "{}: duplicate key {key}",
+                    where_()
+                );
+            }
+            // Before the first [tab]: file-level settings.
+            None if key == "active" => workspace.active = value.parse().with_context(where_)?,
+            None if key == "version" => anyhow::ensure!(
+                value == "1",
+                "{}: unsupported saved-workspace version {value}",
+                where_()
+            ),
+            None => anyhow::bail!("{}: unexpected key {key} before any [tab]", where_()),
+        }
+    }
+    if let Some(fields) = fields {
+        anyhow::ensure!(
+            workspace.tabs.len() < MAX_TABS,
+            "saved workspace holds more than {MAX_TABS} tabs"
+        );
+        workspace.tabs.push(tab(&fields)?);
+    }
+    workspace.active = workspace.active.min(workspace.tabs.len().saturating_sub(1));
+    Ok(workspace)
+}
+
+fn tab(fields: &collections::BTreeMap<&str, &str>) -> anyhow::Result<Tab> {
+    // Reject unknown keys rather than ignoring them: a file written by a newer
+    // Starcom may mean something by them, and guessing is how settings drift.
+    for key in fields.keys() {
+        anyhow::ensure!(
+            matches!(
+                *key,
+                "destination"
+                    | "host"
+                    | "user"
+                    | "session"
+                    | "port"
+                    | "auth"
+                    | "identity"
+                    | "known-hosts"
+                    | "socket"
+                    | "history"
+                    | "access"
+                    | "reconnect"
+            ),
+            "unknown key {key}"
+        );
+    }
+    let text = |key: &str| fields.get(key).copied().unwrap_or_default().to_owned();
+    let flag = |key: &str, on: &str| -> anyhow::Result<bool> {
+        match fields.get(key) {
+            None => Ok(false),
+            Some(value) if *value == on => Ok(true),
+            Some(value) => {
+                anyhow::ensure!(!value.is_empty(), "empty {key}");
+                Ok(false)
+            }
+        }
+    };
+    Ok(Tab {
+        destination: text("destination"),
+        host: text("host"),
+        user: text("user"),
+        session: text("session"),
+        port: fields
+            .get("port")
+            .map(|port| port.parse())
+            .transpose()
+            .context("invalid port")?
+            .unwrap_or(22),
+        agent: fields.get("auth").is_none_or(|value| *value == "agent"),
+        identity: text("identity"),
+        known_hosts: text("known-hosts"),
+        socket: text("socket"),
+        history: fields
+            .get("history")
+            .map(|history| history.parse())
+            .transpose()
+            .context("invalid history")?
+            .unwrap_or(200),
+        interactive: flag("access", "interactive")?,
+        reconnect: flag("reconnect", "yes")?,
+    })
+}
+
+pub fn render(workspace: &Workspace) -> String {
+    let mut out = String::from(
+        "# Starcom saved connection tabs.\n\
+         # Destinations and preferences only: no keys, passphrases, host-key\n\
+         # material, or terminal contents are ever written here.\n\
+         version 1\n",
+    );
+    out.push_str(&format!("active {}\n", workspace.active));
+    for tab in workspace.tabs.iter().take(MAX_TABS) {
+        out.push_str("\n[tab]\n");
+        let mut put = |key: &str, value: &str| {
+            // A control character could only arrive from a field the user typed;
+            // drop the line rather than write something this parser rejects.
+            if !value.is_empty() && value.len() <= MAX_VALUE && !value.chars().any(char::is_control)
+            {
+                out.push_str(key);
+                out.push(' ');
+                out.push_str(value);
+                out.push('\n');
+            }
+        };
+        put("destination", &tab.destination);
+        put("host", &tab.host);
+        put("user", &tab.user);
+        put("session", &tab.session);
+        put("port", &tab.port.to_string());
+        put("auth", if tab.agent { "agent" } else { "identity" });
+        put("identity", &tab.identity);
+        put("known-hosts", &tab.known_hosts);
+        put("socket", &tab.socket);
+        put("history", &tab.history.to_string());
+        put(
+            "access",
+            if tab.interactive {
+                "interactive"
+            } else {
+                "read-only"
+            },
+        );
+        put("reconnect", if tab.reconnect { "yes" } else { "no" });
+    }
+    out
+}
+
+/// Write through a temporary file so an interrupted save cannot leave a
+/// half-written workspace in place of the previous one.
+pub fn save(file: &path::Path, workspace: &Workspace) -> anyhow::Result<()> {
+    let parent = file.parent().context("workspace path has no directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let temporary = file.with_extension("conf.new");
+    fs::write(&temporary, render(workspace).as_bytes())
+        .with_context(|| format!("write {}", temporary.display()))?;
+    #[cfg(unix)]
+    {
+        // Not a secret, but it names the user's hosts and accounts.
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&temporary, file).with_context(|| format!("replace {}", file.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Workspace {
+        Workspace {
+            tabs: vec![
+                Tab {
+                    destination: "dev".into(),
+                    host: "10.0.0.2".into(),
+                    user: "alice".into(),
+                    session: "work".into(),
+                    port: 2222,
+                    agent: false,
+                    identity: "/home/alice/.ssh/id_ed25519".into(),
+                    known_hosts: "/home/alice/.ssh/known_hosts".into(),
+                    socket: String::new(),
+                    history: 300,
+                    interactive: true,
+                    reconnect: true,
+                },
+                Tab {
+                    host: "build.example.test".into(),
+                    user: "bob".into(),
+                    session: "ci".into(),
+                    port: 22,
+                    agent: true,
+                    history: 200,
+                    interactive: false,
+                    reconnect: false,
+                    ..Tab::default()
+                },
+            ],
+            active: 1,
+        }
+    }
+
+    #[test]
+    fn tabs_survive_a_round_trip() {
+        let workspace = sample();
+        let text = render(&workspace);
+        assert_eq!(parse(&text).unwrap(), workspace);
+    }
+
+    #[test]
+    fn nothing_secret_is_ever_written() {
+        let mut workspace = sample();
+        // Even if a field somehow held key-shaped text, only known keys are
+        // written, and none of them carries key material.
+        workspace.tabs[0].session = "work".into();
+        // Scan the data, not the explanatory header, which says these words.
+        let text: String = render(&workspace)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        for forbidden in [
+            "begin openssh private key",
+            "passphrase",
+            "password",
+            "ssh-rsa aaaa",
+            "ssh-ed25519 aaaa",
+            "authorized_keys",
+            "agent_sock",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden} reached the file");
+        }
+        // The identity is a path to choose again, not the key itself.
+        assert!(text.contains("identity /home/alice/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn a_missing_file_is_not_an_error_but_a_malformed_one_is() {
+        let directory = scratch();
+        let file = directory.0.join("workspace.conf");
+        assert!(load(&file).unwrap().is_none());
+        save(&file, &sample()).unwrap();
+        assert_eq!(load(&file).unwrap().unwrap(), sample());
+        fs::write(&file, "[tab]\nport not-a-number\n").unwrap();
+        assert!(load(&file).is_err());
+        fs::write(&file, "[tab]\nnovel-setting yes\n").unwrap();
+        assert!(load(&file).is_err(), "unknown keys must not be ignored");
+        fs::write(&file, "version 2\n").unwrap();
+        assert!(
+            load(&file).is_err(),
+            "a newer format must not be guessed at"
+        );
+    }
+
+    #[test]
+    fn the_file_is_bounded_in_every_direction() {
+        assert!(parse(&format!("[tab]\nhost {}\n", "x".repeat(MAX_VALUE + 1))).is_err());
+        assert!(parse(&format!("[tab]\nhost {}\n", "x".repeat(MAX_VALUE))).is_ok());
+        assert!(parse("[tab]\nhost a\u{1b}b\n").is_err(), "control byte");
+        assert!(parse("[tab]\nhost a\n[tab]\nhost b\n").is_ok());
+        let many = "[tab]\nhost a\n".repeat(MAX_TABS + 1);
+        assert!(parse(&many).is_err(), "tab count must be bounded");
+        assert!(parse("[tab]\nhost a\nhost b\n").is_err(), "duplicate key");
+        // An out-of-range active index selects a real tab instead of panicking.
+        assert_eq!(parse("active 99\n[tab]\nhost a\n").unwrap().active, 0);
+        assert_eq!(parse("").unwrap(), Workspace::default());
+    }
+
+    #[test]
+    fn saving_replaces_the_previous_file_atomically() {
+        let directory = scratch();
+        let file = directory.0.join("nested").join("workspace.conf");
+        save(&file, &sample()).unwrap();
+        let mut smaller = sample();
+        smaller.tabs.truncate(1);
+        smaller.active = 0;
+        save(&file, &smaller).unwrap();
+        assert_eq!(load(&file).unwrap().unwrap(), smaller);
+        assert!(
+            !file.with_extension("conf.new").exists(),
+            "the temporary file outlived the save"
+        );
+    }
+
+    struct Scratch(path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch() -> Scratch {
+        let path = env::temp_dir().join(format!(
+            "starcom-store-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        Scratch(path)
+    }
+}

@@ -6,7 +6,7 @@ mod terminal;
 
 use std::{collections, env, path, sync, time};
 
-use crate::{core, desktop, input as terminal_input, session, snapshot, ssh, ssh_config};
+use crate::{core, desktop, input as terminal_input, session, snapshot, ssh, ssh_config, store};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Authentication {
@@ -63,6 +63,50 @@ impl Default for Form {
 impl Form {
     pub fn destination(&self) -> &str {
         self.destination.trim()
+    }
+
+    /// The non-secret half of this form: where to connect and how, never
+    /// anything that would let a reader of the saved file connect.
+    pub(crate) fn saved(&self) -> store::Tab {
+        store::Tab {
+            destination: self.destination.clone(),
+            host: self.host.clone(),
+            user: self.user.clone(),
+            session: self.session.clone(),
+            port: self.port,
+            agent: self.authentication == Authentication::Agent,
+            identity: self.identity.clone(),
+            known_hosts: self.known_hosts.clone(),
+            socket: self.socket.clone(),
+            history: self.history,
+            interactive: self.interactive,
+            reconnect: self.reconnect,
+        }
+    }
+
+    /// Fill a form from a saved tab. Deliberately does not connect: restoring a
+    /// workspace must never authenticate on the user's behalf at startup.
+    pub(crate) fn restore(saved: store::Tab) -> Self {
+        Self {
+            destination: saved.destination,
+            host: saved.host,
+            user: saved.user,
+            session: saved.session,
+            port: saved.port,
+            authentication: if saved.agent {
+                Authentication::Agent
+            } else {
+                Authentication::Key
+            },
+            identity: saved.identity,
+            known_hosts: saved.known_hosts,
+            socket: saved.socket,
+            history: saved.history.min(snapshot::MAX_HISTORY_LINES),
+            interactive: saved.interactive,
+            reconnect: saved.reconnect,
+            unsupported: Vec::new(),
+            profile_error: None,
+        }
     }
 
     fn apply_profile(&mut self, profile: ssh_config::Profile) {
@@ -145,6 +189,11 @@ pub(crate) enum Step {
 pub enum Action {
     None,
     Connect(desktop::Connection),
+    /// Ask the host which sessions exist. Cannot start a tmux server.
+    ListSessions(desktop::Connection),
+    /// Explicitly create a session, which may start a server. Only ever from a
+    /// confirmed button press, never from a failed attach.
+    CreateSession(desktop::Connection),
     Disconnect,
     Demo,
     /// Every terminal step this frame produced, in order. Never a subset: a
@@ -167,6 +216,9 @@ pub struct DesktopUi {
     pane_ui: collections::BTreeMap<tmuxctl::PaneId, terminal::PaneUi>,
     pending_paste: Option<(desktop::Target, terminal_input::Paste)>,
     notice: Option<String>,
+    /// Set while the user is confirming that creating a session may start a
+    /// tmux server on a host that has none.
+    confirm_create: bool,
 }
 
 impl Default for DesktopUi {
@@ -194,7 +246,19 @@ impl DesktopUi {
             pane_ui: collections::BTreeMap::new(),
             pending_paste: None,
             notice: None,
+            confirm_create: false,
         }
+    }
+
+    /// Restore a saved tab into this UI's form, showing the connection screen.
+    pub(crate) fn restore(&mut self, saved: store::Tab) {
+        self.form = Form::restore(saved);
+        self.profile_source = self.form.destination().to_owned();
+        self.screen = Screen::Connection;
+    }
+
+    pub(crate) fn saved(&self) -> store::Tab {
+        self.form.saved()
     }
 
     pub fn open_terminal(&mut self) {
@@ -204,6 +268,7 @@ impl DesktopUi {
 
     pub fn cancel_transient(&mut self) {
         self.pending_paste = None;
+        self.confirm_create = false;
     }
 
     pub fn refresh_profile(&mut self) {
@@ -271,6 +336,7 @@ impl DesktopUi {
 
     fn show_connection(&mut self, root: &mut egui::Ui, state: &desktop::State) -> Action {
         let mut action = Action::None;
+        let mut chosen = None;
         egui::CentralPanel::default().show_inside(root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.vertical_centered(|ui| {
@@ -404,6 +470,48 @@ impl DesktopUi {
                                 Err(error) => self.notice = Some(error.to_string()),
                             }
                         }
+                        // Discovery is a separate connection, so it must not
+                        // compete with a live attachment on this tab.
+                        let idle = !matches!(
+                            state.phase,
+                            desktop::Phase::Connecting
+                                | desktop::Phase::Watching
+                                | desktop::Phase::Resynchronizing
+                                | desktop::Phase::Reconnecting
+                        );
+                        let busy = matches!(state.discovery, Some(desktop::Discovery::Running));
+                        if ui
+                            .add_enabled(
+                                enabled && idle && !busy,
+                                egui::Button::new("List sessions"),
+                            )
+                            .on_hover_text(
+                                "Ask the host which tmux sessions exist. Uses tmux -N, so it \
+                                 cannot start a server.",
+                            )
+                            .clicked()
+                        {
+                            match self.form.connection() {
+                                Ok(connection) => {
+                                    self.notice = None;
+                                    action = Action::ListSessions(connection);
+                                }
+                                Err(error) => self.notice = Some(error.to_string()),
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                enabled && idle && !busy,
+                                egui::Button::new("Create session"),
+                            )
+                            .on_hover_text(
+                                "Create the named session on the host. This starts a tmux \
+                                 server if none is running.",
+                            )
+                            .clicked()
+                        {
+                            self.confirm_create = true;
+                        }
                         if ui.button("Open local demo").clicked() {
                             action = Action::Demo;
                         }
@@ -417,6 +525,42 @@ impl DesktopUi {
                             self.open_terminal();
                         }
                     });
+                    match state.discovery {
+                        None => {}
+                        Some(desktop::Discovery::Running) => {
+                            ui.add_space(6.0);
+                            ui.weak("Asking the host…");
+                        }
+                        Some(desktop::Discovery::Failed(ref detail)) => {
+                            ui.add_space(6.0);
+                            ui.colored_label(ui.visuals().error_fg_color, detail);
+                        }
+                        Some(desktop::Discovery::Created(ref name)) => {
+                            ui.add_space(6.0);
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                format!("Created session {name}. Connect to attach to it."),
+                            );
+                        }
+                        Some(desktop::Discovery::Sessions(ref found)) => {
+                            ui.add_space(6.0);
+                            if found.is_empty() {
+                                ui.weak("The host is running tmux with no sessions.");
+                            } else {
+                                ui.weak("Sessions on the host:");
+                                for summary in found {
+                                    ui.horizontal(|ui| {
+                                        // Choosing one only fills the field; it
+                                        // does not attach on the user's behalf.
+                                        if ui.button(&summary.name).clicked() {
+                                            chosen = Some(summary.name.clone());
+                                        }
+                                        ui.weak(summary.describe());
+                                    });
+                                }
+                            }
+                        }
+                    }
                     if let Some(ref notice) = self.notice {
                         ui.colored_label(ui.visuals().warn_fg_color, notice);
                     }
@@ -425,6 +569,47 @@ impl DesktopUi {
                 });
             });
         });
+        if let Some(name) = chosen {
+            self.form.session = name;
+        }
+        if self.confirm_create {
+            let mut confirmed = false;
+            egui::Window::new("Create a tmux session?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(root.ctx(), |ui| {
+                    ui.label(format!(
+                        "Create session {:?} on {}?",
+                        self.form.session.trim(),
+                        self.form.host.trim()
+                    ));
+                    ui.add_space(4.0);
+                    ui.weak(
+                        "If the host is not already running tmux, this starts a server. \
+                         Starcom never does that on its own.",
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_create = false;
+                        }
+                        if ui.button("Create session").clicked() {
+                            confirmed = true;
+                        }
+                    });
+                });
+            if confirmed {
+                self.confirm_create = false;
+                match self.form.connection() {
+                    Ok(connection) => {
+                        self.notice = None;
+                        action = Action::CreateSession(connection);
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
+        }
         action
     }
 
