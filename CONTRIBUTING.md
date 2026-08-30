@@ -23,7 +23,7 @@ Start with one Rust 2024 package, a small binary, and a reusable library. Split
 modules rather than introducing multiple crates prematurely. Proposed modules
 are listed in PLAN.md; create them when implemented, not as empty placeholders.
 Use `tests/data/` for small synthetic fixtures, `scripts/` for development tools,
-and `etc/` for eventual desktop metadata and replay screenshots.
+and `etc/` for desktop metadata, replay screenshots, and patches to dependencies.
 
 Use FileMan's Blade/egui/winit versions together when introducing the GUI.
 Do not copy image/archive/SFTP dependencies that Starcom does not use. Do not add
@@ -80,6 +80,18 @@ the native window and system clipboard. Do not equate these checks with native
 macOS/Windows/Wayland/IME acceptance or call local viewport resizing remote pane
 resizing. Keep CI triggers on PRs and main; no repository-writing preparation
 jobs belong in the final workflow.
+
+## Patching a dependency
+
+Sometimes a dependency is missing something Starcom needs. Carry that as a patch
+file under `etc/<crate>/`, with a README stating what it changes and what was
+measured, and keep the default build on the published crate: gate the code that
+needs it behind a `--cfg`, declared in `Cargo.toml`'s `check-cfg`. `etc/sunset/`
+is the worked example.
+
+Do not vendor a dependency's source into this repository, and do not point the
+default build at a fork without recording that decision in PLAN.md. A patch that
+nobody has decided how to carry is a patch, not a dependency.
 
 ## Dependency advisories
 

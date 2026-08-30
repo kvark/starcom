@@ -249,6 +249,70 @@ impl Connection {
         Ok(Channel { connection: self })
     }
 
+    #[cfg(sunset_forward)]
+    /// Open a `direct-tcpip` channel: ask the server to connect to
+    /// `address:port` on our behalf, and carry that TCP stream on the channel.
+    ///
+    /// This is the channel behind `ssh -J`. It needs no PTY, no shell, and no
+    /// remote helper — the server does the connecting, exactly as OpenSSH's own
+    /// jump host does. The host key of this hop is verified before the channel
+    /// is opened, like every other connection.
+    pub fn open_forward(mut self, address: &str, port: u16) -> Result<Channel, Error> {
+        if address.is_empty() || address.len() > 255 || port == 0 {
+            return Err(Error::new(
+                Kind::Configuration,
+                "invalid forwarding destination",
+            ));
+        }
+        let deadline = time::Instant::now() + self.options.timeout;
+        let handle = self
+            .runner
+            // The origin is informational and commonly logged by the server.
+            // Report a loopback origin rather than anything about this host.
+            .open_client_tcpip(address, port, "127.0.0.1", 0)
+            .map_err(protocol)?;
+        self.handle = Some(handle);
+        // A channel that is still opening is not valid for writing, so this is
+        // the confirmation signal; there is no session event for a tcp channel.
+        while !self.forward_ready() {
+            remaining(deadline)?;
+            let progressed = self.drive(deadline)?;
+            if self.closed {
+                return Err(transport("connection ended opening the forward"));
+            }
+            // A refused open leaves the channel finished rather than removing
+            // it, which is how "never" is told apart from "not yet" instead of
+            // waiting out the deadline.
+            if self.forward_finished() {
+                return Err(transport(
+                    "the server refused to open the forward; it may not allow \
+                     TCP forwarding, or the destination refused the connection",
+                ));
+            }
+            if !progressed {
+                self.wait_ready(deadline)?;
+            }
+        }
+        // Nothing was executed, so no exec reply is outstanding.
+        self.started = true;
+        Ok(Channel { connection: self })
+    }
+
+    #[cfg(sunset_forward)]
+    fn forward_ready(&self) -> bool {
+        self.handle.as_ref().is_some_and(|handle| {
+            self.runner
+                .is_write_channel_valid(handle, sunset::ChanData::Normal)
+        })
+    }
+
+    #[cfg(sunset_forward)]
+    fn forward_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|handle| self.runner.is_channel_finished(handle))
+    }
+
     /// Advance bounded network/protocol work without blocking the socket.
     /// Caller data is never retried across a new connection.
     fn drive(&mut self, deadline: time::Instant) -> Result<bool, Error> {
@@ -476,7 +540,22 @@ impl Connection {
     fn channel_eof(&self) -> bool {
         self.closed
             || self.handle.as_ref().is_some_and(|handle| {
-                self.runner.is_channel_eof(handle) || self.runner.is_channel_closed(handle)
+                self.runner.is_channel_eof(handle)
+                    || self.runner.is_channel_closed(handle)
+                    // A refused or released channel is neither "eof" nor
+                    // "closed" to Sunset, but it will never carry data again.
+                    // Without this a reader waits out its whole deadline.
+                    // Needs the etc/sunset patch; see docs/SSH.md.
+                    || {
+                        #[cfg(sunset_forward)]
+                        {
+                            self.runner.is_channel_finished(handle)
+                        }
+                        #[cfg(not(sunset_forward))]
+                        {
+                            false
+                        }
+                    }
             })
     }
 }

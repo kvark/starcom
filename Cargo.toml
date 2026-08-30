@@ -51,4 +51,10 @@ lto = "thin"
 strip = true
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(gles)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(gles)',
+    # Set when building against a Sunset carrying etc/sunset/*.patch, which adds
+    # the client direct-tcpip open that ProxyJump needs. Off by default so the
+    # normal build uses the published crate unchanged.
+    'cfg(sunset_forward)',
+] }

@@ -51,16 +51,24 @@ or trust policy is shown as blocked. Starcom does not silently connect directly,
 select a different key, or ignore those semantics.
 
 An optional system-SSH transport remains a future escape hatch for advanced
-enterprise/cluster configurations. It is now the only route to `ProxyJump`:
-Sunset 0.6 rejects `direct-tcpip` and `forwarded-tcpip` channels outright, so a
-bastion hop cannot be built on the embedded transport at all. The same version
-emits no keyboard-interactive event and has no certificate path, which is what
-blocks MFA and host/user certificates rather than any decision here.
+enterprise/cluster configurations.
 
-Reusing one connection across tabs is likewise limited by the backend: Sunset
-caps a connection at four channels, so at most four of the sixteen tabs could
-share one, and a shared transport would couple their failures. Each tab keeps its
-own connection.
+`ProxyJump` needs a `direct-tcpip` channel, which Sunset 0.6 rejects outright.
+`etc/sunset/` carries a small patch adding the client-side open, validated
+against real OpenSSH; see its README for what was measured. Starcom's
+`open_forward` is behind `--cfg sunset_forward` and the normal build uses the
+published crate unchanged, so `ProxyJump` is still reported as unsupported rather
+than half-supported. Running a second SSH session inside such a channel also
+needs the transport to accept something other than a `TcpStream`, which is not
+written yet.
+
+Sunset 0.6 emits no keyboard-interactive event and has no certificate path, which
+is what blocks MFA and host/user certificates rather than any decision here.
+
+Reusing one connection across tabs is a separate question. Sunset caps a
+connection at four channels (the patch raises it to sixteen), but a shared
+transport would couple every tab on a host to one failure. Each tab keeps its own
+connection.
 
 ## Trust
 
