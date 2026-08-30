@@ -435,6 +435,7 @@ impl DesktopUi {
         self.rebuild_layout(state);
         let mut action = Action::None;
         let mut outgoing = Vec::new();
+        let connection_epoch = state.epoch();
 
         egui::Panel::top("toolbar").show_inside(root, |ui| {
             ui.horizontal(|ui| {
@@ -575,7 +576,7 @@ impl DesktopUi {
                 node.draw(
                     ui,
                     rect,
-                    egui::Id::new(("split", id.0, generation)),
+                    egui::Id::new(("split", id.0, generation, connection_epoch)),
                     state.allow_resize,
                     &mut resizes,
                     &mut |ui, rect, pane_id| {
@@ -683,6 +684,7 @@ impl DesktopUi {
         }
     }
 
+    #[cfg(test)]
     pub fn smoke_selection(&self, ctx: &egui::Context) -> (egui::Pos2, egui::Pos2) {
         let rect = self
             .pane_ui
