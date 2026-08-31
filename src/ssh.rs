@@ -188,8 +188,7 @@ impl Connection {
             }
         }
         let socket = socket.ok_or_else(|| transport(last_error))?;
-        socket.set_nodelay(true).map_err(transport)?;
-        socket.set_nonblocking(true).map_err(transport)?;
+        configure_stream(&socket)?;
         let poller = sync::Arc::new(polling::Poller::new().map_err(transport)?);
         // SAFETY: Connection owns this socket and deregisters it before drop.
         unsafe { poller.add(&socket, polling::Event::readable(0)) }.map_err(transport)?;
@@ -374,12 +373,21 @@ impl Connection {
                                     deadline,
                                 )?);
                             }
-                            let key = self
-                                .credentials
-                                .as_mut()
-                                .expect("loaded above")
-                                .next_key()?;
-                            request.pubkey(key).map_err(protocol)?;
+                            let credentials = self.credentials.as_mut().expect("loaded above");
+                            match credentials.next_key() {
+                                Ok(key) => request.pubkey(key).map_err(protocol)?,
+                                Err(error) if credentials.offered() == 0 => {
+                                    request.skip().map_err(protocol)?;
+                                    return Err(error);
+                                }
+                                Err(_) => {
+                                    // Already offered at least one key. Another
+                                    // Pubkey event means "any more?"; skipping
+                                    // lets the handshake finish instead of
+                                    // treating a successful first key as failure.
+                                    request.skip().map_err(protocol)?;
+                                }
+                            }
                         }
                         sunset::CliEvent::AgentSign(request) => {
                             self.credentials
@@ -680,6 +688,70 @@ impl io::Write for Channel {
 impl Drop for Channel {
     fn drop(&mut self) {
         self.abort();
+    }
+}
+
+fn configure_stream(socket: &net::TcpStream) -> Result<(), Error> {
+    socket.set_nodelay(true).map_err(transport)?;
+    socket.set_nonblocking(true).map_err(transport)?;
+    // Idle control sessions otherwise sit silent until the next tmux command.
+    // NAT and stateful filters then black-hole the TCP connection, and the next
+    // request dies as "tmux reply deadline expired" instead of a transport loss.
+    let _ = set_keepalive_idle(socket, 30);
+    Ok(())
+}
+
+/// Seconds of silence before the first TCP keepalive probe. Not a tmux ping:
+/// RTT in the status bar is the last small control command we already sent.
+fn set_keepalive_idle(socket: &net::TcpStream, seconds: u32) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let seconds = seconds as std::ffi::c_int;
+        let on: std::ffi::c_int = 1;
+        const IPPROTO_TCP: i32 = 6;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const SOL_SOCKET: i32 = 1;
+        #[cfg(target_os = "macos")]
+        const SOL_SOCKET: i32 = 0xffff;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const SO_KEEPALIVE: i32 = 9;
+        #[cfg(target_os = "macos")]
+        const SO_KEEPALIVE: i32 = 0x0008;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const TCP_KEEPIDLE: i32 = 4;
+        #[cfg(target_os = "macos")]
+        const TCP_KEEPIDLE: i32 = 0x10;
+        unsafe extern "C" {
+            fn setsockopt(
+                sockfd: i32,
+                level: i32,
+                optname: i32,
+                optval: *const std::ffi::c_void,
+                optlen: u32,
+            ) -> i32;
+        }
+        let set = |level, name, value: &std::ffi::c_int| unsafe {
+            setsockopt(
+                fd,
+                level,
+                name,
+                (value as *const std::ffi::c_int).cast(),
+                std::mem::size_of_val(value) as u32,
+            )
+        };
+        if set(SOL_SOCKET, SO_KEEPALIVE, &on) != 0 || set(IPPROTO_TCP, TCP_KEEPIDLE, &seconds) != 0
+        {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = (socket, seconds);
+        Ok(())
     }
 }
 

@@ -35,7 +35,8 @@ The embedded resolver currently supports:
 
 - `Host` wildcard/negation matching and first-value-wins ordering;
 - `HostName`, `User`, and `Port`;
-- one `IdentityFile` plus `IdentitiesOnly`;
+- one `IdentityFile` plus `IdentitiesOnly`, or else the first existing
+  default identity Starcom can sign (`~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`);
 - one `UserKnownHostsFile`;
 - bounded `Include` expansion, including `*` and `?` globs.
 
@@ -91,13 +92,20 @@ implementation or a system-SSH adapter.
 
 ## Authentication
 
-If no agent is reachable, the connection form says so before you press Connect,
-and the failure names the socket it tried and what to do about it. A desktop
-session frequently does not inherit `SSH_AUTH_SOCK` from a shell, so an agent
-that works in a terminal can be invisible to a launcher-started Starcom; that is
-the usual cause. An agent that is running but holds no keys is reported as such
-rather than as a generic authentication failure. Starcom never falls back to a
-different key on its own.
+If the profile has no `IdentityFile` and no agent is reachable, the form selects
+the first existing default identity Starcom can sign (`~/.ssh/id_ed25519`, then
+`id_ecdsa`, then `id_rsa`) and shows that path. That is the usual `ssh host`
+setup: a key file on disk, no agent. Starcom still presents only one key, so a
+leftover `id_rsa` is not tried after Ed25519; change the path on the form if the
+server needs a different file.
+
+If no agent is reachable and none of those default files exist, the connection
+form says so before you press Connect, and the failure names the socket it tried
+and what to do about it. A desktop session frequently does not inherit
+`SSH_AUTH_SOCK` from a shell, so an agent that works in a terminal can be
+invisible to a launcher-started Starcom. An agent that is running but holds no
+keys is reported as such rather than as a generic authentication failure.
+Starcom never falls back to a different key during the handshake.
 
 Supported identity sources:
 
@@ -171,8 +179,20 @@ tmux -N -C ... attach-session -E ...
 ```
 
 `-N` prevents creating a replacement tmux server. `-E` avoids changing the
-session environment. Attachments use `ignore-size` so merely opening or resizing
-a local window does not change the shared tmux layout.
+session environment. Read-only attachments use `ignore-size` so merely opening
+does not change the shared layout. Interactive attachments omit `ignore-size`
+and report their cell size with `refresh-client -C`, using the same font metrics
+as painting, so pane column counts match the GUI.
+
+If public-key authentication runs out of identities, the error distinguishes
+"nothing supported was available to offer" from "the server rejected the keys
+that were offered". An agent that lists only unsupported key types fails at
+load rather than after a confusing empty offer.
+
+TCP keepalive is enabled so an idle control session is not black-holed by NAT.
+On Linux and macOS the first probe is after 30 seconds of silence. That is not
+a tmux ping; the desktop's displayed round-trip is the last small control
+command already sent.
 
 Read-only connections add tmux's `read-only` client flag. Interactive connections
 attach without that flag, but Starcom's application gate stays closed until the

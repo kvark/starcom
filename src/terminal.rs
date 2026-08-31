@@ -84,6 +84,16 @@ impl Terminal {
         self.size
     }
 
+    /// Grow or shrink the local grid to the pane's pixel allocation.
+    /// Does not change tmux; remote geometry is a separate, opt-in request.
+    pub fn resize(&mut self, size: core::Size) {
+        if size == self.size {
+            return;
+        }
+        self.model.resize(size);
+        self.size = size;
+    }
+
     pub fn model(&self) -> &term::Term<event::VoidListener> {
         &self.model
     }
@@ -156,6 +166,22 @@ impl Terminal {
     pub fn is_alternate_screen(&self) -> bool {
         self.model.mode().contains(term::TermMode::ALT_SCREEN)
     }
+
+    /// DECSET 1000/1002/1003. The application asked for mouse reports, so the
+    /// wheel belongs to it rather than local history scrolling.
+    pub fn reports_mouse(&self) -> bool {
+        self.model.mode().intersects(term::TermMode::MOUSE_MODE)
+    }
+
+    pub fn sgr_mouse(&self) -> bool {
+        self.model.mode().contains(term::TermMode::SGR_MOUSE)
+    }
+
+    /// Wheel should be delivered to the application: explicit mouse reporting,
+    /// or xterm alternate-scroll (wheel becomes arrows on the alternate screen).
+    pub fn wants_wheel(&self) -> bool {
+        self.reports_mouse() || self.is_alternate_screen()
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +204,31 @@ mod tests {
         terminal.feed(b"\x1b[?1049l");
         assert!(!terminal.is_alternate_screen());
         assert_eq!(terminal.screen_lines()[0], "primary");
+    }
+
+    #[test]
+    fn local_resize_changes_the_grid() {
+        let mut terminal = Terminal::new(core::Size::new(4, 2).unwrap(), 0);
+        terminal.feed(b"abcdefgh");
+        assert_eq!(terminal.screen_lines(), ["abcd", "efgh"]);
+        terminal.resize(core::Size::new(8, 3).unwrap());
+        assert_eq!(terminal.size(), core::Size::new(8, 3).unwrap());
+        assert_eq!(terminal.screen_lines().len(), 3);
+    }
+
+    #[test]
+    fn mouse_reporting_and_alternate_scroll_are_observable() {
+        let mut terminal = Terminal::new(core::Size::new(20, 4).unwrap(), 0);
+        assert!(!terminal.reports_mouse());
+        assert!(!terminal.wants_wheel());
+        terminal.feed(b"\x1b[?1000h\x1b[?1006h");
+        assert!(terminal.reports_mouse());
+        assert!(terminal.sgr_mouse());
+        assert!(terminal.wants_wheel());
+        terminal.feed(b"\x1b[?1000l\x1b[?1006l\x1b[?1049h");
+        assert!(!terminal.reports_mouse());
+        assert!(terminal.is_alternate_screen());
+        assert!(terminal.wants_wheel());
     }
 
     #[test]

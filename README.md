@@ -17,21 +17,25 @@ cargo run --release --locked
 cargo run --release --locked -- --demo
 ```
 
-Use **+** to open a connection tab. Starcom suggests literal `Host` entries from
-`~/.ssh/config`, resolves supported user/host/port/key settings, and reports
-unsupported routing or authentication policy instead of bypassing it. Each tab
-shows either its connection form or its tmux windows—not both side by side.
+Use **+** to open a connection tab. Pick a `Host` from `~/.ssh/config` or type
+another destination; Starcom resolves supported user/host/port/key settings and
+reports unsupported routing or authentication policy instead of bypassing it.
+Choosing a known host lists its tmux sessions and selects the first one so
+**Connect** is the next click. Each tab is one session and one window of that
+session: its form or its panes, not both side by side.
 
 Tabs are saved and reopened on their forms; Starcom never authenticates at
-startup, and the saved file holds destinations, never credentials. **List
-sessions** asks the host what exists without being able to start a tmux server;
-**Create session** is the one action that may start one, and it asks first.
+startup, and the saved file holds destinations, never credentials.
+**Create session** is the one action that may start a tmux server, and it asks
+first.
 
-The desktop currently supports local scrollback, selection and copying, plus the
-experimental interactive path and opt-in shared tmux pane resizing. Multiline
-paste requires confirmation. Transport loss reconnects automatically with visible,
-cancellable backoff; authentication, trust, and missing-session failures stop and
-wait for you.
+The desktop currently supports local scrollback, selection and copying, pane
+split/zoom/close controls, and opt-in shared tmux pane resizing. Wheel events go
+to the application when it asked for mouse reports or is on the alternate
+screen; otherwise they scroll local history. Multiline paste requires
+confirmation. Transport loss reconnects automatically with visible, cancellable
+backoff; authentication, trust, and missing-session failures stop and wait for
+you.
 
 SSH and cryptography use Rust libraries; OpenSSL is not a build dependency.
 Host keys must already be trusted.

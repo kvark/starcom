@@ -39,7 +39,38 @@ impl Command {
         )))
     }
 
-    /// One axis only. tmux retains ownership of the window's total dimensions.
+    /// Set this control client's size so pane cell counts match the GUI.
+    pub fn client_size(size: crate::core::Size) -> Self {
+        Self(format!(
+            "refresh-client -C {}x{}\n",
+            size.columns(),
+            size.rows()
+        ))
+    }
+
+    pub fn split_pane(pane: tmuxctl::PaneId, axis: input::Axis) -> Self {
+        Self(format!(
+            "split-window {} -t {pane}\n",
+            match axis {
+                input::Axis::Columns => "-h",
+                input::Axis::Rows => "-v",
+            }
+        ))
+    }
+
+    pub fn kill_pane(pane: tmuxctl::PaneId) -> Self {
+        Self(format!("kill-pane -t {pane}\n"))
+    }
+
+    pub fn zoom_pane(pane: tmuxctl::PaneId) -> Self {
+        Self(format!("resize-pane -Z -t {pane}\n"))
+    }
+
+    pub fn select_pane(pane: tmuxctl::PaneId) -> Self {
+        Self(format!("select-pane -t {pane}\n"))
+    }
+
+    /// One axis only. The window's total size comes from `client_size`.
     pub fn resize_axis(pane: tmuxctl::PaneId, resize: input::Resize) -> Result<Self, input::Error> {
         input::Action::Resize(resize).validate()?;
         let axis = match resize.axis {
@@ -117,6 +148,30 @@ mod tests {
     fn input_is_hex_not_command_syntax() {
         let command = Command::send_bytes(tmuxctl::PaneId(7), b"a;\n\x00\xff").unwrap();
         assert_eq!(command.as_str(), "send-keys -H -t %7 61 3b 0a 00 ff\n");
+        assert_eq!(
+            Command::client_size(crate::core::Size::new(120, 40).unwrap()).as_str(),
+            "refresh-client -C 120x40\n"
+        );
+        assert_eq!(
+            Command::split_pane(tmuxctl::PaneId(3), input::Axis::Columns).as_str(),
+            "split-window -h -t %3\n"
+        );
+        assert_eq!(
+            Command::split_pane(tmuxctl::PaneId(3), input::Axis::Rows).as_str(),
+            "split-window -v -t %3\n"
+        );
+        assert_eq!(
+            Command::kill_pane(tmuxctl::PaneId(3)).as_str(),
+            "kill-pane -t %3\n"
+        );
+        assert_eq!(
+            Command::zoom_pane(tmuxctl::PaneId(3)).as_str(),
+            "resize-pane -Z -t %3\n"
+        );
+        assert_eq!(
+            Command::select_pane(tmuxctl::PaneId(3)).as_str(),
+            "select-pane -t %3\n"
+        );
         assert_eq!(
             command.as_bytes().iter().filter(|&&b| b == b'\n').count(),
             1

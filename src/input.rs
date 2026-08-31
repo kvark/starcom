@@ -24,6 +24,8 @@ pub enum Key {
     PageUp,
     PageDown,
     Function(u8),
+    WheelUp,
+    WheelDown,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -55,6 +57,8 @@ impl Key {
             Self::PageDown => "NPage".to_owned(),
             Self::Function(number @ 1..=20) => format!("F{number}"),
             Self::Function(_) => return Err(Error::UnsupportedKey),
+            Self::WheelUp => return Ok("WheelUp".to_owned()),
+            Self::WheelDown => return Ok("WheelDown".to_owned()),
         };
         Ok(format!(
             "{}{}{}{name}",
@@ -114,6 +118,12 @@ pub enum Action {
     Key(Key, Modifiers),
     Paste(Paste),
     Resize(Resize),
+    /// The GUI client's size in cells, from the same font metrics used to paint.
+    ClientSize(core::Size),
+    Split(Axis),
+    KillPane,
+    ZoomPane,
+    SelectPane,
 }
 
 impl Action {
@@ -132,11 +142,32 @@ impl Action {
         }
     }
 
+    pub fn changes_layout(&self) -> bool {
+        matches!(
+            self,
+            Self::Resize(_)
+                | Self::ClientSize(_)
+                | Self::Split(_)
+                | Self::KillPane
+                | Self::ZoomPane
+        )
+    }
+
+    pub fn changes_window_size(&self) -> bool {
+        matches!(self, Self::Resize(_) | Self::ClientSize(_))
+    }
+
     pub fn size(&self) -> usize {
         match *self {
             Self::Bytes(ref bytes) => bytes.len(),
             Self::Paste(ref paste) => paste.0.len(),
-            Self::Key(..) | Self::Resize(..) => 32,
+            Self::Key(..)
+            | Self::Resize(..)
+            | Self::ClientSize(_)
+            | Self::Split(_)
+            | Self::KillPane
+            | Self::ZoomPane
+            | Self::SelectPane => 32,
         }
     }
 }
@@ -189,6 +220,20 @@ pub enum Error {
     ResizeSize,
 }
 
+/// CSI mouse wheel report at a 0-based pane cell. Used when the application
+/// enabled 1000/1002/1003 so local history scrolling would steal its input.
+pub fn mouse_wheel_bytes(up: bool, column: usize, row: usize, sgr: bool) -> Vec<u8> {
+    let x = column.saturating_add(1);
+    let y = row.saturating_add(1);
+    let button = if up { 64 } else { 65 };
+    if sgr {
+        format!("\x1b[<{button};{x};{y}M").into_bytes()
+    } else {
+        let encode = |n: usize| n.clamp(1, 223) as u8 + 32;
+        vec![0x1b, b'[', b'M', button as u8 + 32, encode(x), encode(y)]
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match *self {
@@ -230,6 +275,21 @@ mod tests {
         );
         assert!(Key::Function(0).name(Modifiers::default()).is_err());
         assert!(Key::Function(21).name(Modifiers::default()).is_err());
+        assert_eq!(Key::WheelUp.name(Modifiers::default()).unwrap(), "WheelUp");
+        assert_eq!(
+            Key::WheelDown.name(Modifiers::default()).unwrap(),
+            "WheelDown"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_reports_sgr_and_x10() {
+        assert_eq!(mouse_wheel_bytes(true, 0, 0, true), b"\x1b[<64;1;1M");
+        assert_eq!(mouse_wheel_bytes(false, 9, 4, true), b"\x1b[<65;10;5M");
+        assert_eq!(
+            mouse_wheel_bytes(true, 0, 0, false),
+            vec![0x1b, b'[', b'M', 96, 33, 33]
+        );
     }
 
     #[test]

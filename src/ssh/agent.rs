@@ -57,6 +57,12 @@ impl Agent {
             }
         }
         wire.finish()?;
+        if keys.is_empty() {
+            return Err(authentication(
+                "the SSH agent holds keys, but none are ed25519, ECDSA P-256, or RSA \
+                 in a form Starcom can sign",
+            ));
+        }
         Ok(keys)
     }
 

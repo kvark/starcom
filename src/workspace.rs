@@ -1,7 +1,7 @@
 //! Connection tabs own independent clients, forms, selection and input tokens.
 //! A new tab displays a form, never a sidebar alongside somebody else's panes.
 
-use std::{path, sync};
+use std::{path, sync, time};
 
 use crate::{desktop, ssh_config, store, ui};
 
@@ -34,6 +34,7 @@ pub(crate) struct Workspace {
     /// Where saved tabs live. None disables persistence entirely, which is what
     /// happens with no home directory and in the demo.
     store: Option<path::PathBuf>,
+    fps: u32,
 }
 
 /// A restored tab is labelled by where it points, not by a live connection.
@@ -66,6 +67,7 @@ impl Workspace {
                 .then(desktop::home_path)
                 .flatten()
                 .map(|home| store::path(&home)),
+            fps: store::DEFAULT_FPS,
         };
         if startup != desktop::Startup::Demo {
             workspace.reload_config();
@@ -109,6 +111,11 @@ impl Workspace {
             self.tabs[index].ui.restore(tab);
         }
         self.active = saved.active.min(self.tabs.len().saturating_sub(1));
+        self.fps = store::clamp_fps(saved.fps);
+    }
+
+    pub(crate) fn repaint_interval(&self) -> time::Duration {
+        time::Duration::from_secs_f64(1.0 / f64::from(store::clamp_fps(self.fps)))
     }
 
     /// Persist after a change to which tabs exist or where they point. Failure
@@ -124,6 +131,7 @@ impl Workspace {
                 .map(|tab| tab.ui.saved())
                 .collect(),
             active: self.active,
+            fps: store::clamp_fps(self.fps),
         };
         if let Err(error) = store::save(file, &saved) {
             self.notice = Some(format!("Could not save tabs: {error:#}"));
@@ -215,13 +223,6 @@ impl Workspace {
                         {
                             navigation = Action::Select(tab.id);
                         }
-                        if ui
-                            .small_button("×")
-                            .on_hover_text("Close this connection tab; remote jobs keep running")
-                            .clicked()
-                        {
-                            navigation = Action::Close(tab.id);
-                        }
                     });
                 }
                 if ui
@@ -231,6 +232,23 @@ impl Workspace {
                 {
                     navigation = Action::New;
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut fps = self.fps;
+                    let response = ui
+                        .add(
+                            egui::DragValue::new(&mut fps)
+                                .range(1..=i64::from(store::MAX_FPS))
+                                .suffix(" fps"),
+                        )
+                        .on_hover_text(
+                            "Maximum redraw rate for live output. Pointer and key events \
+                             still paint immediately.",
+                        );
+                    if response.changed() {
+                        self.fps = store::clamp_fps(fps);
+                        self.persist();
+                    }
+                });
                 if let Some(ref notice) = self.notice {
                     ui.colored_label(ui.visuals().error_fg_color, notice);
                 }
@@ -304,7 +322,7 @@ impl Workspace {
                             );
                             let started = tab.client.connect(connection).map(|()| {
                                 tab.label = label;
-                                tab.ui.open_terminal();
+                                tab.ui.reset_client_size();
                             });
                             // Remember where a successful connection pointed, so
                             // the next start reopens the same form.
@@ -461,6 +479,7 @@ mod tests {
                     },
                 ],
                 active: 1,
+                fps: store::DEFAULT_FPS,
             },
         )
         .unwrap();
@@ -474,6 +493,7 @@ mod tests {
             config_error: None,
             notice: None,
             store: Some(file.clone()),
+            fps: store::DEFAULT_FPS,
         };
         workspace.restore();
         assert_eq!(workspace.tabs.len(), 2);
@@ -529,6 +549,7 @@ mod tests {
             config_error: None,
             notice: None,
             store: Some(file.clone()),
+            fps: store::DEFAULT_FPS,
         };
         workspace.restore();
         assert!(workspace.tabs.is_empty());

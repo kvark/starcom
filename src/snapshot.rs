@@ -76,20 +76,14 @@ impl State {
                 .parse()?,
         );
         let size = core::Size::new(number(2)?, number(3)?)?;
-        let cursor = (number(6)?, number(7)?);
+        let cursor = size.clamp_cursor(number(6)?, number(7)?);
         let alternate = flag(8)?;
         let saved_cursor = if alternate {
-            (number(11)?, number(12)?)
+            size.clamp_cursor(number(11)?, number(12)?)
         } else {
             // tmux leaves alternate_saved_* empty when no saved grid exists.
             (0, 0)
         };
-        for position in [cursor, saved_cursor] {
-            anyhow::ensure!(
-                position.0 <= size.columns() && position.1 < size.rows(),
-                "cursor outside pane"
-            );
-        }
         let scroll_region = (number(13)?, number(14)?);
         anyhow::ensure!(
             scroll_region.0 <= scroll_region.1 && scroll_region.1 < size.rows(),
@@ -143,6 +137,11 @@ impl State {
     /// None means the tmux server did not export this input-side mode.
     pub fn bracketed_paste(&self) -> Option<bool> {
         self.bracketed_paste
+    }
+
+    /// The pane asked for mouse reports (1000/1002/1003). Wheel belongs to it.
+    pub fn reports_mouse(&self) -> bool {
+        self.modes[5] || self.modes[6] || self.modes[7]
     }
 
     fn restore_modes(&self, terminal: &mut terminal::Terminal) {
@@ -439,6 +438,14 @@ mod tests {
     }
 
     #[test]
+    fn mouse_standard_flag_means_the_pane_wants_the_wheel() {
+        let off = state(12, 3);
+        assert!(!off.reports_mouse());
+        let on = State::parse("%1|@2|12|3|0|0|0|0|0|0|2000|||0|2|1|0|0|0|1|1|0|0|0|0|1|").unwrap();
+        assert!(on.reports_mouse());
+    }
+
+    #[test]
     fn older_tmux_missing_bracketed_paste_is_explicitly_unknown() {
         let original = "%1|@2|12|3|0|0|0|0|0|0|2000|||0|2|1|0|0|0|1|0|0|0|0|0||";
         assert_eq!(State::parse(original).unwrap().bracketed_paste(), None);
@@ -495,6 +502,15 @@ mod tests {
         pane.terminal.feed(b"\x1b[?1049l!");
         assert!(!pane.terminal.is_alternate_screen());
         assert_eq!(pane.terminal.screen_lines()[0], "home!");
+    }
+
+    #[test]
+    fn a_saved_cursor_from_before_a_resize_is_clamped() {
+        let state = State::parse("%1|@2|80|24|0|0|0|0|1|0|2000|120|40|0|23|1|0|0|0|1|0|0|0|0|0|1|")
+            .unwrap();
+        assert!(state.alternate);
+        assert_eq!(state.cursor, (0, 0));
+        assert_eq!(state.saved_cursor, (80, 23));
     }
 
     #[test]

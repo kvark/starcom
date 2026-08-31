@@ -11,7 +11,10 @@ const INITIAL_SIZE: (u32, u32) = (1280, 760);
 
 #[derive(Debug)]
 enum Event {
+    /// egui asked for a frame (hover, widgets, timers). Not fps-capped.
     Repaint(time::Instant),
+    /// SSH/tmux worker has new data. Coalesced to the configured fps.
+    Remote,
 }
 
 struct Runtime {
@@ -196,11 +199,21 @@ impl Drop for Runtime {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Wake {
+    when: time::Instant,
+    /// Local UI: paint as soon as `when` arrives. Remote output: still
+    /// subject to the fps interval on the actual RedrawRequested.
+    force: bool,
+}
+
 struct App {
     workspace: workspace::Workspace,
     ctx: egui::Context,
     runtime: Option<Runtime>,
-    next_repaint: Option<time::Instant>,
+    next_repaint: Option<Wake>,
+    last_paint: Option<time::Instant>,
+    input_redraw: bool,
     error: Option<anyhow::Error>,
 }
 
@@ -212,11 +225,22 @@ impl App {
         self.next_repaint = None;
     }
 
-    fn schedule(&mut self, when: time::Instant) {
-        self.next_repaint = Some(
-            self.next_repaint
-                .map_or(when, |previous| previous.min(when)),
-        );
+    fn schedule(&mut self, when: time::Instant, force: bool) {
+        self.next_repaint = Some(match self.next_repaint {
+            Some(previous) => Wake {
+                when: previous.when.min(when),
+                force: previous.force || force,
+            },
+            None => Wake { when, force },
+        });
+    }
+
+    fn request_redraw(&mut self) {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        self.input_redraw = true;
+        runtime.window.request_redraw();
     }
 }
 
@@ -244,24 +268,39 @@ impl winit::application::ApplicationHandler<Event> for App {
         window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        let Some(ref mut runtime) = self.runtime else {
-            return;
-        };
-        if runtime.window.id() != window_id {
+        if self
+            .runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.window.id() != window_id)
+        {
             return;
         }
-        let control = self
-            .workspace
-            .terminal_focused(&self.ctx)
-            .then(|| ui::input::terminal_control_key(&event, runtime.input.egui_input().modifiers))
-            .flatten();
-        if let Some(key) = control {
-            runtime.input.egui_input_mut().events.push(key);
-            runtime.window.request_redraw();
-        } else {
-            let response = runtime.input.on_window_event(&runtime.window, &event);
-            if response.repaint {
-                runtime.window.request_redraw();
+        if !matches!(event, winit::event::WindowEvent::RedrawRequested) {
+            let modifiers = self
+                .runtime
+                .as_ref()
+                .expect("checked above")
+                .input
+                .egui_input()
+                .modifiers;
+            let control = self
+                .workspace
+                .terminal_focused(&self.ctx)
+                .then(|| ui::input::terminal_control_key(&event, modifiers))
+                .flatten();
+            let redraw = if let Some(key) = control {
+                let runtime = self.runtime.as_mut().expect("checked above");
+                runtime.input.egui_input_mut().events.push(key);
+                true
+            } else {
+                let runtime = self.runtime.as_mut().expect("checked above");
+                runtime
+                    .input
+                    .on_window_event(&runtime.window, &event)
+                    .repaint
+            };
+            if redraw {
+                self.request_redraw();
             }
         }
         match event {
@@ -270,35 +309,52 @@ impl winit::application::ApplicationHandler<Event> for App {
                 event_loop.exit();
             }
             winit::event::WindowEvent::Resized(size) => {
-                if let Err(error) = runtime.resize(size) {
+                let result = self.runtime.as_mut().expect("checked above").resize(size);
+                if let Err(error) = result {
                     self.error = Some(error);
                     event_loop.exit();
                 } else {
-                    runtime.window.request_redraw();
+                    self.request_redraw();
                 }
             }
             winit::event::WindowEvent::RedrawRequested => {
-                if runtime.size.width == 0 || runtime.size.height == 0 {
+                let interval = self.workspace.repaint_interval();
+                let force = self.input_redraw;
+                self.input_redraw = false;
+                // Only remote coalescing uses this path (force is false). Local
+                // pointer/key events set input_redraw and paint immediately.
+                if !force && self.last_paint.is_some_and(|at| at.elapsed() < interval) {
+                    let at = self.last_paint.expect("checked above") + interval;
+                    self.schedule(at, false);
                     return;
                 }
                 if self
                     .next_repaint
-                    .is_some_and(|when| when <= time::Instant::now())
+                    .is_some_and(|wake| wake.when <= time::Instant::now())
                 {
                     self.next_repaint = None;
+                }
+                let runtime = self.runtime.as_mut().expect("checked above");
+                if runtime.size.width == 0 || runtime.size.height == 0 {
+                    return;
                 }
                 let input = runtime.input.take_egui_input(&runtime.window);
                 let mut action = workspace::Action::None;
                 let output = self.ctx.run_ui(input, |root| {
                     action = self.workspace.show(root);
                 });
+                let runtime = self.runtime.as_mut().expect("checked above");
                 if let Err(error) = runtime.paint(&self.ctx, output) {
                     self.error = Some(error);
                     event_loop.exit();
                     return;
                 }
-                self.workspace
-                    .apply(action, || runtime.input.clipboard_text());
+                self.last_paint = Some(time::Instant::now());
+                self.workspace.apply(action, || {
+                    self.runtime
+                        .as_mut()
+                        .and_then(|runtime| runtime.input.clipboard_text())
+                });
             }
             _ => {}
         }
@@ -312,20 +368,31 @@ impl winit::application::ApplicationHandler<Event> for App {
 
     fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, event: Event) {
         match event {
-            Event::Repaint(when) => self.schedule(when),
+            Event::Repaint(when) => self.schedule(when, true),
+            Event::Remote => {
+                let now = time::Instant::now();
+                let when = match self.last_paint {
+                    Some(painted) => now.max(painted + self.workspace.repaint_interval()),
+                    None => now,
+                };
+                self.schedule(when, false);
+            }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-        if let Some(when) = self.next_repaint {
-            if when <= time::Instant::now() {
+        if let Some(wake) = self.next_repaint {
+            if wake.when <= time::Instant::now() {
                 self.next_repaint = None;
+                if wake.force {
+                    self.input_redraw = true;
+                }
                 if let Some(ref runtime) = self.runtime {
                     runtime.window.request_redraw();
                 }
             } else {
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(when));
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(wake.when));
             }
         }
     }
@@ -345,19 +412,30 @@ pub fn run(startup: desktop::Startup) -> anyhow::Result<()> {
     let proxy = event_loop.create_proxy();
     let ctx = egui::Context::default();
     configure(&ctx);
-    ctx.set_request_repaint_callback(move |info| {
-        if let Some(when) = time::Instant::now().checked_add(info.delay) {
-            let _ = proxy.send_event(Event::Repaint(when));
+    ctx.set_request_repaint_callback({
+        let proxy = proxy.clone();
+        move |info| {
+            if let Some(when) = time::Instant::now().checked_add(info.delay) {
+                let _ = proxy.send_event(Event::Repaint(when));
+            }
         }
     });
-    let wake_ctx = ctx.clone();
-    let workspace =
-        workspace::Workspace::new(sync::Arc::new(move || wake_ctx.request_repaint()), startup)?;
+    let workspace = workspace::Workspace::new(
+        {
+            let proxy = proxy.clone();
+            sync::Arc::new(move || {
+                let _ = proxy.send_event(Event::Remote);
+            })
+        },
+        startup,
+    )?;
     let mut app = App {
         workspace,
         ctx,
         runtime: None,
         next_repaint: None,
+        last_paint: None,
+        input_redraw: false,
         error: None,
     };
     let result = event_loop.run_app(&mut app);

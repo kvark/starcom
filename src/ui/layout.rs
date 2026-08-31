@@ -1,6 +1,6 @@
 //! Reconstruct the split hierarchy from tmux's pane rectangles.
-//! Local dividers optionally request a single tmux resize on release. The
-//! server owns the final geometry; no window-size option is modified.
+//! Local dividers request a tmux resize on release, in the same cell units
+//! used to paint. The server owns the final geometry.
 
 use crate::{input, snapshot};
 
@@ -14,18 +14,20 @@ pub enum Axis {
 pub struct Boundary {
     pane: tmuxctl::PaneId,
     pane_cells: usize,
-    first_cells: usize,
-    available_cells: usize,
 }
 
 impl Boundary {
-    fn resize(self, axis: Axis, ratio: f32) -> Option<(tmuxctl::PaneId, input::Resize)> {
-        if !ratio.is_finite() {
+    /// Size from the GUI pixels and the same cell metrics used to paint.
+    fn resize_pixels(
+        self,
+        axis: Axis,
+        first_pixels: f32,
+        cell: f32,
+    ) -> Option<(tmuxctl::PaneId, input::Resize)> {
+        if !(cell.is_finite() && cell > 0.0 && first_pixels.is_finite()) {
             return None;
         }
-        let desired = (ratio * self.available_cells as f32).round() as isize;
-        let cells = (self.pane_cells as isize + desired - self.first_cells as isize).clamp(1, 4096)
-            as usize;
+        let cells = (first_pixels / cell).round().clamp(1.0, 4096.0) as usize;
         (cells != self.pane_cells).then_some((
             self.pane,
             input::Resize {
@@ -105,8 +107,6 @@ impl Node {
                                 Axis::Horizontal => pane.state.size.columns(),
                                 Axis::Vertical => pane.state.size.rows(),
                             },
-                            first_cells: first_end - low,
-                            available_cells: high - low - 1,
                         })
                 } else {
                     None
@@ -123,12 +123,15 @@ impl Node {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         ui: &mut egui::Ui,
         rect: egui::Rect,
         id: egui::Id,
         remote_resize: bool,
+        cell_width: f32,
+        row_height: f32,
         resizes: &mut Vec<(tmuxctl::PaneId, input::Resize)>,
         pane: &mut impl FnMut(&mut egui::Ui, egui::Rect, tmuxctl::PaneId),
     ) {
@@ -172,9 +175,9 @@ impl Node {
                         Axis::Vertical => egui::CursorIcon::ResizeVertical,
                     })
                     .on_hover_text(if remote_resize && remote_boundary.is_some() {
-                        "Release to resize this shared tmux divider. Other clients see the change."
+                        "Release to resize the tmux pane. Other attached clients see the change."
                     } else {
-                        "Resize local views only. Remote tmux geometry is unchanged."
+                        "Remote pane resize is off. Enable it to change tmux geometry."
                     });
                 if response.dragged()
                     && available > 0.0
@@ -189,8 +192,13 @@ impl Node {
                 }
                 if remote_resize
                     && response.drag_stopped()
-                    && let Some(resize) =
-                        remote_boundary.and_then(|boundary| boundary.resize(axis, *ratio))
+                    && let Some(resize) = remote_boundary.and_then(|edge| {
+                        let cell = match axis {
+                            Axis::Horizontal => cell_width,
+                            Axis::Vertical => row_height,
+                        };
+                        edge.resize_pixels(axis, boundary, cell)
+                    })
                 {
                     resizes.push(resize);
                 }
@@ -201,8 +209,26 @@ impl Node {
                         ui.visuals().widgets.hovered.bg_fill,
                     );
                 }
-                first.draw(ui, a, id.with(0), remote_resize, resizes, pane);
-                second.draw(ui, b, id.with(1), remote_resize, resizes, pane);
+                first.draw(
+                    ui,
+                    a,
+                    id.with(0),
+                    remote_resize,
+                    cell_width,
+                    row_height,
+                    resizes,
+                    pane,
+                );
+                second.draw(
+                    ui,
+                    b,
+                    id.with(1),
+                    remote_resize,
+                    cell_width,
+                    row_height,
+                    resizes,
+                    pane,
+                );
             }
         }
     }
@@ -216,10 +242,10 @@ mod tests {
         let boundary = Boundary {
             pane: tmuxctl::PaneId(2),
             pane_cells: 40,
-            first_cells: 81,
-            available_cells: 122,
         };
-        let (pane, resize) = boundary.resize(Axis::Horizontal, 91.0 / 122.0).unwrap();
+        let (pane, resize) = boundary
+            .resize_pixels(Axis::Horizontal, 400.0, 8.0)
+            .unwrap();
         assert_eq!(pane, tmuxctl::PaneId(2));
         assert_eq!(
             resize,
@@ -228,8 +254,16 @@ mod tests {
                 cells: 50
             }
         );
-        assert!(boundary.resize(Axis::Horizontal, 81.0 / 122.0).is_none());
-        assert!(boundary.resize(Axis::Vertical, f32::NAN).is_none());
+        assert!(
+            boundary
+                .resize_pixels(Axis::Horizontal, 320.0, 8.0)
+                .is_none()
+        );
+        assert!(
+            boundary
+                .resize_pixels(Axis::Vertical, 10.0, f32::NAN)
+                .is_none()
+        );
     }
 
     #[test]
