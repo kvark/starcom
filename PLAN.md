@@ -10,10 +10,11 @@ epoch and rebuilds models; session replacement and history truncation are
 reported. Loss during output, input, paste, and a remote layout change, plus a
 restarted tmux server, are covered by fixture tests.
 
-M4 now persists non-secret tabs and restores them without authenticating, and
-adds explicit session discovery and creation. Its other three items — connection
-reuse, ProxyJump, and certificate/MFA workflows — are blocked on Sunset 0.6 and
-are recorded below with what specifically blocks each. M5 is next.
+M4 now persists non-secret tabs and restores them without authenticating, adds
+explicit session discovery and creation, and connects through `ProxyJump`
+bastions. Its two remaining items — connection reuse and certificate/MFA
+workflows — are recorded below with what specifically blocks each: a design
+question for the first, and missing Sunset events for the second. M5 is next.
 
 Development targets `main` directly. CI runs for pull requests and updates to
 `main`. Routine milestone branches, generated recovery trees, and shadow copies
@@ -84,7 +85,7 @@ mode is the external frontend interface and works with the host's installed tmux
 | SSH | Embedded Sunset + RustCrypto; no libssh2/OpenSSL/ring/AWS-LC backend. |
 | Dependency risk | Owning the SSH stack means owning its advisories: `deny.toml` gates every change and runs weekly. |
 | Automatic retry | Transport loss only. Authentication, trust, missing-session, server-exit, and detach always stop. |
-| Advanced SSH escape hatch | Optional system-SSH transport remains a future option, alongside the `etc/sunset` patch. |
+| Advanced SSH escape hatch | Optional system-SSH transport remains a future option. `ProxyJump` no longer needs it. |
 | Third-party patches | Carried as a pinned fork plus the patch file it holds, with measured results. Never vendored, never unpinned. |
 | Saved state | Destinations and preferences only. Restoring a tab never authenticates. |
 | Session creation | Only from an explicit action. No failure path may create a session or a server. |
@@ -112,7 +113,10 @@ The following are correctness rules, not optional polish:
 - Remote resizing is opt-in because it changes the shared tmux layout. The server's
   resulting geometry is authoritative and triggers reconstruction.
 - Unsupported SSH routing, trust, or authentication directives are shown as
-  blockers; Starcom does not quietly connect with different semantics.
+  blockers; Starcom does not quietly connect with different semantics. A
+  `ProxyJump` is carried out rather than blocked, and on the config's terms: a
+  hop it cannot honour exactly blocks the chain instead of being approximated,
+  and no hop is ever trusted on another hop's behalf.
 - Persisted state is destinations and preferences, never credentials, host-key
   material, or terminal contents. Restoring a workspace opens forms, not sessions.
 - Session discovery uses `tmux -N` and cannot start a server. Starcom asks on its
@@ -150,7 +154,9 @@ terminal checkpoint.
   `IdentitiesOnly`, one `UserKnownHostsFile`, and OpenSSH's default
   `id_ed25519` / `id_ecdsa` / `id_rsa` when `IdentityFile` is omitted and no
   agent is reachable.
-- `Match`, jump/proxy routing, certificates, custom agents, and security-algorithm
+- `ProxyJump` chains of up to four hops, resolved through the config, with each
+  hop verified and authenticated on its own.
+- `Match`, `ProxyCommand`, certificates, custom agents, and security-algorithm
   overrides are reported as unsupported rather than ignored.
 
 ### Desktop
@@ -239,7 +245,7 @@ write, endless security retry, or phantom successful reconnection. Met for the
 tested configuration; each clause has a fixture test, and the reconnect test is
 verified to fail when automatic retry is disabled.
 
-### M4 — Multiple-machine operational fit: two items done, three blocked on the SSH backend
+### M4 — Multiple-machine operational fit: three items done, two remaining
 
 - [x] Persist non-secret tabs/profiles and restore them without auto-authentication.
 - [x] Add explicit session discovery/creation UI without changing attach semantics.
@@ -254,17 +260,17 @@ verified to fail when automatic retry is disabled.
   transport, and that is why it was deferred. Starcom leaves the feature off
   until the coupling question is answered; the channel count was never the
   blocker.
-- [ ] Add ProxyJump/bastion support or a system-SSH adapter for advanced configs.
-  The backend blocker is removed. `etc/sunset/` holds a 62-line change to Sunset
-  adding a client `direct-tcpip` open and a way to tell a refused open from a
-  slow one, and Starcom now builds against `kvark/sunset` pinned at that
-  revision, the way the GUI stack pins `kvark/blade`. It is validated against
-  real OpenSSH in the normal fixture run: a forward carries data both ways, and
-  both an unreachable destination and a server with `AllowTcpForwarding no` are
-  reported as refusals rather than as timeouts.
-  What remains is the larger half: running a second SSH session inside that
-  channel needs `ssh::Connection` to accept a transport other than a
-  `TcpStream`. Until that exists, `ProxyJump` stays reported as unsupported.
+- [x] Add ProxyJump/bastion support or a system-SSH adapter for advanced configs.
+  `ssh::Connection` now runs over either a `TcpStream` or the previous hop's
+  forwarding channel, so a bastion hop is an ordinary connection rather than a
+  special case: each hop verifies its own host key, authenticates for itself,
+  and gets its own deadline. Chains are bounded at four hops, a hop with hops of
+  its own is refused rather than traversed, and hops are resolved through the
+  config the way `ssh` resolves them. The fixture proves it against real
+  OpenSSH: one and two hops both land on the second sshd rather than the
+  bastion, tmux control mode survives the hop, and an untrusted destination
+  behind a trusted bastion fails as an unknown host key.
+  The system-SSH adapter stays a future escape hatch, not a substitute.
 - [ ] Improve certificate, hardware-key, custom-agent, and MFA workflows.
   Sunset 0.6's client emits no keyboard-interactive event and has no certificate
   path, so MFA and certificates cannot be driven from it at all. Hardware keys and
@@ -273,9 +279,10 @@ verified to fail when automatic retry is disabled.
 
 Gate: a user with several hosts can reopen yesterday's tabs, see what is running,
 and start what is missing, without Starcom authenticating or creating anything on
-its own. Met for persistence and discovery. The remaining three items are a
-milestone of their own; the forwarding blocker among them is now carried as a
-pinned fork, leaving the transport work rather than an open question.
+its own. Met for persistence, discovery, and reaching hosts behind a bastion. The
+two remaining items are not blocked on the same thing: connection reuse waits on
+a design decision about coupling, and MFA and certificates wait on events Sunset
+does not emit. Neither is work that can be started by deciding to.
 
 ### M5 — Performance and release hardening
 
@@ -294,20 +301,22 @@ pinned fork, leaving the transport work rather than an open question.
   packaging. GitHub Release binaries are built from the git pin.
 - [x] Unsigned GitHub Releases from `v*` tags: Linux tar.gz, AppImage, deb, and
   rpm; macOS aarch64 zip and DMG (ad-hoc codesign); Windows zip. App icon,
-  desktop entry, and window/PE resources are included.
+  desktop entry, and window/PE resources are included. Release notes are the
+  tag's section of `CHANGELOG.md`, and a tag without one fails the workflow
+  rather than publishing an empty release.
 - [ ] Package signed Linux, macOS, and Windows builds.
 
 ## Immediate work order
 
-1. Send `etc/sunset/*.patch` upstream, so the pinned fork can be dropped for a
-   published release.
-2. Give `ssh::Connection` a transport other than a `TcpStream`, which is what
-   `ProxyJump` needs on top of the forwarding channel that now exists.
-3. Begin M5 with the measurement harness, not with optimizations. There is still
-   no recorded startup time, idle CPU, per-pane memory, or input latency.
-4. Add native macOS/Windows close, clipboard, and input acceptance.
-5. Exercise reconnection on a real network path, not only a killed local client.
-6. Extend SSH configuration only where semantics can be tested end to end.
+1. Begin M5 with the measurement harness, not with optimizations. There is still
+   no recorded startup time, idle CPU, per-pane memory, or input latency, and
+   nothing else in M5 can be judged without them.
+2. Send `etc/sunset/*.patch` upstream, so the pinned fork can be dropped for a
+   published release. M5 has to leave git dependencies behind to package at all.
+3. Add native macOS/Windows close, clipboard, and input acceptance.
+4. Exercise reconnection on a real network path, not only a killed local client,
+   including a hop through a bastion.
+5. Extend SSH configuration only where semantics can be tested end to end.
 
 ## Validation policy
 

@@ -31,6 +31,10 @@ pub struct Profile {
     pub identity: Option<path::PathBuf>,
     pub known_hosts: Option<path::PathBuf>,
     pub identities_only: bool,
+    /// Jump hosts to traverse before this destination, in order, each already
+    /// resolved through the config so an alias hop carries its own HostName,
+    /// User, Port, identity, and known-hosts file. Empty is a direct connection.
+    pub jumps: Vec<Profile>,
     /// Retain these in the form and refuse to silently bypass them on Connect.
     pub unsupported: Vec<String>,
 }
@@ -98,6 +102,13 @@ impl Config {
     }
 
     pub fn resolve(&self, alias: &str) -> anyhow::Result<Profile> {
+        self.resolve_at(alias, 0)
+    }
+
+    /// `depth` is 0 for the destination and 1 for a hop reached through
+    /// `ProxyJump`. A hop that jumps again is reported rather than followed, so
+    /// the chain stays a flat list and cannot be built out of a cycle.
+    fn resolve_at(&self, alias: &str, depth: usize) -> anyhow::Result<Profile> {
         anyhow::ensure!(
             !alias.is_empty() && alias.len() <= 255 && !alias.chars().any(char::is_control),
             "invalid SSH host alias"
@@ -138,10 +149,28 @@ impl Config {
                 profile.known_hosts = Some(expand_path(value, &self.home, alias, &profile)?);
             }
         }
+        // ProxyJump is routing that Starcom can carry out exactly, so it is
+        // followed rather than refused. Everything about it that cannot be
+        // carried out exactly still lands in `unsupported`.
+        if let Some(value) = first("proxyjump")
+            && !value.eq_ignore_ascii_case("none")
+        {
+            if values["proxyjump"].len() != 1 {
+                profile
+                    .unsupported
+                    .push("ProxyJump with extra arguments".into());
+            } else if depth != 0 {
+                profile.unsupported.push("nested ProxyJump".into());
+            } else {
+                match self.jumps(value, depth) {
+                    Ok(jumps) => profile.jumps = jumps,
+                    Err(error) => profile.unsupported.push(format!("ProxyJump ({error})")),
+                }
+            }
+        }
         // These options change routing, authentication, or trust. Display them
         // as blockers rather than connecting directly or using another identity.
         for (name, neutral) in [
-            ("proxyjump", "none"),
             ("proxycommand", "none"),
             ("certificatefile", "none"),
             ("identityagent", "SSH_AUTH_SOCK"),
@@ -189,6 +218,101 @@ impl Config {
         }
         Ok(profile)
     }
+}
+
+impl Config {
+    /// Resolve a `ProxyJump` value into the hops it names, in traversal order.
+    ///
+    /// Each hop is resolved through the config, so a hop that is an alias gets
+    /// its own settings the way `ssh` would give them to it. An explicit user
+    /// or port in the `ProxyJump` value wins over the hop's own block, also as
+    /// in `ssh`. A hop whose profile is not fully supported fails the whole
+    /// chain: connecting to a bastion on different terms than its config asks
+    /// for is the silent substitution this reader exists to prevent.
+    fn jumps(&self, value: &str, depth: usize) -> anyhow::Result<Vec<Profile>> {
+        let specs: Vec<_> = value.split(',').collect();
+        anyhow::ensure!(
+            specs.len() <= crate::ssh::MAX_JUMPS,
+            "more than {} hops",
+            crate::ssh::MAX_JUMPS
+        );
+        let mut jumps = Vec::new();
+        for spec in specs {
+            let written = parse_hop(spec)?;
+            let mut hop = self.resolve_at(&written.host, depth + 1)?;
+            if written.user.is_some() {
+                hop.user = written.user;
+            }
+            if written.port.is_some() {
+                hop.port = written.port;
+            }
+            anyhow::ensure!(
+                hop.unsupported.is_empty(),
+                "hop {} uses unsupported policy: {}",
+                written.host,
+                hop.unsupported.join(", ")
+            );
+            jumps.push(hop);
+        }
+        Ok(jumps)
+    }
+}
+
+/// One hop exactly as written, before any config block is consulted.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Hop {
+    pub user: Option<String>,
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+/// Parse one hop: `[user@]host[:port]`, with an IPv6 literal in brackets.
+/// Anything else is refused rather than guessed at, because guessing wrong here
+/// means connecting somewhere the user did not name.
+pub fn parse_hop(spec: &str) -> anyhow::Result<Hop> {
+    let spec = spec.trim();
+    anyhow::ensure!(
+        !spec.is_empty() && spec.len() <= 320 && !spec.chars().any(char::is_control),
+        "invalid hop"
+    );
+    let (user, rest) = match spec.rsplit_once('@') {
+        Some((user, rest)) => {
+            anyhow::ensure!(!user.is_empty(), "empty hop user");
+            (Some(user.to_owned()), rest)
+        }
+        None => (None, spec),
+    };
+    let (host, port) = if let Some(rest) = rest.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']').context("unterminated IPv6 literal")?;
+        match tail {
+            "" => (host, None),
+            tail => (
+                host,
+                Some(tail.strip_prefix(':').context("expected a port")?),
+            ),
+        }
+    } else {
+        match rest.split_once(':') {
+            // A bare IPv6 literal has no way to tell a port from an address
+            // group. OpenSSH requires brackets there, and so does this.
+            Some((_, tail)) if tail.contains(':') => {
+                anyhow::bail!("bracket an IPv6 hop address")
+            }
+            Some((host, port)) => (host, Some(port)),
+            None => (rest, None),
+        }
+    };
+    anyhow::ensure!(!host.is_empty(), "empty hop host");
+    let port = port
+        .map(|port| port.parse::<u16>())
+        .transpose()
+        .context("invalid hop port")?;
+    anyhow::ensure!(port != Some(0), "invalid hop port");
+    Ok(Hop {
+        user,
+        host: host.to_owned(),
+        port,
+    })
 }
 
 fn evaluate(
@@ -586,13 +710,122 @@ mod tests {
 
     #[test]
     fn unsupported_routing_and_match_are_never_silently_bypassed() {
-        let config = config("Host remote\nProxyJump gateway\nHost local\nHostName 127.0.0.1");
-        assert_eq!(config.resolve("remote").unwrap().unsupported, ["proxyjump"]);
+        let config = config("Host remote\nProxyCommand nc %h %p\nHost local\nHostName 127.0.0.1");
+        assert_eq!(
+            config.resolve("remote").unwrap().unsupported,
+            ["proxycommand"]
+        );
         assert!(config.resolve("local").unwrap().unsupported.is_empty());
         let config = self::config(
             "Match exec \"touch /must-not-run\"\nUser altered\nHost safe\nHostName localhost",
         );
         assert!(!config.resolve("safe").unwrap().unsupported.is_empty());
+    }
+
+    /// A hop is a destination, so it is resolved through the config exactly as
+    /// the destination is. Getting this wrong means connecting to a bastion
+    /// under the wrong name, user, or trust store.
+    #[test]
+    fn proxy_jump_hops_are_resolved_through_the_config() {
+        let config = config(
+            "Host remote\nHostName 10.0.0.9\nProxyJump gateway\n\
+             Host gateway\nHostName bastion.example\nUser jump\nPort 2222",
+        );
+        let profile = config.resolve("remote").unwrap();
+        assert!(profile.unsupported.is_empty(), "{:?}", profile.unsupported);
+        assert_eq!(profile.host, "10.0.0.9");
+        assert_eq!(profile.jumps.len(), 1);
+        assert_eq!(profile.jumps[0].host, "bastion.example");
+        assert_eq!(profile.jumps[0].user.as_deref(), Some("jump"));
+        assert_eq!(profile.jumps[0].port, Some(2222));
+        assert!(profile.jumps[0].jumps.is_empty());
+    }
+
+    /// `ssh` lets the ProxyJump value override the hop's own block. Silently
+    /// preferring the block would connect as the wrong user.
+    #[test]
+    fn an_explicit_hop_user_and_port_win_over_the_hops_own_block() {
+        let config = config(
+            "Host remote\nProxyJump admin@gateway:2022\n\
+             Host gateway\nHostName bastion.example\nUser jump\nPort 2222",
+        );
+        let profile = config.resolve("remote").unwrap();
+        assert_eq!(profile.jumps[0].host, "bastion.example");
+        assert_eq!(profile.jumps[0].user.as_deref(), Some("admin"));
+        assert_eq!(profile.jumps[0].port, Some(2022));
+    }
+
+    /// Every way a chain could stop being a flat, fully understood list has to
+    /// end in `unsupported` rather than in a connection.
+    #[test]
+    fn a_chain_that_cannot_be_carried_out_exactly_is_refused() {
+        // A hop that jumps again is reported, not flattened: that is what keeps
+        // the chain from being built out of a cycle.
+        let config = config("Host a\nProxyJump b\nHost b\nProxyJump a");
+        let profile = config.resolve("a").unwrap();
+        assert!(profile.jumps.is_empty());
+        assert_eq!(profile.unsupported.len(), 1);
+        assert!(profile.unsupported[0].contains("nested ProxyJump"));
+
+        // A hop carrying policy this reader will not honour fails the chain
+        // rather than connecting to the bastion on different terms.
+        let config = self::config("Host a\nProxyJump b\nHost b\nProxyCommand nc %h %p");
+        let profile = config.resolve("a").unwrap();
+        assert!(profile.jumps.is_empty());
+        assert!(profile.unsupported[0].contains("proxycommand"));
+
+        // More hops than the traversal bound.
+        let config = self::config("Host a\nProxyJump b,c,d,e,f");
+        assert!(config.resolve("a").unwrap().unsupported[0].contains("hops"));
+
+        // `none` is how ssh spells "no jump", and must not become a host.
+        let config = self::config("Host a\nProxyJump none");
+        let profile = config.resolve("a").unwrap();
+        assert!(profile.jumps.is_empty() && profile.unsupported.is_empty());
+    }
+
+    #[test]
+    fn hop_specifications_are_parsed_or_refused_never_guessed() {
+        assert_eq!(
+            parse_hop("host").unwrap(),
+            Hop {
+                user: None,
+                host: "host".into(),
+                port: None
+            }
+        );
+        assert_eq!(
+            parse_hop(" user@host:22 ").unwrap(),
+            Hop {
+                user: Some("user".into()),
+                host: "host".into(),
+                port: Some(22)
+            }
+        );
+        assert_eq!(
+            parse_hop("[fe80::1]:2222").unwrap(),
+            Hop {
+                user: None,
+                host: "fe80::1".into(),
+                port: Some(2222)
+            }
+        );
+        assert_eq!(parse_hop("[fe80::1]").unwrap().host, "fe80::1");
+        for refused in [
+            "",
+            " ",
+            "@host",
+            "host:",
+            "host:0",
+            "host:99999",
+            "host:notaport",
+            // Unbracketed IPv6: there is no way to tell a port from a group.
+            "fe80::1",
+            "[fe80::1",
+            "[fe80::1]2222",
+        ] {
+            assert!(parse_hop(refused).is_err(), "accepted {refused:?}");
+        }
     }
 
     #[test]

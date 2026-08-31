@@ -13,6 +13,10 @@ mod trust;
 const MAX_QUEUED_STDOUT: usize = 1024 * 1024;
 const MAX_QUEUED_STDERR: usize = 64 * 1024;
 const DRIVE_BUDGET: usize = 512;
+/// A jump chain longer than this is refused rather than traversed. Every hop is
+/// a full SSH connection with its own key exchange and its own deadline, so the
+/// cost is real and an unbounded chain is a way to make a connect hang.
+pub(crate) const MAX_JUMPS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub enum Authentication {
@@ -29,6 +33,11 @@ pub struct Options {
     pub authentication: Authentication,
     /// Per-operation timeout. OS hostname resolution is not covered by this.
     pub timeout: time::Duration,
+    /// Jump hosts to traverse, in order, before reaching `host`. Empty is a
+    /// direct connection. Each hop verifies its own host key against its own
+    /// known-hosts file and authenticates with its own identity: a jump host is
+    /// never allowed to vouch for the next one.
+    pub jumps: Vec<Options>,
 }
 
 impl Options {
@@ -68,6 +77,24 @@ impl Options {
                 Kind::Configuration,
                 "an explicit known-hosts file is required",
             ));
+        }
+        if self.jumps.len() > MAX_JUMPS {
+            return Err(Error::new(
+                Kind::Configuration,
+                "too many jump hosts to traverse",
+            ));
+        }
+        for jump in &self.jumps {
+            jump.validate()?;
+            // The chain is one flat list, so it cannot be made to nest itself
+            // into a cycle. Config resolution refuses a nested ProxyJump for
+            // the same reason rather than flattening it silently.
+            if !jump.jumps.is_empty() {
+                return Err(Error::new(
+                    Kind::Configuration,
+                    "a jump host may not have jump hosts of its own",
+                ));
+            }
         }
         Ok(())
     }
@@ -145,9 +172,47 @@ pub fn agent_available() -> bool {
     agent::available()
 }
 
+/// What a connection's SSH stream runs over.
+///
+/// A jump host's forwarding channel is a byte stream with the same nonblocking
+/// contract as a socket, which is the whole of what `ProxyJump` needs. The hop
+/// below owns its own connection and, through it, the one real socket and the
+/// poller every hop in the chain waits on.
+enum Transport {
+    Tcp(net::TcpStream),
+    Forward(Box<Channel>),
+}
+
+impl Transport {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => io::Read::read(socket, buffer),
+            Self::Forward(channel) => io::Read::read(channel.as_mut(), buffer),
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => io::Write::write(socket, bytes),
+            Self::Forward(channel) => io::Write::write(channel.as_mut(), bytes),
+        }
+    }
+
+    /// Stop carrying data, in whichever way this transport can. Aborting a
+    /// forward walks down the chain to the socket underneath it.
+    fn shutdown(&mut self) {
+        match self {
+            Self::Tcp(socket) => {
+                let _ = socket.shutdown(net::Shutdown::Both);
+            }
+            Self::Forward(channel) => channel.abort(),
+        }
+    }
+}
+
 pub struct Connection {
     runner: sunset::Runner<'static, sunset::Client>,
-    socket: net::TcpStream,
+    transport: Transport,
     poller: sync::Arc<polling::Poller>,
     wake_pending: sync::Arc<sync::atomic::AtomicBool>,
     events: polling::Events,
@@ -168,7 +233,24 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Connect to `options.host`, traversing `options.jumps` first when there
+    /// are any. Every hop is an ordinary connection whose transport happens not
+    /// to be a socket, so nothing about trust or authentication is special-cased
+    /// for a bastion: each one verifies its own host key and authenticates for
+    /// itself, and the deadline is per hop.
     pub fn connect(options: &Options) -> Result<Self, Error> {
+        options.validate()?;
+        let Some((first, rest)) = options.jumps.split_first() else {
+            return Self::connect_direct(options);
+        };
+        let mut hop = Self::connect_direct(first)?;
+        for next in rest {
+            hop = Self::connect_through(hop.open_forward(&next.host, next.port)?, next)?;
+        }
+        Self::connect_through(hop.open_forward(&options.host, options.port)?, options)
+    }
+
+    fn connect_direct(options: &Options) -> Result<Self, Error> {
         options.validate()?;
         let trust = trust::Store::load(&options.known_hosts)?;
         // The OS resolver isn't cancellable through ToSocketAddrs. Connection
@@ -192,11 +274,49 @@ impl Connection {
         let poller = sync::Arc::new(polling::Poller::new().map_err(transport)?);
         // SAFETY: Connection owns this socket and deregisters it before drop.
         unsafe { poller.add(&socket, polling::Event::readable(0)) }.map_err(transport)?;
+        Self::establish(
+            Transport::Tcp(socket),
+            poller,
+            sync::Arc::new(sync::atomic::AtomicBool::new(false)),
+            options,
+            trust,
+            deadline,
+        )
+    }
+
+    /// Run a connection over an already-open forwarding channel from the hop
+    /// below. The poller and the wake flag are the ones that hop registered, so
+    /// waiting anywhere in the chain waits on the single real socket, and one
+    /// notification from the UI wakes all of it.
+    fn connect_through(carrier: Channel, options: &Options) -> Result<Self, Error> {
+        options.validate()?;
+        let trust = trust::Store::load(&options.known_hosts)?;
+        let deadline = time::Instant::now() + options.timeout;
+        let poller = sync::Arc::clone(&carrier.connection.poller);
+        let wake_pending = sync::Arc::clone(&carrier.connection.wake_pending);
+        Self::establish(
+            Transport::Forward(Box::new(carrier)),
+            poller,
+            wake_pending,
+            options,
+            trust,
+            deadline,
+        )
+    }
+
+    fn establish(
+        stream: Transport,
+        poller: sync::Arc<polling::Poller>,
+        wake_pending: sync::Arc<sync::atomic::AtomicBool>,
+        options: &Options,
+        trust: trust::Store,
+        deadline: time::Instant,
+    ) -> Result<Self, Error> {
         let mut connection = Self {
             runner: sunset::Runner::new_client_owned(),
-            socket,
+            transport: stream,
             poller,
-            wake_pending: sync::Arc::new(sync::atomic::AtomicBool::new(false)),
+            wake_pending,
             events: polling::Events::new(),
             options: options.clone(),
             trust,
@@ -434,7 +554,7 @@ impl Connection {
             if self.closed {
                 return Ok(true);
             }
-            progressed |= self.flush_socket()?;
+            progressed |= self.flush_output()?;
             progressed |= self.drain_channel()?;
             if self.runner.read_channel_ready().is_some() {
                 return Ok(any_progress || progressed);
@@ -442,7 +562,7 @@ impl Connection {
             if self.runner.is_input_ready() {
                 if self.incoming_offset == self.incoming.len() {
                     let mut buffer = [0; 16 * 1024];
-                    match io::Read::read(&mut self.socket, &mut buffer) {
+                    match self.transport.read(&mut buffer) {
                         Ok(0) => {
                             self.runner.close_input();
                             progressed = true;
@@ -508,14 +628,14 @@ impl Connection {
         Ok(count != 0)
     }
 
-    fn flush_socket(&mut self) -> Result<bool, Error> {
+    fn flush_output(&mut self) -> Result<bool, Error> {
         let bytes = self.runner.output_buf();
         if bytes.is_empty() {
             return Ok(false);
         }
-        match io::Write::write(&mut self.socket, bytes) {
+        match self.transport.write(bytes) {
             Ok(0) => Err(transport(
-                "SSH socket closed during write; delivery is uncertain",
+                "SSH transport closed during write; delivery is uncertain",
             )),
             Ok(count) => {
                 self.runner.consume_output(count);
@@ -533,9 +653,13 @@ impl Connection {
         } else {
             polling::Event::readable(0)
         };
-        self.poller
-            .modify(&self.socket, interest)
-            .map_err(transport)?;
+        let socket = match &mut self.transport {
+            Transport::Tcp(socket) => socket,
+            // There is nothing here to poll: the hop below owns the only real
+            // socket, so waiting means letting that hop advance and block.
+            Transport::Forward(channel) => return channel.wait(deadline),
+        };
+        self.poller.modify(&*socket, interest).map_err(transport)?;
         loop {
             self.events.clear();
             match self
@@ -566,8 +690,10 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let _ = self.poller.delete(&self.socket);
-        let _ = self.socket.shutdown(net::Shutdown::Both);
+        if let Transport::Tcp(socket) = &self.transport {
+            let _ = self.poller.delete(socket);
+        }
+        self.transport.shutdown();
     }
 }
 
@@ -613,7 +739,7 @@ impl Channel {
     }
     pub fn abort(&mut self) {
         self.connection.closed = true;
-        let _ = self.connection.socket.shutdown(net::Shutdown::Both);
+        self.connection.transport.shutdown();
     }
     fn read_stream(&mut self, bytes: &mut [u8], data: sunset::ChanData) -> io::Result<usize> {
         if bytes.is_empty() {
@@ -666,7 +792,7 @@ impl io::Write for Channel {
             .runner
             .write_channel(handle, sunset::ChanData::Normal, bytes)
             .map_err(|error| io::Error::other(protocol(error)))?;
-        self.connection.flush_socket().map_err(io::Error::other)?;
+        self.connection.flush_output().map_err(io::Error::other)?;
         if count == 0 {
             Err(io::ErrorKind::WouldBlock.into())
         } else {
@@ -778,6 +904,47 @@ fn transport(detail: impl fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn options() -> Options {
+        Options {
+            host: "example.invalid".to_owned(),
+            port: 22,
+            user: "someone".to_owned(),
+            known_hosts: path::PathBuf::from("known_hosts"),
+            authentication: Authentication::Agent,
+            timeout: time::Duration::from_secs(5),
+            jumps: Vec::new(),
+        }
+    }
+
+    /// A chain is checked before anything is dialled, because the failure it
+    /// prevents — an unbounded or self-referential route — is one that would
+    /// otherwise look like a hang rather than an error.
+    #[test]
+    fn a_jump_chain_is_bounded_and_flat() {
+        let mut direct = options();
+        assert!(direct.validate().is_ok());
+
+        direct.jumps = vec![options(); MAX_JUMPS];
+        assert!(direct.validate().is_ok());
+
+        direct.jumps = vec![options(); MAX_JUMPS + 1];
+        assert_eq!(direct.validate().unwrap_err().kind, Kind::Configuration);
+
+        // A hop with hops of its own could describe a cycle. Config resolution
+        // refuses to build one; this refuses to traverse one.
+        let mut nested = options();
+        nested.jumps = vec![options()];
+        direct.jumps = vec![nested];
+        assert_eq!(direct.validate().unwrap_err().kind, Kind::Configuration);
+
+        // A hop is validated as strictly as a destination.
+        let mut invalid = options();
+        invalid.port = 0;
+        direct.jumps = vec![invalid];
+        assert_eq!(direct.validate().unwrap_err().kind, Kind::Configuration);
+    }
+
     #[test]
     fn diagnostics_cannot_emit_terminal_controls() {
         let error = Error::new(Kind::Transport, "remote\x1b]52;c;payload\x07\n");

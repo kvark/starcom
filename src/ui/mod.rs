@@ -14,6 +14,23 @@ pub enum Authentication {
     Key,
 }
 
+/// One resolved jump host, in the order it is traversed. Everything here comes
+/// from the SSH config, not from the form: a bastion is routing policy, and the
+/// user does not get asked to retype it.
+#[derive(Clone, Debug)]
+struct Jump {
+    host: String,
+    user: String,
+    port: u16,
+    identity: Option<String>,
+    known_hosts: Option<String>,
+}
+
+/// The account `ssh` would use when nothing names one.
+fn local_user() -> String {
+    env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).unwrap_or_default()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
     Connection,
@@ -33,6 +50,8 @@ pub struct Form {
     history: usize,
     interactive: bool,
     reconnect: bool,
+    /// Jump hosts from the SSH config, traversed before `host`.
+    jumps: Vec<Jump>,
     unsupported: Vec<String>,
     profile_error: Option<String>,
 }
@@ -42,7 +61,7 @@ impl Default for Form {
         Self {
             destination: String::new(),
             host: String::new(),
-            user: env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).unwrap_or_default(),
+            user: local_user(),
             session: String::new(),
             port: 22,
             authentication: Authentication::Agent,
@@ -54,6 +73,7 @@ impl Default for Form {
             history: 200,
             interactive: true,
             reconnect: true,
+            jumps: Vec::new(),
             unsupported: Vec::new(),
             profile_error: None,
         }
@@ -104,6 +124,9 @@ impl Form {
             history: saved.history.min(snapshot::MAX_HISTORY_LINES),
             interactive: saved.interactive,
             reconnect: saved.reconnect,
+            // Filled in from the config by the caller: a saved tab records
+            // where the user chose to connect, never how it is routed there.
+            jumps: Vec::new(),
             unsupported: Vec::new(),
             profile_error: None,
         }
@@ -141,8 +164,29 @@ impl Form {
         if let Some(known_hosts) = profile.known_hosts {
             self.known_hosts = known_hosts.to_string_lossy().into_owned();
         }
-        self.unsupported = profile.unsupported;
+        self.apply_routing(profile.jumps, profile.unsupported);
         self.profile_error = None;
+    }
+
+    /// The part of a profile that says how the connection is routed and what
+    /// policy blocks it, separate from the endpoint and identity the user may
+    /// have edited. Restoring a tab takes this and nothing else.
+    fn apply_routing(&mut self, jumps: Vec<ssh_config::Profile>, unsupported: Vec<String>) {
+        self.jumps = jumps
+            .into_iter()
+            .map(|hop| Jump {
+                host: hop.host,
+                // A hop with no User of its own gets the local account, the way
+                // `ssh -J` does. It does not inherit the destination's user.
+                user: hop.user.unwrap_or_else(local_user),
+                port: hop.port.unwrap_or(22),
+                identity: hop.identity.map(|path| path.to_string_lossy().into_owned()),
+                known_hosts: hop
+                    .known_hosts
+                    .map(|path| path.to_string_lossy().into_owned()),
+            })
+            .collect();
+        self.unsupported = unsupported;
     }
 
     fn host_ready(&self) -> bool {
@@ -152,6 +196,16 @@ impl Form {
     /// Listing does not attach, so it does not need a session name.
     fn listing(&self) -> anyhow::Result<desktop::Connection> {
         self.connection_named("_")
+    }
+
+    /// The route, for the form to show. A bastion changes who sees the
+    /// connection, so it is never invisible on the screen that starts one.
+    fn route(&self) -> String {
+        self.jumps
+            .iter()
+            .map(|hop| format!("{}@{}:{}", hop.user, hop.host, hop.port))
+            .collect::<Vec<_>>()
+            .join(" → ")
     }
 
     fn connection(&self) -> anyhow::Result<desktop::Connection> {
@@ -185,13 +239,40 @@ impl Form {
                 ssh::Authentication::Identity(local_path(&self.identity)?)
             }
         };
+        let timeout = time::Duration::from_secs(30);
+        let known_hosts = local_path(&self.known_hosts)?;
+        let jumps = self
+            .jumps
+            .iter()
+            .map(|hop| {
+                Ok(ssh::Options {
+                    host: hop.host.trim().to_owned(),
+                    user: hop.user.trim().to_owned(),
+                    port: hop.port,
+                    // A hop with its own IdentityFile uses it. Otherwise it
+                    // authenticates the way the user chose here, which is the
+                    // only identity Starcom has been told about.
+                    authentication: match hop.identity {
+                        Some(ref path) => ssh::Authentication::Identity(local_path(path)?),
+                        None => authentication.clone(),
+                    },
+                    known_hosts: match hop.known_hosts {
+                        Some(ref path) => local_path(path)?,
+                        None => known_hosts.clone(),
+                    },
+                    timeout,
+                    jumps: Vec::new(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let options = ssh::Options {
             host: self.host.trim().to_owned(),
             user: self.user.trim().to_owned(),
             port: self.port,
             authentication,
-            known_hosts: local_path(&self.known_hosts)?,
-            timeout: time::Duration::from_secs(30),
+            known_hosts,
+            timeout,
+            jumps,
         };
         options.validate()?;
         Ok(desktop::Connection {
@@ -328,6 +409,16 @@ impl DesktopUi {
         // so the form does not fire SSH on first paint.
         self.listed_destination = self.form.destination().to_owned();
         self.auto_list = false;
+        // The saved tab holds what the user chose to connect to. How the
+        // connection is routed and what policy blocks it are the config's to
+        // say, and are re-read rather than restored: a saved tab must not be a
+        // way to reach a host on terms the config no longer allows, or to skip
+        // a bastion that has since been added.
+        if !self.profile_source.is_empty()
+            && let Ok(profile) = self.config.resolve(&self.profile_source)
+        {
+            self.form.apply_routing(profile.jumps, profile.unsupported);
+        }
         self.screen = Screen::Connection;
     }
 
@@ -354,6 +445,7 @@ impl DesktopUi {
         let destination = self.form.destination().to_owned();
         self.profile_source = destination.clone();
         self.form.unsupported.clear();
+        self.form.jumps.clear();
         self.form.profile_error = None;
         if destination.is_empty() {
             self.form.host.clear();
@@ -529,6 +621,14 @@ impl DesktopUi {
                             "{}@{}:{}",
                             self.form.user, self.form.host, self.form.port
                         ));
+                    }
+                    if !self.form.jumps.is_empty() {
+                        ui.weak(format!("Via jump host: {}", self.form.route()))
+                            .on_hover_text(
+                                "From ProxyJump in your SSH config. Each hop verifies its \
+                                 own host key and authenticates separately; a jump host \
+                                 never vouches for the next one.",
+                            );
                     }
 
                     ui.add_space(12.0);

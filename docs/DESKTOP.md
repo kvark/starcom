@@ -56,13 +56,21 @@ Currently supported:
 - one `IdentityFile` and `IdentitiesOnly`, or else `~/.ssh/id_ed25519` /
   `id_ecdsa` / `id_rsa` when those default files exist;
 - one `UserKnownHostsFile`;
+- `ProxyJump`, including a hop written as `user@host:port`;
 - bounded `Include` files and `*`/`?` include globs.
 
 Wildcard `Host` entries apply defaults but are not shown as literal suggestions.
-The parser never executes configuration commands. `Match`, `ProxyJump`,
-`ProxyCommand`, certificates, custom agents, multiple identity files, algorithm
-overrides, and other routing/security policy are displayed as blockers. Starcom
-does not silently bypass them by connecting directly or choosing another key.
+The parser never executes configuration commands. `Match`, `ProxyCommand`,
+certificates, custom agents, multiple identity files, algorithm overrides, and
+other routing/security policy are displayed as blockers. Starcom does not
+silently bypass them by connecting directly or choosing another key.
+
+A profile with a `ProxyJump` shows its route under the resolved endpoint, so a
+bastion is never invisible on the screen that starts the connection. A restored
+tab re-reads the route and the blockers from the config rather than restoring
+them: a saved tab records where you chose to connect, and must not become a way
+to skip a bastion that has since been added, or to reach a host on terms the
+config no longer allows. See [SSH.md](SSH.md) for how each hop is trusted.
 
 Use **Reload config** after editing the file. Unknown or changed host keys fail
 instead of being accepted automatically. See [SSH.md](SSH.md) for the exact trust
