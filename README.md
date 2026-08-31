@@ -6,11 +6,20 @@ A small native client for persistent remote tmux sessions. Linux, macOS, and
 Windows clients; Linux hosts with stock SSH and tmux. No remote Starcom service.
 Built with Rust, Blade, egui, and Alacritty's terminal core.
 
-![Starcom desktop showing two terminal panes](etc/screenshot.png)
+![Starcom desktop attached to a remote tmux session](etc/screenshot.png)
 
-*Application-rendered demo data, not a remote session.*
+## Install
+
+```sh
+cargo install --locked --git https://github.com/kvark/starcom
+```
+
+That builds the desktop client. Run `starcom` or `starcom --demo`. A recent stable
+Rust is required (`rust-version` is 1.96).
 
 ## Run
+
+From a checkout:
 
 ```sh
 cargo run --release --locked
