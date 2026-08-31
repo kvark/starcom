@@ -42,7 +42,8 @@ impl Runtime {
         let mut attributes = winit::window::Window::default_attributes()
             .with_title("Starcom")
             .with_inner_size(winit::dpi::LogicalSize::new(INITIAL_SIZE.0, INITIAL_SIZE.1))
-            .with_min_inner_size(winit::dpi::LogicalSize::new(640, 400));
+            .with_min_inner_size(winit::dpi::LogicalSize::new(640, 400))
+            .with_window_icon(app_icon());
         #[cfg(target_os = "linux")]
         {
             use winit::platform::{
@@ -398,6 +399,18 @@ impl winit::application::ApplicationHandler<Event> for App {
     }
 }
 
+fn app_icon() -> Option<winit::window::Icon> {
+    const PNG: &[u8] = include_bytes!("../etc/macos/icon.png");
+    let mut reader = png::Decoder::new(io::Cursor::new(PNG)).read_info().ok()?;
+    let mut pixels = vec![0_u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    pixels.truncate(info.buffer_size());
+    winit::window::Icon::from_rgba(pixels, info.width, info.height).ok()
+}
+
 pub(crate) fn configure(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::dark());
     let mut style = (*ctx.global_style()).clone();
@@ -616,4 +629,12 @@ pub fn save_snapshot(
     painter.destroy(&context);
     context.destroy_command_encoder(&mut encoder);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn app_icon_decodes_as_rgba() {
+        assert!(super::app_icon().is_some());
+    }
 }

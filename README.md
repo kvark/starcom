@@ -10,12 +10,47 @@ Built with Rust, Blade, egui, and Alacritty's terminal core.
 
 ## Install
 
+Prebuilt binaries are attached to each [GitHub Release](https://github.com/kvark/starcom/releases)
+on `v*` tags. Linux and Windows builds are unsigned; macOS builds are ad-hoc
+codesigned, not notarized.
+
+| Platform | Artifact |
+| --- | --- |
+| Linux x86_64 | `.tar.gz`, `.AppImage`, `.deb`, `.rpm` |
+| macOS Apple Silicon | `.zip` app bundle, `.dmg` (ad-hoc signed) |
+| Windows x86_64 | `.zip` |
+
+From source:
+
 ```sh
 cargo install --locked --git https://github.com/kvark/starcom
 ```
 
 That builds the desktop client. Run `starcom` or `starcom --demo`. A recent stable
 Rust is required (`rust-version` is 1.96).
+
+The crates.io `starcom` crate is a name reservation and is not a working install.
+
+## Linux desktop integration
+
+Install the binary, desktop entry, and icon to `~/.local` (the standard per-user
+prefix):
+
+```sh
+make install
+```
+
+To install system-wide instead:
+
+```sh
+sudo make install PREFIX=/usr
+```
+
+To remove:
+
+```sh
+make uninstall
+```
 
 ## Run
 

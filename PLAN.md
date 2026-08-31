@@ -290,7 +290,11 @@ pinned fork, leaving the transport work rather than an open question.
   with no fixed version published. Either reach a fixed release or ship without
   the `rsa` feature; `deny.toml` records the accepted exposure until then.
 - [ ] Replace the pinned `blade` git revision with published crates. Git
-  dependencies cannot be published to crates.io, so this blocks packaging.
+  dependencies cannot be published to crates.io, so this blocks crates.io
+  packaging. GitHub Release binaries are built from the git pin.
+- [x] Unsigned GitHub Releases from `v*` tags: Linux tar.gz, AppImage, deb, and
+  rpm; macOS aarch64 zip and DMG (ad-hoc codesign); Windows zip. App icon,
+  desktop entry, and window/PE resources are included.
 - [ ] Package signed Linux, macOS, and Windows builds.
 
 ## Immediate work order

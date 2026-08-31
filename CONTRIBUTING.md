@@ -23,7 +23,8 @@ Start with one Rust 2024 package, a small binary, and a reusable library. Split
 modules rather than introducing multiple crates prematurely. Proposed modules
 are listed in PLAN.md; create them when implemented, not as empty placeholders.
 Use `tests/data/` for small synthetic fixtures, `scripts/` for development tools,
-and `etc/` for desktop metadata, replay screenshots, and patches to dependencies.
+and `etc/` for desktop metadata (entry, SVG, PNG, ICO), replay screenshots, and
+patches to dependencies. Icon rasters come from `scripts/generate-icons.py`.
 
 Use FileMan's Blade/egui/winit versions together when introducing the GUI.
 Do not copy image/archive/SFTP dependencies that Starcom does not use. Do not add

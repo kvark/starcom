@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: windows-latest
+          - os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+
+      # --- Linux ---
+      - name: Install packaging tools (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle --rev 17cc8eb --locked
+          cargo install cargo-deb cargo-generate-rpm
+
+      - name: Build + bundle (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo bundle --release --bin starcom
+
+      - name: Package tarball (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf dist/starcom-linux-x86_64.tar.gz starcom
+
+      - name: Package AppImage (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p dist
+          cp target/release/bundle/appimage/starcom_*_x86_64.AppImage dist/starcom-linux-x86_64.AppImage
+
+      - name: Package deb + rpm (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo deb --no-build
+          cp target/debian/*.deb dist/
+          cargo generate-rpm
+          cp target/generate-rpm/*.rpm dist/
+
+      # --- macOS ---
+      - name: Build (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle --rev 17cc8eb --locked
+          rustup target add aarch64-apple-darwin
+          cargo bundle --release --target aarch64-apple-darwin --bin starcom
+
+      - name: Package (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          mkdir -p dist
+          APP=target/aarch64-apple-darwin/release/bundle/osx/Starcom.app
+          codesign --sign - --deep --force "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" dist/starcom-macos-aarch64.zip
+          mkdir -p dmg_staging
+          cp -R "$APP" dmg_staging/
+          ln -s /Applications dmg_staging/Applications
+          hdiutil create -volname Starcom -srcfolder dmg_staging -ov -format UDZO dist/starcom-macos-aarch64.dmg
+
+      # --- Windows ---
+      - name: Build (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: cargo build --release --locked --bin starcom
+
+      - name: Package zip (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/starcom.exe -DestinationPath dist/starcom-windows-x86_64.zip
+
+      # --- Upload ---
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

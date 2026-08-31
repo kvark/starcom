@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Starcom
+Comment=Session Terminal And Remote COMmander
+Exec=starcom
+Icon=starcom
+Categories=Network;System;TerminalEmulator;
+Keywords=terminal;tmux;ssh;remote;
+Terminal=false
+StartupWMClass=starcom
