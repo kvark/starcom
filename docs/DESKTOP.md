@@ -5,8 +5,8 @@ existing tmux session, reconstructs each pane into an Alacritty terminal model,
 and presents tmux windows and panes through Blade/egui.
 
 The implementation is usable enough for focused testing, but it is not yet a
-finished terminal: application mouse reporting, broad TUI compatibility, and
-native macOS/Windows interaction acceptance remain open.
+finished terminal: full application mouse (beyond wheel), broad TUI
+compatibility, and native macOS/Windows interaction acceptance remain open.
 
 ## Start
 
@@ -26,9 +26,14 @@ a connection tab. A new tab displays its connection form—not panes from anothe
 session and not a sidebar beside existing panes.
 
 After a successful connection, the terminal workspace replaces the form in that
-tab. **Connection settings** returns to the form without moving it into another
-tab. Closing a tab detaches that Starcom client; the tmux server and remote jobs
-continue running. Ctrl-Shift-W/Cmd-W closes the active tab.
+tab. A failed first attach stays on the form and shows why — the toolbar phrase
+"Connection failed" is not the whole message. **Exit** always returns to the form
+in the same tab, including after a failed attach. Ctrl-Shift-W/Cmd-W closes the
+tab and detaches that Starcom client; the tmux server and remote jobs continue
+running.
+
+A Starcom tab is one tmux session and shows one window of that session. A
+window picker is not in this increment.
 
 Each tab currently opens its own SSH connection. Reusing a host connection across
 multiple session tabs is deferred until it can be done without coupling failures
@@ -36,15 +41,20 @@ or authentication state between tabs.
 
 ## SSH configuration
 
-The host field suggests literal `Host` aliases discovered from `~/.ssh/config`.
-Typing filters the suggestions; selecting one resolves the supported profile
-settings into the form.
+The form's main choice is the host. Literal `Host` aliases from `~/.ssh/config`
+are listed for one-click selection; the field after those buttons accepts a
+hostname, address, or alias that is not in that list. Selecting a known host
+resolves the supported
+profile and lists that host's tmux sessions, selecting the first so **Connect**
+is available immediately. Restored tabs do not list or authenticate on their
+own.
 
 Currently supported:
 
 - `Host` patterns and negation, with OpenSSH-style first-value-wins ordering;
 - `HostName`, `User`, and `Port`;
-- one `IdentityFile` and `IdentitiesOnly`;
+- one `IdentityFile` and `IdentitiesOnly`, or else `~/.ssh/id_ed25519` /
+  `id_ecdsa` / `id_rsa` when those default files exist;
 - one `UserKnownHostsFile`;
 - bounded `Include` files and `*`/`?` include globs.
 
@@ -65,8 +75,8 @@ on Windows, or `$XDG_CONFIG_HOME` where it is set) and reopened next time.
 
 What is saved is where a tab points and how it should connect: destination alias,
 host, user, port, session name, tmux socket, history depth, whether it is
-interactive, whether it reconnects, and whether it uses the agent or an identity
-file. Nothing that would let a reader of that file connect is written: no keys,
+interactive, whether it reconnects, whether it uses the agent or an identity
+file, and the global redraw cap (`fps`). Nothing that would let a reader of that file connect is written: no keys,
 no passphrases, no host-key material, and no terminal contents. An identity entry
 is the path you already chose, never the key behind it.
 
@@ -79,16 +89,16 @@ The demo neither reads nor writes this file.
 
 ## Finding and creating sessions
 
-**List sessions** asks the host what exists. It runs `tmux -N`, so asking can
-never bring a tmux server into existence: a host with no tmux running says so.
-Choosing a listed session fills the session field; it does not attach.
+Selecting a known host lists its sessions automatically. **Refresh** asks again.
+The query runs `tmux -N`, so it can never bring a tmux server into existence: a
+host with no tmux running says so. The first session is selected; choosing
+another only fills the field, and double-clicking attaches.
 
-Starcom also asks on its own in one case: when a connection fails because that
-session does not exist. You have already asked to connect and already
-authenticated, and the list is exactly the missing information, so it appears
-without a second button press. No other failure triggers it — authentication and
-host-key failures could not list anyway, and the others already say what
-happened. Listing is never a step on the way to attaching.
+Starcom also asks on its own when a connection fails because that session does
+not exist. You have already asked to connect and already authenticated, and the
+list is exactly the missing information. No other failure triggers it —
+authentication and host-key failures could not list anyway, and the others
+already say what happened.
 
 **Create session** makes the named session on the host, after a confirmation that
 says plainly that this starts a tmux server if none is running. It is the only
@@ -105,11 +115,15 @@ blocks the window or disturbs a live attachment.
 Enable **Allow terminal input** before connecting for an interactive attachment.
 A read-only attachment remains available for inspection.
 
-If **SSH agent** is selected and no agent is reachable, the form says so before
-you connect. A desktop session often does not inherit `SSH_AUTH_SOCK` from a
-shell, so an agent that works in your terminal may be invisible here; start an
-agent in the session that launches Starcom, or choose a key file. The warning
-clears on its own once an agent appears; there is no need to restart Starcom.
+Selecting a Host alias that has no `IdentityFile` uses **SSH agent** when one is
+reachable. If none is, Starcom fills **Key file** from the first existing default
+identity (`~/.ssh/id_ed25519`, then `id_ecdsa`, then `id_rsa`) — the same files
+`ssh` would offer without an agent. If **SSH agent** stays selected and no agent
+is reachable, the form says so before you connect. A desktop session often does
+not inherit `SSH_AUTH_SOCK` from a shell, so an agent that works in your terminal
+may be invisible here; start an agent in the session that launches Starcom, or
+choose a key file. The warning clears on its own once an agent appears; there is
+no need to restart Starcom.
 
 Click a pane to focus it. Text and committed IME input are encoded as UTF-8.
 Enter, arrows, Home/End, Page Up/Down, Insert/Delete, Tab, Escape, Backspace, and
@@ -139,28 +153,54 @@ rather than changing the user's option or risking broadcast.
 
 ## Scrolling, selection, and copying
 
-Wheel scrolling examines local terminal history. Drag to select, double-click for
-a word, and triple-click for a line. Selection anchors live in the terminal model,
-so they follow incoming scrolls. Copying handles wide cells, combining characters,
-and soft wraps, with a 1 MiB output limit.
+Wheel handling follows the pane, not a global shortcut. If the application
+enabled mouse reporting (DEC 1000/1002/1003), the wheel is sent as a mouse
+report at the hovered cell. If it is on the alternate screen without mouse
+reporting, the wheel becomes Up/Down, matching xterm alternate-scroll. Otherwise
+the wheel examines local terminal history.
 
-The renderer paints only visible history rows. Font-size controls affect local
-presentation and do not resize the remote terminal.
+Drag to select, double-click for a word, and triple-click for a line. Selection
+anchors live in the terminal model, so they follow incoming scrolls. Copying
+handles wide cells, combining characters, and soft wraps, with a 1 MiB output
+limit. Full application mouse (clicks and drags forwarded to the program) is
+not implemented yet; local selection still wins those.
 
-Application mouse reporting is not implemented yet. Local selection and scrolling
-therefore remain the only mouse behavior; a future implementation must provide an
-obvious override rather than trapping the user in application mouse mode.
+The renderer paints only visible history rows. Font-size controls change the
+cell metrics used both to paint and to tell tmux this client's size, so the
+remote grid matches the glyphs on screen.
+
+The status bar's bottom-left spinner ticks on each workspace repaint, the same
+liveness mark FileMan uses. Next to it, when a recent small tmux command has
+finished, its round-trip time is shown. That is not a probe: nothing extra is
+sent to measure it.
+
+Remote pane output is redrawn at most 5 times per second by default (the **fps**
+control on the tab bar, saved in `workspace.conf`). Buttons, hover, typing, and
+other local UI stay immediate.
+
+## Pane controls
+
+Each interactive pane has window-style buttons in its top-right corner:
+
+- **│** split right (`split-window -h`)
+- **─** split below (`split-window -v`)
+- **□** maximize / restore (`resize-pane -Z`)
+- **×** close the pane (`kill-pane`), hidden when it is the last pane in the
+  window
+
+Click a pane to focus it (`select-pane`). These are the same tmux operations an
+ordinary client would use, so other attached clients see them.
 
 ## Pane dividers
 
-Dragging a divider always changes the local allocation while the pointer moves.
-By default, this does **not** change tmux geometry.
+Dragging a divider previews the split locally. On release, an interactive
+connection sends `resize-pane` to tmux — the same shared layout change a normal
+tmux client would make — then reconstructs from the server's geometry. Cells
+stay at the real font size; they are not scaled. Uncheck **Resize remote panes**
+if this attachment must not change the layout others are using.
 
-For an interactive, synchronized session, enable **Resize remote panes** to opt in.
-On release, Starcom submits a guarded one-axis `resize-pane`, invalidates the old
-models, and reconstructs from the server's resulting layout. Other attached tmux
-clients see this shared change. Nested or unusual layouts that cannot be mapped to
-a safe tmux boundary remain local-only.
+Nested or unusual layouts that cannot be mapped to a safe tmux boundary stay
+local-only.
 
 Starcom never changes tmux's global sizing options. Zoomed windows, stale geometry,
 panes in modes, dead/input-disabled panes, and changed session/window identities
@@ -168,8 +208,9 @@ block the resize transaction.
 
 ## Disconnect and exit behavior
 
-Disconnecting preserves the last received view for reading and copying, marks it
-stale, and disables input.
+**Exit** preserves the last received view for reading and copying, marks it
+stale, and disables input. It is available in every connection phase, including
+**Connection failed**.
 
 **Reconnect automatically after connection loss** is on by default in the
 connection form. Only transport loss is retried. Authentication failures, host-key

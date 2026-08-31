@@ -89,6 +89,14 @@ impl Config {
         &self.aliases
     }
 
+    /// The first existing OpenSSH default identity Starcom can sign.
+    ///
+    /// OpenSSH offers every default file plus agent keys. Starcom's form holds
+    /// one file, so this prefers Ed25519 over leftover RSA/ECDSA files.
+    pub fn default_identity(&self) -> Option<path::PathBuf> {
+        first_default_identity(&self.home)
+    }
+
     pub fn resolve(&self, alias: &str) -> anyhow::Result<Profile> {
         anyhow::ensure!(
             !alias.is_empty() && alias.len() <= 255 && !alias.chars().any(char::is_control),
@@ -158,6 +166,7 @@ impl Config {
         }
         if first("identitiesonly").is_some_and(|value| value.eq_ignore_ascii_case("yes"))
             && profile.identity.is_none()
+            && self.default_identity().is_none()
         {
             profile
                 .unsupported
@@ -313,6 +322,17 @@ fn words(line: &str) -> anyhow::Result<Vec<String>> {
         words.push(word);
     }
     Ok(words)
+}
+
+/// Names OpenSSH would try with no IdentityFile, among algorithms Starcom signs.
+/// Hardware-backed `*_sk`, DSA, and XMSS keys are omitted: they are unsupported.
+const DEFAULT_IDENTITY_FILES: [&str; 3] = ["id_ed25519", "id_ecdsa", "id_rsa"];
+
+fn first_default_identity(home: &path::Path) -> Option<path::PathBuf> {
+    DEFAULT_IDENTITY_FILES.iter().find_map(|name| {
+        let path = home.join(".ssh").join(name);
+        path.is_file().then_some(path)
+    })
 }
 
 fn expand_path(
@@ -635,5 +655,54 @@ mod tests {
         );
         fs::write(root.join(".ssh/conf.d/a"), "Include config\n").unwrap();
         assert!(Config::load(&root).is_err());
+    }
+
+    #[test]
+    fn omitted_identityfile_selects_ed25519_over_a_leftover_rsa_file() {
+        let root = std::env::temp_dir().join(format!(
+            "starcom-identity-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        fs::create_dir_all(root.join(".ssh")).unwrap();
+        fs::write(
+            root.join(".ssh/config"),
+            "Host zork\nHostName zork.example\n",
+        )
+        .unwrap();
+        fs::write(root.join(".ssh/id_rsa"), "rsa").unwrap();
+        fs::write(root.join(".ssh/id_ed25519"), "ed25519").unwrap();
+        let config = Config::load(&root).unwrap();
+        assert_eq!(
+            config.default_identity(),
+            Some(root.join(".ssh/id_ed25519"))
+        );
+        let profile = config.resolve("zork").unwrap();
+        assert!(profile.identity.is_none());
+        assert!(profile.unsupported.is_empty());
+        fs::write(root.join(".ssh/config"), "Host zork\nIdentitiesOnly yes\n").unwrap();
+        let config = Config::load(&root).unwrap();
+        assert!(config.resolve("zork").unwrap().unsupported.is_empty());
+        fs::remove_file(root.join(".ssh/id_ed25519")).unwrap();
+        fs::remove_file(root.join(".ssh/id_rsa")).unwrap();
+        assert!(config.default_identity().is_none());
+        assert_eq!(
+            Config::load(&root)
+                .unwrap()
+                .resolve("zork")
+                .unwrap()
+                .unsupported,
+            ["IdentitiesOnly without an explicit IdentityFile"]
+        );
     }
 }

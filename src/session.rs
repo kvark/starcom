@@ -106,7 +106,7 @@ impl Session {
                         "tmux blocked input: pane changed, is in a mode, or synchronize-panes is enabled"
                     );
                 }
-                if matches!(action, input::Action::Resize(_)) {
+                if action.changes_layout() {
                     self.view.invalidate();
                 }
                 Ok(())
@@ -177,6 +177,9 @@ pub(crate) fn validate_action(
         .get(&pane)
         .ok_or_else(|| anyhow::anyhow!("pane is no longer in this session"))?;
     action.validate()?;
+    if let input::Action::ClientSize(_) = *action {
+        return Ok(());
+    }
     if let input::Action::Resize(resize) = *action {
         let size = pane.state.size;
         match resize.axis {

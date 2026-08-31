@@ -27,6 +27,13 @@ impl Size {
     pub fn rows(self) -> usize {
         self.rows
     }
+
+    /// tmux reports x == width when a wrap is pending. Saved alternate-screen
+    /// coordinates are not updated on resize, so they can sit past the current
+    /// pane; clamp rather than failing the snapshot.
+    pub fn clamp_cursor(self, column: usize, row: usize) -> (usize, usize) {
+        (column.min(self.columns()), row.min(self.rows() - 1))
+    }
 }
 
 impl Default for Size {
@@ -84,6 +91,8 @@ mod tests {
         assert!(Size::new(usize::MAX, 2).is_err());
         assert!(Size::new(4096, 4096).is_err());
         assert_eq!(Size::new(80, 24).unwrap(), Size::default());
+        assert_eq!(Size::default().clamp_cursor(80, 23), (80, 23));
+        assert_eq!(Size::default().clamp_cursor(120, 40), (80, 23));
     }
 
     #[test]

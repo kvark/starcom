@@ -12,7 +12,8 @@ never appended to the models of a lost attachment.
 ## Capture boundary
 
 1. Attach using the existing verified SSH transport and stock `tmux -N -C`.
-   Keep `read-only,ignore-size,no-output` and `attach-session -E`.
+   Keep `attach-session -E` with `no-output`. Read-only adds `read-only,ignore-size`;
+   interactive omits `ignore-size` and later reports `refresh-client -C`.
 2. Set `no-output` on this client and consume the reply, draining earlier output.
 3. Discover pane IDs. Reject aliases overriding snapshot commands and configured
    after-capture/display/list/refresh hooks at global, session, window, and pane
@@ -47,7 +48,9 @@ mutation or unsupported hook behavior.
 The primary and active alternate screens, bounded scrollback, visible cell
 attributes, cursor position (including pending wrap), alternate-screen saved
 cursor, scroll region, tab stops, exported keyboard/mouse modes, and pending
-terminal bytes are reconstructed. `capture-pane -J` preserves soft-wrap joining.
+terminal bytes are reconstructed. tmux does not resize the saved primary-screen
+cursor when a pane on the alternate screen shrinks, so those coordinates are
+clamped to the current pane rather than failing the snapshot. `capture-pane -J` preserves soft-wrap joining.
 When tmux does not export `bracket_paste_flag` (as in the tested 3.4 build), its
 value remains explicitly unknown in the snapshot metadata rather than guessed.
 

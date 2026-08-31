@@ -147,18 +147,26 @@ terminal checkpoint.
 - GUI discovery of literal `Host` aliases from `~/.ssh/config`, including bounded
   `Include` expansion and wildcard defaults.
 - Supported resolution: `Host`, `HostName`, `User`, `Port`, one `IdentityFile`,
-  `IdentitiesOnly`, and one `UserKnownHostsFile`.
+  `IdentitiesOnly`, one `UserKnownHostsFile`, and OpenSSH's default
+  `id_ed25519` / `id_ecdsa` / `id_rsa` when `IdentityFile` is omitted and no
+  agent is reachable.
 - `Match`, jump/proxy routing, certificates, custom agents, and security-algorithm
   overrides are reported as unsupported rather than ignored.
 
 ### Desktop
 
 - Independent connection tabs; `+` opens a new connection form.
-- Per-session tmux-window tabs and pane layouts.
+- Host-first connection: known `Host` aliases, automatic session listing, first
+  session selected, Connect without a separate list step.
+- One Starcom tab is one tmux session and shows one window of that session.
+  A window picker is deferred.
+- Interactive clients report `refresh-client -C` from GUI font metrics so
+  tmux cell counts match the painted pane; divider drags send `resize-pane`.
 - Local scrollback, selection, word/line selection, copying, and font sizing.
 - Interactive UTF-8/IME commits, conventional special keys, terminal Ctrl keys,
   clipboard paste, and multiline-paste confirmation.
-- Local divider dragging and explicit opt-in shared tmux pane resizing.
+- Divider dragging that resizes tmux on release, with an opt-out for
+  attachments that must not change the shared layout.
 - Event-driven redraw and a worker thread that does no network I/O under the UI
   model lock.
 - Automatic reconnection after transport loss: classification, cancellable
@@ -195,7 +203,9 @@ terminal checkpoint.
 - [x] Blade/egui/winit desktop with event-driven redraw.
 - [x] Connection tabs whose form and terminal workspace replace one another.
 - [x] SSH-config alias suggestions and fail-closed profile resolution.
-- [x] Local scrollback, selection, copy, window tabs, and pane layouts.
+- [x] Local scrollback, selection, copy, and pane layouts.
+- [x] Wheel to the application when it reports mouse or is on the alternate screen;
+  pane split/zoom/kill chrome.
 - [x] Guarded keyboard input and paste; no stale/offline replay.
 - [x] Opt-in remote divider resizing followed by server-authoritative resync.
 - [x] Native Linux/X11 render, clipboard, resize, and clean-close smoke test.

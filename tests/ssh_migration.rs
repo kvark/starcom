@@ -97,7 +97,7 @@ fn desktop_worker_publishes_live_view_and_rejects_cancelled_requests() {
         desktop::Phase::Demo,
         "stale connection replaced demo"
     );
-    client.with_view(|view| assert_eq!(view.unwrap().panes().len(), 3));
+    client.with_view(|view| assert_eq!(view.unwrap().panes().len(), 2));
 }
 
 #[cfg(feature = "gui")]

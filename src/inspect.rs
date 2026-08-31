@@ -73,6 +73,8 @@ pub struct Inspector {
     /// session means the attach never happened, which is a different failure
     /// from a session that ended later.
     answered: bool,
+    /// Round-trip of the last small control command. Not a probe.
+    pub last_rtt: Option<time::Duration>,
 }
 
 impl Inspector {
@@ -102,6 +104,7 @@ impl Inspector {
             input_buffer_prefix: None,
             input_sequence: 0,
             answered: false,
+            last_rtt: None,
         })
     }
 
@@ -184,6 +187,13 @@ impl Inspector {
         Ok(batch.replies.remove(0))
     }
 
+    /// Tell tmux this client's cell size so pane widths match the GUI font.
+    #[cfg(feature = "gui")]
+    pub(crate) fn set_client_size(&mut self, size: core::Size) -> anyhow::Result<()> {
+        self.request(command::Command::client_size(size).as_str())?;
+        Ok(())
+    }
+
     /// One newline-terminated, synchronous tmux command list. Register every
     /// reply before writing; never retry a partial write or failed command list.
     pub(crate) fn request_batch(&mut self, commands: &[String]) -> anyhow::Result<Batch> {
@@ -232,7 +242,8 @@ impl Inspector {
             wire.len() < 512 * 1024,
             "control transaction exceeds budget"
         );
-        let deadline = time::Instant::now() + self.channel.timeout();
+        let started = time::Instant::now();
+        let deadline = started + self.channel.timeout();
         let mut ids = Vec::with_capacity(reply_count);
         for _ in 0..reply_count {
             ids.push(self.control.register_command()?);
@@ -306,6 +317,9 @@ impl Inspector {
                 }
             }
             if batch.replies.len() == reply_count {
+                if reply_count <= 8 {
+                    self.last_rtt = Some(started.elapsed());
+                }
                 return Ok(batch);
             }
         }
@@ -419,7 +433,8 @@ impl Inspector {
     /// Enable application input only after the initial snapshot and policy
     /// checks. tmux's read-only flag is sticky, so interactive connections attach
     /// without it; the application gate remains closed until this succeeds.
-    /// Keep ignore-size: local windows must never change remote dimensions.
+    /// Interactive attachments report their cell size; they do not use
+    /// ignore-size, or pane math cannot match what the GUI paints.
     pub(crate) fn enable_input(
         &mut self,
         view: &snapshot::View,
@@ -434,6 +449,9 @@ impl Inspector {
                         | "set-buffer"
                         | "paste-buffer"
                         | "resize-pane"
+                        | "split-window"
+                        | "kill-pane"
+                        | "select-pane"
                         | "if-shell"
                         | "display-message"
                 ),
@@ -476,6 +494,9 @@ impl Inspector {
                         | "after-set-buffer"
                         | "after-paste-buffer"
                         | "after-resize-pane"
+                        | "after-split-window"
+                        | "after-kill-pane"
+                        | "after-select-pane"
                         | "after-if-shell"
                         | "after-display-message"
                 ) {
@@ -494,14 +515,17 @@ impl Inspector {
             "invalid interactive client metadata"
         );
         let fields: Vec<_> = batch.replies[0][0].split('|').collect();
+        anyhow::ensure!(fields.len() == 5, "invalid interactive client metadata");
+        // Snapshot already ran refresh-client -f '!no-output' so live bytes
+        // can flow. Do not require no-output here.
+        let flags: collections::BTreeSet<_> = fields[2].split(',').collect();
+        anyhow::ensure!(fields[0] == "1", "tmux dropped control mode");
+        anyhow::ensure!(fields[1] == "0", "tmux made the client read-only");
         anyhow::ensure!(
-            fields.len() == 5
-                && fields[0] == "1"
-                && fields[1] == "0"
-                && fields[2].split(',').any(|flag| flag == "ignore-size")
-                && fields[3].is_empty(),
-            "tmux did not preserve interactive access, ignore-size, or the non-PTY channel"
+            !flags.contains("ignore-size"),
+            "tmux still ignores this client's size"
         );
+        anyhow::ensure!(fields[3].is_empty(), "tmux allocated a PTY");
         let pid: u32 = fields[4].parse()?;
         let stamp = time::SystemTime::now()
             .duration_since(time::UNIX_EPOCH)?
@@ -549,6 +573,31 @@ impl Inspector {
                 input::Action::Resize(resize) => {
                     anyhow::ensure!(actions.len() == 1, "resize must be a separate transaction");
                     commands.push(command::Command::resize_axis(target.pane, resize)?);
+                }
+                input::Action::Split(axis) => {
+                    anyhow::ensure!(actions.len() == 1, "split must be a separate transaction");
+                    commands.push(command::Command::split_pane(target.pane, axis));
+                }
+                input::Action::KillPane => {
+                    anyhow::ensure!(
+                        actions.len() == 1,
+                        "kill-pane must be a separate transaction"
+                    );
+                    commands.push(command::Command::kill_pane(target.pane));
+                }
+                input::Action::ZoomPane => {
+                    anyhow::ensure!(actions.len() == 1, "zoom must be a separate transaction");
+                    commands.push(command::Command::zoom_pane(target.pane));
+                }
+                input::Action::SelectPane => {
+                    anyhow::ensure!(
+                        actions.len() == 1,
+                        "select-pane must be a separate transaction"
+                    );
+                    commands.push(command::Command::select_pane(target.pane));
+                }
+                input::Action::ClientSize(_) => {
+                    anyhow::bail!("client size is not a pane transaction")
                 }
                 input::Action::Paste(ref paste) => {
                     anyhow::ensure!(actions.len() == 1, "paste must be a separate transaction");
@@ -662,9 +711,13 @@ fn attach_command_with_access(
     // read-only is a UI safety flag, not an authorization sandbox for commands.
     command.push_str(" attach-session -E -f ");
     if access == session::Access::ReadOnly {
-        command.push_str("read-only,");
+        // Read-only inspection must not change the shared layout.
+        command.push_str("read-only,ignore-size,no-output -t ");
+    } else {
+        // Interactive clients report their size; ignore-size would make the
+        // painted column count disagree with tmux.
+        command.push_str("no-output -t ");
     }
-    command.push_str("ignore-size,no-output -t ");
     command.push_str(&command::shell_quote(&format!("={}", session.as_str()))?);
     Ok(command)
 }
@@ -696,7 +749,8 @@ pub(crate) fn parse_info_with_access(
     );
     let flags: collections::BTreeSet<_> = fields[4].split(',').collect();
     anyhow::ensure!(
-        flags.contains("ignore-size") && flags.contains("no-output"),
+        flags.contains("no-output")
+            && flags.contains("ignore-size") == (access == session::Access::ReadOnly),
         "tmux did not apply the inspection safety flags"
     );
     let session = fields[1]
@@ -732,18 +786,12 @@ fn parse_panes(lines: &[String]) -> anyhow::Result<Vec<Pane>> {
         let size = core::Size::new(fields[2].parse()?, fields[3].parse()?)?;
         let left = fields[4].parse()?;
         let top = fields[5].parse()?;
-        let cursor_x = fields[6].parse()?;
-        let cursor_y = fields[7].parse()?;
+        let (cursor_x, cursor_y) = size.clamp_cursor(fields[6].parse()?, fields[7].parse()?);
         let alternate_screen = match fields[8] {
             "0" => false,
             "1" => true,
             _ => anyhow::bail!("invalid alternate-screen state"),
         };
-        // tmux can leave x == width while a wrap is pending.
-        anyhow::ensure!(
-            cursor_x <= size.columns() && cursor_y < size.rows(),
-            "cursor is outside the pane"
-        );
         anyhow::ensure!(
             left <= 65535 && top <= 65535,
             "pane position exceeds budget"
@@ -776,6 +824,10 @@ mod tests {
             attach_command(&session, Some("/tmp/a'b")).unwrap(),
             "exec tmux -N -C -S '/tmp/a'\"'\"'b' attach-session -E -f read-only,ignore-size,no-output -t '=work'\"'\"'s; $(false)'"
         );
+        assert_eq!(
+            attach_command_with_access(&session, None, session::Access::Interactive).unwrap(),
+            "exec tmux -N -C attach-session -E -f no-output -t '=work'\"'\"'s; $(false)'"
+        );
         assert!(attach_command(&session, Some("x\nkill-server")).is_err());
     }
 
@@ -788,6 +840,20 @@ mod tests {
         assert!(parse_info(&["3.3a|$0|1|0|ignore-size,no-output|".to_owned()]).is_err());
         assert!(parse_info(&["3.3a|$0|1|1|ignore-size|".to_owned()]).is_err());
         assert!(parse_info(&["3.3a|$0|1|1|ignore-size,no-output|/dev/pts/0".to_owned()]).is_err());
+        assert!(
+            parse_info_with_access(
+                &["3.3a|$0|1|0|control-mode,no-output|".to_owned()],
+                session::Access::Interactive,
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_info_with_access(
+                &["3.3a|$0|1|0|control-mode,ignore-size,no-output|".to_owned()],
+                session::Access::Interactive,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -799,11 +865,13 @@ mod tests {
         assert!(parse_panes(&[valid.clone(), valid]).is_err());
         for line in [
             "%0 @0 999999 999999 0 0 0 0 0 0 0",
-            "%0 @0 80 24 0 0 81 0 0 0 0",
             "%0 @0 80 24 0 0 0 0 2 0 0",
             "pane @0 80 24 0 0 0 0 0 0 0",
         ] {
             assert!(parse_panes(&[line.to_owned()]).is_err());
         }
+        let clamped = parse_panes(&["%0 @0 80 24 0 0 120 40 1 0 2000".to_owned()]).unwrap();
+        assert_eq!(clamped[0].cursor_x, 80);
+        assert_eq!(clamped[0].cursor_y, 23);
     }
 }

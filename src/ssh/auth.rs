@@ -9,6 +9,7 @@ use signature::Signer as _;
 pub(super) struct Credentials {
     keys: collections::VecDeque<sunset::SignKey>,
     signer: Signer,
+    offered: usize,
 }
 
 enum Signer {
@@ -42,6 +43,7 @@ impl Credentials {
                 Ok(Self {
                     keys: [key].into_iter().collect(),
                     signer: Signer::Identity(Box::new(private)),
+                    offered: 0,
                 })
             }
             Authentication::Agent => {
@@ -50,15 +52,26 @@ impl Credentials {
                 Ok(Self {
                     keys,
                     signer: Signer::Agent(agent),
+                    offered: 0,
                 })
             }
         }
     }
 
     pub fn next_key(&mut self) -> Result<sunset::SignKey, Error> {
-        self.keys.pop_front().ok_or_else(|| {
-            error("no remaining supported identities; public-key authentication was rejected")
-        })
+        let key = self.keys.pop_front().ok_or_else(|| {
+            if self.offered == 0 {
+                error("no supported identities were available to offer")
+            } else {
+                error("public-key authentication was rejected")
+            }
+        })?;
+        self.offered += 1;
+        Ok(key)
+    }
+
+    pub fn offered(&self) -> usize {
+        self.offered
     }
 
     pub fn sign(

@@ -19,6 +19,18 @@ const MAX_VALUE: usize = 4096;
 /// A key, a space, and the longest value this program writes.
 const MAX_LINE: usize = MAX_VALUE + 128;
 pub const MAX_TABS: usize = 16;
+/// Desktop redraw cap written as a file-level setting. 0 in a hand-edited file
+/// means "use the default" rather than "never paint".
+pub const DEFAULT_FPS: u32 = 5;
+pub const MAX_FPS: u32 = 60;
+
+pub fn clamp_fps(fps: u32) -> u32 {
+    if fps == 0 {
+        DEFAULT_FPS
+    } else {
+        fps.min(MAX_FPS)
+    }
+}
 
 /// One saved tab. Every field is a destination or a preference; none of it is
 /// a credential. Paths name a file the user already chose, never its contents.
@@ -39,10 +51,21 @@ pub struct Tab {
     pub reconnect: bool,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
     pub tabs: Vec<Tab>,
     pub active: usize,
+    pub fps: u32,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            tabs: Vec::new(),
+            active: 0,
+            fps: DEFAULT_FPS,
+        }
+    }
 }
 
 /// `~/.config/starcom/workspace.conf`, or the platform equivalent. Returns None
@@ -123,6 +146,15 @@ fn parse(text: &str) -> anyhow::Result<Workspace> {
             }
             // Before the first [tab]: file-level settings.
             None if key == "active" => workspace.active = value.parse().with_context(where_)?,
+            None if key == "fps" => {
+                let fps: u32 = value.parse().with_context(where_)?;
+                anyhow::ensure!(
+                    fps <= MAX_FPS,
+                    "{}: fps must be at most {MAX_FPS}",
+                    where_()
+                );
+                workspace.fps = clamp_fps(fps);
+            }
             None if key == "version" => anyhow::ensure!(
                 value == "1",
                 "{}: unsupported saved-workspace version {value}",
@@ -210,6 +242,7 @@ pub fn render(workspace: &Workspace) -> String {
          version 1\n",
     );
     out.push_str(&format!("active {}\n", workspace.active));
+    out.push_str(&format!("fps {}\n", clamp_fps(workspace.fps)));
     for tab in workspace.tabs.iter().take(MAX_TABS) {
         out.push_str("\n[tab]\n");
         let mut put = |key: &str, value: &str| {
@@ -298,7 +331,17 @@ mod tests {
                 },
             ],
             active: 1,
+            fps: DEFAULT_FPS,
         }
+    }
+
+    #[test]
+    fn fps_is_a_file_level_setting() {
+        let mut workspace = sample();
+        workspace.fps = 12;
+        assert_eq!(parse(&render(&workspace)).unwrap().fps, 12);
+        assert_eq!(parse("fps 0\n").unwrap().fps, DEFAULT_FPS);
+        assert!(parse("fps 99\n").is_err());
     }
 
     #[test]

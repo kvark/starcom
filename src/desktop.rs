@@ -115,7 +115,6 @@ pub(crate) struct State {
     pub generation: u64,
     pub phase: Phase,
     pub view: Option<snapshot::View>,
-    pub view_label: String,
     pub error: Option<String>,
     pub access: session::Access,
     pub allow_resize: bool,
@@ -129,6 +128,8 @@ pub(crate) struct State {
     pub failure: Option<reconnect::Failure>,
     /// The last session-discovery result, shown on the connection form.
     pub discovery: Option<Discovery>,
+    /// Last interactive-command round trip, from traffic we already send.
+    pub last_rtt: Option<time::Duration>,
     actions: collections::VecDeque<Pending>,
     action_bytes: usize,
     io_wake: Option<ssh::Wake>,
@@ -143,7 +144,6 @@ impl Default for State {
             generation: 0,
             phase: Phase::Idle,
             view: None,
-            view_label: String::new(),
             error: None,
             access: session::Access::ReadOnly,
             allow_resize: false,
@@ -151,6 +151,7 @@ impl Default for State {
             continuity: None,
             failure: None,
             discovery: None,
+            last_rtt: None,
             actions: collections::VecDeque::new(),
             action_bytes: 0,
             io_wake: None,
@@ -224,7 +225,7 @@ impl State {
             "input was not sent: the connection or layout is no longer current"
         );
         anyhow::ensure!(
-            !matches!(action, input::Action::Resize(_)) || self.allow_resize,
+            !action.changes_window_size() || self.allow_resize,
             "remote resizing is disabled; it changes the shared tmux layout"
         );
         session::validate_action(
@@ -385,7 +386,6 @@ impl Client {
         state.cancel();
         state.view = Some(view);
         state.generation += 1;
-        state.view_label = "Local demo / work".to_owned();
         state.phase = Phase::Demo;
         drop(state);
         self.shared.1.notify_one();
@@ -419,7 +419,7 @@ impl Client {
                 "input target changed; nothing was sent"
             );
             anyhow::ensure!(
-                !matches!(action, input::Action::Resize(_)) || state.allow_resize,
+                !action.changes_window_size() || state.allow_resize,
                 "remote resizing is disabled"
             );
             session::validate_action(
@@ -437,7 +437,7 @@ impl Client {
     /// Explicit per-connection consent; automatic window sizing remains off.
     pub fn allow_remote_resize(&self, allow: bool) {
         let mut state = self.lock();
-        state.allow_resize = allow && state.input_ready();
+        state.allow_resize = allow;
     }
 
     pub fn phase(&self) -> Phase {
@@ -816,6 +816,7 @@ fn watch(
         }),
         _ => truncation_notice(&view),
     };
+    let first_attach = previous.is_none();
     *previous = Some(identity);
     {
         let mut state = shared
@@ -829,17 +830,17 @@ fn watch(
         state.access = connection.access;
         state.io_wake = Some(inspector.waker());
         state.generation += 1;
-        state.view_label = format!(
-            "{}@{} / {}",
-            connection.options.user,
-            connection.options.host,
-            connection.session.as_str()
-        );
+        state.last_rtt = inspector.last_rtt;
         state.phase = Phase::Watching;
         state.retry = None;
         state.error = None;
         state.failure = None;
         state.continuity = continuity;
+        // First interactive attach resizes tmux on divider release, like a
+        // normal client. Reconnects keep the checkbox as the user left it.
+        if first_attach && connection.access == session::Access::Interactive {
+            state.allow_resize = true;
+        }
     }
     // A fully restored attachment earns a fresh schedule: the next drop starts
     // from the short delay again instead of inheriting an old backoff.
@@ -912,6 +913,7 @@ fn watch(
                 }
                 state.view = Some(restored);
                 state.generation += 1;
+                state.last_rtt = inspector.last_rtt;
                 state.phase = Phase::Watching;
                 state.continuity = truncation_notice(state.view.as_ref().expect("just set"));
                 drop(state);
@@ -928,9 +930,26 @@ fn watch(
                     }
                     if let Some(pending) = state.actions.pop_front() {
                         state.action_bytes -= pending.action.size();
+                        if let input::Action::ClientSize(size) = pending.action {
+                            if !state.allow_resize {
+                                continue;
+                            }
+                            state.view.as_mut().expect("view published").invalidate();
+                            state.phase = Phase::Resynchronizing;
+                            state.discard_actions();
+                            drop(state);
+                            inspector.set_client_size(size)?;
+                            let mut state = shared
+                                .0
+                                .lock()
+                                .unwrap_or_else(sync::PoisonError::into_inner);
+                            if state.accepts(epoch) {
+                                state.last_rtt = inspector.last_rtt;
+                            }
+                            continue;
+                        }
                         if state.target(pending.target.pane) != Some(pending.target)
-                            || (matches!(pending.action, input::Action::Resize(_))
-                                && !state.allow_resize)
+                            || (pending.action.changes_window_size() && !state.allow_resize)
                         {
                             continue;
                         }
@@ -938,7 +957,7 @@ fn watch(
                             state.view.as_ref().expect("view published"),
                             pending.target.pane,
                         )?;
-                        let resizing = matches!(pending.action, input::Action::Resize(_));
+                        let resizing = pending.action.changes_layout();
                         let ordinary = matches!(
                             pending.action,
                             input::Action::Bytes(_) | input::Action::Key(..)
@@ -965,7 +984,7 @@ fn watch(
                             state.phase = Phase::Resynchronizing;
                             if !state.actions.is_empty() {
                                 state.error = Some(
-                                    "Resize started; queued input was discarded, not replayed."
+                                    "Layout changed; queued input was discarded, not replayed."
                                         .to_owned(),
                                 );
                             }
@@ -994,6 +1013,7 @@ fn watch(
                         state.error = Some("tmux blocked this action: the pane changed, is in a mode, or synchronize-panes/zoom is enabled. Nothing was retried.".to_owned());
                         state.view.as_mut().expect("view published").invalidate();
                     }
+                    state.last_rtt = inspector.last_rtt;
                     drop(state);
                     wake();
                     continue;
@@ -1038,7 +1058,6 @@ pub fn save_demo(path: &path::Path) -> anyhow::Result<()> {
         view: Some(demo_view()?),
         generation: 1,
         phase: Phase::Demo,
-        view_label: "Local demo / work".to_owned(),
         ..State::default()
     };
     let mut ui = ui::DesktopUi::default();
@@ -1052,9 +1071,7 @@ pub(crate) fn home_path() -> Option<path::PathBuf> {
 
 pub(crate) fn demo_view() -> anyhow::Result<snapshot::View> {
     let mut panes = Vec::new();
-    for (id, window_id, left, columns, rows) in
-        [(0, 0, 0, 54, 27), (1, 0, 55, 54, 27), (2, 1, 0, 90, 27)]
-    {
+    for (id, window_id, left, columns, rows) in [(0, 0, 0, 54, 27), (1, 0, 55, 54, 27)] {
         let state = snapshot::State::parse(&format!(
             "%{id}|@{window_id}|{columns}|{rows}|{left}|0|0|0|0|0|2000|||0|{}|1|0|0|0|1|0|0|0|0|0|1|",
             rows - 1
@@ -1112,7 +1129,7 @@ mod tests {
         let client = Client::new(sync::Arc::new(|| {})).unwrap();
         client.demo().unwrap();
         assert_eq!(client.phase(), Phase::Demo);
-        client.with_view(|view| assert_eq!(view.unwrap().panes().len(), 3));
+        client.with_view(|view| assert_eq!(view.unwrap().panes().len(), 2));
         client.disconnect();
         assert_eq!(client.phase(), Phase::Disconnected);
         client.with_view(|view| assert_eq!(view.unwrap().status(), snapshot::Status::Disconnected));
