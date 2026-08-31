@@ -301,7 +301,9 @@ does not emit. Neither is work that can be started by deciding to.
   packaging. GitHub Release binaries are built from the git pin.
 - [x] Unsigned GitHub Releases from `v*` tags: Linux tar.gz, AppImage, deb, and
   rpm; macOS aarch64 zip and DMG (ad-hoc codesign); Windows zip. App icon,
-  desktop entry, and window/PE resources are included.
+  desktop entry, and window/PE resources are included. Release notes are the
+  tag's section of `CHANGELOG.md`, and a tag without one fails the workflow
+  rather than publishing an empty release.
 - [ ] Package signed Linux, macOS, and Windows builds.
 
 ## Immediate work order

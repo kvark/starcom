@@ -82,17 +82,33 @@ macOS/Windows/Wayland/IME acceptance or call local viewport resizing remote pane
 resizing. Keep CI triggers on PRs and main; no repository-writing preparation
 jobs belong in the final workflow.
 
+## Releasing
+
+A `v*` tag builds and publishes a GitHub Release; nothing else does. Before
+tagging:
+
+1. Add a `## vX.Y.Z` section at the top of `CHANGELOG.md`. The workflow extracts
+   exactly that section as the release notes and fails if it is missing, so a
+   release cannot be published with an empty body.
+2. Make sure `version` in `Cargo.toml` matches the tag.
+3. Tag a commit whose CI is green. The release workflow builds artifacts; it
+   does not re-run the test suite.
+
+Retagging is the way to fix a bad release: delete the release and the tag, push
+the fix, and tag again. An asset uploaded twice under one name replaces the
+first rather than appearing twice, so a partial re-run is safe.
+
 ## Patching a dependency
 
 Sometimes a dependency is missing something Starcom needs. Carry that as a patch
 file under `etc/<crate>/`, with a README stating what it changes and what was
-measured, and keep the default build on the published crate: gate the code that
-needs it behind a `--cfg`, declared in `Cargo.toml`'s `check-cfg`. `etc/sunset/`
-is the worked example.
+measured. `etc/sunset/` is the worked example: the patch file is the change as it
+should reach upstream, and `Cargo.toml` pins a fork carrying exactly it.
 
-Do not vendor a dependency's source into this repository, and do not point the
-default build at a fork without recording that decision in PLAN.md. A patch that
-nobody has decided how to carry is a patch, not a dependency.
+Do not vendor a dependency's source into this repository. Pointing the default
+build at a fork is a decision to record in PLAN.md, with the `deny.toml`
+`allow-git` entry and a note saying what removes it — a published release. A
+patch nobody has decided how to carry is a patch, not a dependency.
 
 ## Dependency advisories
 
