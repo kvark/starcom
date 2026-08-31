@@ -19,6 +19,7 @@ fn options() -> ssh::Options {
         known_hosts: root().join("known_hosts"),
         authentication: ssh::Authentication::Identity(root().join("id_ed25519")),
         timeout: time::Duration::from_secs(5),
+        jumps: Vec::new(),
     }
 }
 
@@ -713,4 +714,117 @@ fn a_direct_tcpip_channel_carries_data_through_the_server() {
 /// it, otherwise the caller cannot tell a refusal from an unresponsive host.
 fn options_timeout() -> time::Duration {
     options().timeout
+}
+
+/// The fixture's second sshd. It accepts SSH normally and only refuses to
+/// forward, which makes it a destination that cannot be reached by accident:
+/// a chain that ended at the bastion could not have opened this session.
+fn destination() -> ssh::Options {
+    let mut options = options();
+    options.port = env::var("STARCOM_NO_FORWARD_PORT")
+        .expect("run scripts/test-ssh.sh")
+        .parse()
+        .unwrap();
+    options
+}
+
+/// Drain a channel to end of file, as a string. Fails rather than hangs.
+fn read_to_end(channel: &mut ssh::Channel) -> String {
+    let deadline = time::Instant::now() + time::Duration::from_secs(10);
+    let mut collected = Vec::new();
+    let mut buffer = [0; 1024];
+    while !channel.eof() {
+        assert!(time::Instant::now() < deadline, "channel stalled");
+        match io::Read::read(channel, &mut buffer) {
+            Ok(0) => {}
+            Ok(count) => collected.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                channel.wait(deadline).unwrap()
+            }
+            Err(error) => panic!("read: {error}"),
+        }
+        if collected.len() > 64 * 1024 {
+            panic!("unexpectedly large reply");
+        }
+    }
+    String::from_utf8(collected).unwrap()
+}
+
+/// A jump host carries a whole second SSH session inside its forwarding
+/// channel. The far end has to really be the destination, and the chain has to
+/// survive more than one hop, or `ProxyJump` is a name for something else.
+#[test]
+#[ignore = "requires the isolated SSH/tmux fixture"]
+fn a_jump_host_carries_a_whole_second_ssh_session() {
+    for hops in 1..=2 {
+        let mut through = destination();
+        through.jumps = vec![options(); hops];
+        let mut channel = ssh::Connection::connect(&through)
+            .unwrap_or_else(|error| panic!("{hops} hop(s): {error}"))
+            .exec("printf '%s' \"$SSH_CONNECTION\"")
+            .unwrap();
+        let reported = read_to_end(&mut channel);
+        // SSH_CONNECTION ends with the port this session actually landed on, so
+        // a chain that quietly stopped at the bastion fails here rather than
+        // looking like a success against the wrong host.
+        assert!(
+            reported.ends_with(&format!(" {}", destination().port)),
+            "{hops} hop(s) did not reach the destination: {reported:?}"
+        );
+    }
+
+    // A single short reply proves the channel opens. tmux control mode through
+    // the chain proves it carries a real conversation: the inner session's own
+    // framing, flow control, and window updates all ride the outer channel.
+    let mut through = destination();
+    through.jumps = vec![options()];
+    let session = core::SessionName::new("starcom").unwrap();
+    let socket = root().join("tmux.sock");
+    let mut inspector = inspect::Inspector::attach(&through, &session, socket.to_str()).unwrap();
+    let observed = inspector.observe(20).unwrap();
+    let rows: Vec<_> = observed
+        .captures
+        .iter()
+        .flat_map(|capture| &capture.escaped_rows)
+        .collect();
+    assert!(
+        rows.iter().any(|row| row.contains("STARCOM_PRIMARY_READY")),
+        "tmux control mode did not survive the hop"
+    );
+}
+
+/// The point of the hop-by-hop design: a bastion the user trusts says nothing
+/// about the host behind it. Each hop is verified against its own known-hosts
+/// file, and a chain fails at whichever hop is untrusted.
+#[test]
+#[ignore = "requires the isolated SSH/tmux fixture"]
+fn a_jump_host_cannot_vouch_for_the_destination() {
+    let mut unknown_destination = destination();
+    unknown_destination.known_hosts = root().join("known_hosts.empty");
+    unknown_destination.jumps = vec![options()];
+    let error = ssh::Connection::connect(&unknown_destination)
+        .err()
+        .expect("an untrusted destination behind a trusted bastion must fail");
+    assert_eq!(error.kind, ssh::Kind::UnknownHostKey, "{error}");
+
+    // And the near end is verified first: an untrusted bastion fails before the
+    // destination is contacted at all.
+    let mut unknown_bastion = destination();
+    let mut bastion = options();
+    bastion.known_hosts = root().join("known_hosts.empty");
+    unknown_bastion.jumps = vec![bastion];
+    let error = ssh::Connection::connect(&unknown_bastion)
+        .err()
+        .expect("an untrusted bastion must fail");
+    assert_eq!(error.kind, ssh::Kind::UnknownHostKey, "{error}");
+
+    // A chain is refused before anything is dialled when it cannot be traversed.
+    let mut nested = destination();
+    let mut hop = options();
+    hop.jumps = vec![options()];
+    nested.jumps = vec![hop];
+    let error = ssh::Connection::connect(&nested)
+        .err()
+        .expect("a nested chain must be refused");
+    assert_eq!(error.kind, ssh::Kind::Configuration, "{error}");
 }

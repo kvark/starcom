@@ -62,10 +62,10 @@ cargo test --config 'patch.crates-io.sunset.path="/path/to/sunset"' --all-featur
 
 ## Status
 
-The patch is carried, not landed. `ssh::Connection::open_forward` exists and is
-covered against a real server, but `ProxyJump` is still reported as unsupported:
-running a second SSH session inside the channel needs `ssh::Connection` to accept
-a transport other than a `TcpStream`, which is not written.
+The patch is carried, not landed. `ProxyJump` is built on it and covered against
+real OpenSSH — `ssh::Connection` runs over either a socket or the previous hop's
+forwarding channel — so this is a dependency of a shipped feature now, not an
+experiment.
 
 Remove the `[patch.crates-io]` entry, this directory, and the `allow-git` entry
 in `deny.toml` once the change reaches a published Sunset release.

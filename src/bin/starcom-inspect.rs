@@ -2,12 +2,13 @@
 use std::{collections, env, ffi, path, process, time};
 
 use anyhow::Context;
-use starcom::{core, inspect, session, snapshot, ssh};
+use starcom::{core, inspect, session, snapshot, ssh, ssh_config};
 
 const HELP: &str = "Starcom SSH/tmux inspector (read-only; no GUI)\n\
 \n\
 Usage: starcom-inspect --host HOST --user USER --session NAME --known-hosts FILE\n\
                       [--identity FILE | --agent] [--port PORT] [--socket PATH]\n\
+                      [--jump [USER@]HOST[:PORT][,...]]\n\
                       [--history LINES] [--timeout SECONDS] [--watch SECONDS]\n\
 \n\
 HOST is a DNS name or unbracketed IP, not an SSH config alias. This first backend\n\
@@ -17,6 +18,9 @@ Unknown/changed keys are never accepted automatically. Marker/pattern policies\n
 not supported by this backend are rejected, not ignored.\n\
 Use --agent for an encrypted key already loaded in an SSH agent; --identity\n\
 currently accepts an unencrypted private-key file. Exactly one is required.\n\
+--jump routes through bastions in order, as ssh -J does. Each hop verifies its\n\
+own host key in the same known_hosts file and authenticates with the same\n\
+identity; nothing about a hop is inherited from the destination.\n\
 Defaults: port 22, history 200 lines (max 1000), timeout 10 seconds per operation.\n\
 OS DNS resolution and local agent IPC are not covered by the network timeout.\n\
 Default captures are NOT an atomic/interactive session.\n\
@@ -50,7 +54,7 @@ fn run() -> anyhow::Result<()> {
                 agent = true;
             }
             "--host" | "--user" | "--session" | "--known-hosts" | "--identity" | "--port"
-            | "--socket" | "--history" | "--timeout" | "--watch" => {
+            | "--socket" | "--history" | "--timeout" | "--watch" | "--jump" => {
                 let value = args
                     .next()
                     .with_context(|| format!("{arg} needs a value"))?;
@@ -109,13 +113,37 @@ fn run() -> anyhow::Result<()> {
     } else {
         None
     };
+    let timeout = time::Duration::from_secs(seconds);
+    // A hop names only where it is. Trust, identity, and deadline are this
+    // invocation's, because there is no config here to say otherwise.
+    let jumps = match values.remove("--jump") {
+        None => Vec::new(),
+        Some(value) => value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("--jump must be UTF-8"))?
+            .split(',')
+            .map(|spec| {
+                let hop = ssh_config::parse_hop(spec)?;
+                Ok(ssh::Options {
+                    host: hop.host,
+                    port: hop.port.unwrap_or(22),
+                    user: hop.user.clone().unwrap_or_else(|| user.clone()),
+                    known_hosts: known_hosts.clone(),
+                    authentication: authentication.clone(),
+                    timeout,
+                    jumps: Vec::new(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    };
     let options = ssh::Options {
         host,
         port,
         user,
         known_hosts,
         authentication,
-        timeout: time::Duration::from_secs(seconds),
+        timeout,
+        jumps,
     };
     if let Some(seconds) = watch_seconds {
         return watch(&options, &session, socket.as_deref(), history, seconds);

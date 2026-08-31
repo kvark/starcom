@@ -44,22 +44,45 @@ Files, total bytes, include depth, directory entries, aliases, and path expansio
 are bounded. Reading configuration never executes a command. `%h`, `%n`, `%r`,
 `%p`, `%d`, `%%`, and `~/` are handled where supported.
 
-The following are not approximated: `Match`, `ProxyJump`, `ProxyCommand`, host
-certificates, multiple identities, custom agent routing, hardware security keys,
-algorithm overrides, canonicalization, binding directives, revoked-key files,
-and password/MFA workflows. A profile using unsupported routing, authentication,
-or trust policy is shown as blocked. Starcom does not silently connect directly,
+The following are not approximated: `Match`, `ProxyCommand`, host certificates,
+multiple identities, custom agent routing, hardware security keys, algorithm
+overrides, canonicalization, binding directives, revoked-key files, and
+password/MFA workflows. A profile using unsupported routing, authentication, or
+trust policy is shown as blocked. Starcom does not silently connect directly,
 select a different key, or ignore those semantics.
 
 An optional system-SSH transport remains a future escape hatch for advanced
 enterprise/cluster configurations.
 
-`ProxyJump` needs a `direct-tcpip` channel, which published Sunset 0.6 rejects
-outright. Starcom builds against `kvark/sunset` pinned at the revision carrying
-`etc/sunset/*.patch`, which adds the client-side open; see that README for what
-was measured. `ProxyJump` is still reported as unsupported rather than
-half-supported: running a second SSH session inside such a channel needs the
-transport to accept something other than a `TcpStream`, which is not written.
+## ProxyJump
+
+`ProxyJump` is carried out, not approximated. Each hop is an ordinary SSH
+connection whose transport happens to be the previous hop's `direct-tcpip`
+channel rather than a socket, which is exactly what `ssh -J` does. Nothing about
+trust or authentication is special-cased for a bastion:
+
+- every hop verifies its own host key against its own known-hosts file, so a
+  trusted bastion says nothing about the host behind it;
+- every hop authenticates for itself, using its own `IdentityFile` when its
+  config block names one and the identity chosen in the form otherwise;
+- the per-operation timeout applies per hop, so a chain cannot exceed it by
+  being long;
+- a chain is at most four hops and is refused before anything is dialled if it
+  is longer, or if a hop has jump hosts of its own.
+
+Hops are resolved through the config the way `ssh` resolves them: a hop that is
+an alias gets its own `HostName`, `User`, `Port`, `IdentityFile`, and
+`UserKnownHostsFile`, and an explicit `user@` or `:port` in the `ProxyJump`
+value wins over that block. Two things are refused rather than guessed at. A hop
+whose own profile contains unsupported policy blocks the whole chain, because
+connecting to a bastion on terms its config did not ask for is the substitution
+this reader exists to prevent. And a hop that itself has a `ProxyJump` is
+reported rather than flattened, which is what keeps a chain from being built out
+of a cycle.
+
+The channel this rides on is not in a published Sunset. Starcom builds against
+`kvark/sunset`, pinned at the revision carrying `etc/sunset/*.patch`; see that
+README for what was measured.
 
 Sunset 0.6 emits no keyboard-interactive event and has no certificate path, which
 is what blocks MFA and host/user certificates rather than any decision here.
