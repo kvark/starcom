@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(not(debug_assertions), feature = "gui"),
+    windows_subsystem = "windows"
+)]
+
 use std::{env, fs, io, path, process};
 
 use anyhow::Context;

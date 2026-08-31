@@ -255,6 +255,20 @@ A full-screen application's conversation history is not necessarily terminal
 scrollback. Both tmux and Starcom retain bounded history and cannot recover data
 that the server discarded.
 
+## Linux desktop integration
+
+`make install` builds a release binary and installs it with `etc/starcom.desktop`
+and `etc/starcom.svg` under `PREFIX` (`~/.local` by default, or `/usr` for a
+system package). `StartupWMClass=starcom` matches the X11/Wayland class the
+window sets. The same files are packed into the `.deb` and `.rpm` release
+artifacts.
+
+Window chrome uses `etc/macos/icon.png`; the Windows PE resource uses
+`etc/windows/icon.ico`. Regenerate both from `scripts/generate-icons.py` if the
+SVG geometry changes. macOS `.app` / `.dmg` and the Linux AppImage come from
+`cargo-bundle` metadata in `Cargo.toml`. GitHub Release jobs run on `v*` tags;
+those builds are not notarized or Authenticode-signed.
+
 ## Build and validation
 
 The default features include desktop and embedded SSH:
