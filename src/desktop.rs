@@ -444,6 +444,14 @@ impl Client {
         self.lock().phase
     }
 
+    /// Unblock a socket wait so the worker can notice a machine suspend.
+    /// Does not enqueue input and does not change the connection epoch.
+    pub(crate) fn nudge(&self) {
+        if let Some(ref wake) = self.lock().io_wake {
+            wake.notify();
+        }
+    }
+
     /// Bumped for every reconstructed view. A change means the models were
     /// rebuilt from a fresh snapshot, never appended to the previous ones.
     pub fn generation(&self) -> u64 {
@@ -845,6 +853,7 @@ fn watch(
     // A fully restored attachment earns a fresh schedule: the next drop starts
     // from the short delay again instead of inheriting an old backoff.
     backoff.reset();
+    let mut last_alive = reconnect::AliveClock::now();
     wake();
     loop {
         let status = {
@@ -917,9 +926,16 @@ fn watch(
                 state.phase = Phase::Watching;
                 state.continuity = truncation_notice(state.view.as_ref().expect("just set"));
                 drop(state);
+                last_alive = reconnect::AliveClock::now();
                 wake();
             }
             snapshot::Status::Watching => {
+                if last_alive.suspended() {
+                    return Err(ssh::Error::timeout(
+                        "the machine slept; the control stream is not known to have survived",
+                    )
+                    .into());
+                }
                 let pending = {
                     let mut state = shared
                         .0
@@ -939,6 +955,7 @@ fn watch(
                             state.discard_actions();
                             drop(state);
                             inspector.set_client_size(size)?;
+                            last_alive = reconnect::AliveClock::now();
                             let mut state = shared
                                 .0
                                 .lock()
@@ -1015,6 +1032,7 @@ fn watch(
                     }
                     state.last_rtt = inspector.last_rtt;
                     drop(state);
+                    last_alive = reconnect::AliveClock::now();
                     wake();
                     continue;
                 }
@@ -1037,6 +1055,7 @@ fn watch(
                     view.apply(notification);
                 }
                 drop(state);
+                last_alive = reconnect::AliveClock::now();
                 wake();
             }
         }

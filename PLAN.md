@@ -1,6 +1,6 @@
 # Starcom plan and roadmap
 
-Updated: 2026-08-30.
+Updated: 2026-08-31.
 
 **Current status:** M0 through M3 are done for the tested configuration, and M4
 is half done. M2's gate is signed off; M3 is complete: transport loss is classified apart
@@ -227,6 +227,10 @@ as a gate: they are acceptance breadth, and the milestone no longer waits on the
 - [x] Reattach and reconstruct fresh models for every new epoch.
 - [x] Preserve the last view but never queue offline input or replay uncertain writes.
 - [x] Test connection loss during output, input, paste, and remote layout changes.
+- [x] Treat a tmux write/reply deadline and a machine suspend (wall time running
+  ahead of the monotonic clock) as transport loss, so a sleeping laptop
+  reconnects instead of failing as a protocol fault. TCP keepalive probes every
+  5s after 30s idle, four misses.
 - [x] Expose history truncation and server/session replacement clearly.
 - [x] Reattach across a genuinely restarted tmux server and report it as a
   replacement. A fresh server numbers its first session `$0` again, so identity

@@ -250,12 +250,19 @@ impl Inspector {
         }
         let mut unsent = wire.as_bytes();
         while !unsent.is_empty() {
-            anyhow::ensure!(
-                time::Instant::now() < deadline,
-                "tmux write deadline expired; delivery is uncertain"
-            );
+            if time::Instant::now() >= deadline {
+                return Err(ssh::Error::timeout(
+                    "tmux write deadline expired; delivery is uncertain",
+                )
+                .into());
+            }
             match io::Write::write(&mut self.channel, unsent) {
-                Ok(0) => anyhow::bail!("tmux channel closed during write; delivery is uncertain"),
+                Ok(0) => {
+                    return Err(ssh::Error::transport(
+                        "tmux channel closed during write; delivery is uncertain",
+                    )
+                    .into());
+                }
                 Ok(count) => unsent = &unsent[count..],
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.channel.take_wakeup();
@@ -275,7 +282,7 @@ impl Inspector {
         loop {
             let (events, bytes) = self
                 .read_events(deadline, ReadPurpose::Reply)?
-                .context("tmux reply deadline expired")?;
+                .ok_or_else(|| ssh::Error::timeout("tmux reply deadline expired"))?;
             total = total.checked_add(bytes).context("wire budget overflow")?;
             anyhow::ensure!(
                 total <= MAX_TRANSFER,
@@ -336,7 +343,13 @@ impl Inspector {
         let mut buffer = [0; 8192];
         loop {
             let woken = self.channel.take_wakeup();
-            if (purpose == ReadPurpose::Poll && woken) || time::Instant::now() >= deadline {
+            if time::Instant::now() >= deadline {
+                if purpose == ReadPurpose::Reply {
+                    return Err(ssh::Error::timeout("tmux reply deadline expired").into());
+                }
+                return Ok(None);
+            }
+            if purpose == ReadPurpose::Poll && woken {
                 return Ok(None);
             }
             let mut bytes = 0usize;
@@ -393,6 +406,9 @@ impl Inspector {
             }
             if let Err(error) = self.channel.wait(deadline) {
                 if error.kind == ssh::Kind::Timeout {
+                    if purpose == ReadPurpose::Reply {
+                        return Err(error.into());
+                    }
                     return Ok(None);
                 }
                 return Err(error.into());

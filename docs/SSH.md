@@ -190,9 +190,12 @@ that were offered". An agent that lists only unsupported key types fails at
 load rather than after a confusing empty offer.
 
 TCP keepalive is enabled so an idle control session is not black-holed by NAT.
-On Linux and macOS the first probe is after 30 seconds of silence. That is not
-a tmux ping; the desktop's displayed round-trip is the last small control
-command already sent.
+On Linux and macOS the first probe is after 30 seconds of silence, then every
+5 seconds; four unanswered probes close the socket. That is not a tmux ping;
+the desktop's displayed round-trip is the last small control command we already
+sent. A tmux write or reply deadline is a timeout (transport loss), not a
+protocol fault: a sleeping laptop or a black-holed NAT mapping must reconnect
+rather than sit on "Connected" until the next keystroke fails closed.
 
 Read-only connections add tmux's `read-only` client flag. Interactive connections
 attach without that flag, but Starcom's application gate stays closed until the
