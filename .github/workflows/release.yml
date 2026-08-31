@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  # Re-run a release without deleting and re-pushing its tag, and create the
+  # tag from here when pushing one is not an option. The tag is made at the
+  # dispatched commit if it does not already exist.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, e.g. v0.1.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -19,8 +28,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Extract this tag's section from CHANGELOG.md
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          awk -v want="## ${GITHUB_REF_NAME}" '
+          case "$TAG" in v*) ;; *) echo "not a version tag: $TAG" >&2; exit 1;; esac
+          awk -v want="## $TAG" '
             $0 == want { found = 1; next }
             found && /^## / { exit }
             found { print }
@@ -31,7 +43,8 @@ jobs:
       - name: Create the release
         uses: softprops/action-gh-release@v2
         with:
-          name: Starcom ${{ github.ref_name }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Starcom ${{ inputs.tag || github.ref_name }}
           body_path: notes.md
 
   release:
@@ -120,4 +133,5 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist/*

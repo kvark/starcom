@@ -94,9 +94,14 @@ tagging:
 3. Tag a commit whose CI is green. The release workflow builds artifacts; it
    does not re-run the test suite.
 
-Retagging is the way to fix a bad release: delete the release and the tag, push
-the fix, and tag again. An asset uploaded twice under one name replaces the
-first rather than appearing twice, so a partial re-run is safe.
+The workflow can also be run by hand from the Actions tab with the tag as an
+input, which creates the tag at the dispatched commit if it does not exist yet.
+That is how a release is re-run after a green fix without deleting and
+re-pushing its tag, and the only route available where pushing a tag ref is not.
+
+Retagging is still the way to fix a released commit: delete the release and the
+tag, push the fix, and tag again. An asset uploaded twice under one name
+replaces the first rather than appearing twice, so a partial re-run is safe.
 
 ## Patching a dependency
 
