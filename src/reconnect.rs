@@ -162,6 +162,39 @@ pub const FIRST_DELAY: time::Duration = time::Duration::from_millis(500);
 /// Ceiling for a single wait. A laptop that slept for an hour still comes back
 /// within this bound instead of drifting into a multi-minute backoff.
 pub const MAX_DELAY: time::Duration = time::Duration::from_secs(30);
+/// Wall time running this far ahead of the monotonic clock is a suspend, not
+/// scheduling jitter. NTP steps of a second or two must not force a reconnect.
+pub const SUSPEND_SLACK: time::Duration = time::Duration::from_secs(2);
+
+/// True when wall time advanced by more than the monotonic clock, which is what
+/// happens across a machine sleep: `Instant` pauses, `SystemTime` does not.
+pub fn suspend_elapsed(mono: time::Duration, wall: time::Duration) -> bool {
+    wall > mono.saturating_add(SUSPEND_SLACK)
+}
+
+/// Last time this attachment did successful I/O, in both clock domains.
+#[derive(Clone, Copy, Debug)]
+pub struct AliveClock {
+    instant: time::Instant,
+    wall: time::SystemTime,
+}
+
+impl AliveClock {
+    pub fn now() -> Self {
+        Self {
+            instant: time::Instant::now(),
+            wall: time::SystemTime::now(),
+        }
+    }
+
+    pub fn suspended(self) -> bool {
+        let mono = time::Instant::now().saturating_duration_since(self.instant);
+        let wall = time::SystemTime::now()
+            .duration_since(self.wall)
+            .unwrap_or(time::Duration::ZERO);
+        suspend_elapsed(mono, wall)
+    }
+}
 
 /// Exponential backoff with deterministic +/-25% jitter.
 ///
@@ -374,6 +407,49 @@ mod tests {
         // The same seed reproduces the same schedule, so this stays testable.
         let mut again = Backoff::new(1);
         assert_eq!(left, (0..6).map(|_| again.next_delay()).collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn a_reply_deadline_is_transport_loss_not_a_protocol_fault() {
+        // Sleep and NAT black-holes used to surface as the string
+        // "tmux reply deadline expired", which classified as Protocol and
+        // refused to reconnect. The typed timeout is what retry policy sees.
+        let error = anyhow::Error::new(ssh::Error::for_test(
+            ssh::Kind::Timeout,
+            "tmux reply deadline expired",
+        ));
+        assert_eq!(classify(&error), Failure::Transport);
+        let wrapped = anyhow::Error::new(ssh::Error::for_test(
+            ssh::Kind::Timeout,
+            "tmux write deadline expired; delivery is uncertain",
+        ))
+        .context("interactive request failed; delivery may be uncertain and was not retried");
+        assert_eq!(classify(&wrapped), Failure::Transport);
+        // The opaque interactive wrapper must not, by itself, become a retry.
+        assert_eq!(
+            classify(&anyhow::anyhow!(
+                "interactive request failed; delivery may be uncertain and was not retried"
+            )),
+            Failure::Protocol
+        );
+    }
+
+    #[test]
+    fn wall_time_running_ahead_of_monotonic_is_a_suspend() {
+        assert!(!suspend_elapsed(
+            time::Duration::from_secs(30),
+            time::Duration::from_secs(30)
+        ));
+        assert!(!suspend_elapsed(
+            time::Duration::from_secs(5),
+            time::Duration::from_secs(6)
+        ));
+        assert!(suspend_elapsed(
+            time::Duration::from_millis(200),
+            time::Duration::from_secs(60)
+        ));
+        assert!(!AliveClock::now().suspended());
     }
 
     #[test]

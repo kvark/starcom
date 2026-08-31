@@ -3,7 +3,7 @@
 
 use std::{path, sync, time};
 
-use crate::{desktop, ssh_config, store, ui};
+use crate::{desktop, reconnect, ssh_config, store, ui};
 
 const MAX_TABS: usize = 16;
 type Wake = sync::Arc<dyn Fn() + Send + Sync>;
@@ -35,6 +35,9 @@ pub(crate) struct Workspace {
     /// happens with no home directory and in the demo.
     store: Option<path::PathBuf>,
     fps: u32,
+    /// GUI-side copy of the last event-loop clock, used to notice a machine
+    /// sleep while the SSH worker is blocked in poll.
+    suspend_clock: reconnect::AliveClock,
 }
 
 /// A restored tab is labelled by where it points, not by a live connection.
@@ -68,6 +71,7 @@ impl Workspace {
                 .flatten()
                 .map(|home| store::path(&home)),
             fps: store::DEFAULT_FPS,
+            suspend_clock: reconnect::AliveClock::now(),
         };
         if startup != desktop::Startup::Demo {
             workspace.reload_config();
@@ -395,6 +399,19 @@ impl Workspace {
         (self.wake)();
     }
 
+    /// If wall time jumped while this process's monotonic clock did not, the
+    /// machine slept. Wake SSH workers so they can treat the control stream as
+    /// lost instead of sitting on "Connected" until the next keystroke.
+    pub(crate) fn notice_suspend(&mut self) {
+        if !self.suspend_clock.suspended() {
+            return;
+        }
+        self.suspend_clock = reconnect::AliveClock::now();
+        for tab in &self.tabs {
+            tab.client.nudge();
+        }
+    }
+
     pub fn shutdown(&mut self) {
         self.cancel_transient();
         // Save before dropping the tabs: the forms are the thing being saved.
@@ -494,6 +511,7 @@ mod tests {
             notice: None,
             store: Some(file.clone()),
             fps: store::DEFAULT_FPS,
+            suspend_clock: reconnect::AliveClock::now(),
         };
         workspace.restore();
         assert_eq!(workspace.tabs.len(), 2);
@@ -550,6 +568,7 @@ mod tests {
             notice: None,
             store: Some(file.clone()),
             fps: store::DEFAULT_FPS,
+            suspend_clock: reconnect::AliveClock::now(),
         };
         workspace.restore();
         assert!(workspace.tabs.is_empty());

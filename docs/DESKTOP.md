@@ -213,7 +213,9 @@ stale, and disables input. It is available in every connection phase, including
 **Connection failed**.
 
 **Reconnect automatically after connection loss** is on by default in the
-connection form. Only transport loss is retried. Authentication failures, host-key
+connection form. Only transport loss is retried. That includes a TCP drop, a
+tmux write/reply deadline (a black-holed stream), and this machine sleeping
+(wall time running ahead of the monotonic clock). Authentication failures, host-key
 failures, a missing or destroyed session, a tmux server that exited, and an
 explicit detach all stop and wait for you, because retrying any of them would
 either loop on a security decision or quietly attach somewhere else.

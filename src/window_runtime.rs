@@ -248,6 +248,7 @@ impl App {
 impl winit::application::ApplicationHandler<Event> for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.runtime.is_some() {
+            self.workspace.notice_suspend();
             return;
         }
         match Runtime::new(event_loop, &self.ctx) {
@@ -382,6 +383,7 @@ impl winit::application::ApplicationHandler<Event> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        self.workspace.notice_suspend();
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
         if let Some(wake) = self.next_repaint {
             if wake.when <= time::Instant::now() {

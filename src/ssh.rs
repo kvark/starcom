@@ -103,6 +103,13 @@ impl Error {
         Self::new(Kind::Transport, detail)
     }
 
+    /// A bounded wait ran out with no reply. That is transport loss: the
+    /// stream may be black-holed, and Starcom must not treat it as a protocol
+    /// fault that refuses to reconnect.
+    pub(crate) fn timeout(detail: impl fmt::Display) -> Self {
+        Self::new(Kind::Timeout, detail)
+    }
+
     /// Build any failure kind without a socket, so reconnection policy can be
     /// tested against all of them offline.
     #[cfg(test)]
@@ -695,20 +702,24 @@ fn configure_stream(socket: &net::TcpStream) -> Result<(), Error> {
     socket.set_nodelay(true).map_err(transport)?;
     socket.set_nonblocking(true).map_err(transport)?;
     // Idle control sessions otherwise sit silent until the next tmux command.
-    // NAT and stateful filters then black-hole the TCP connection, and the next
-    // request dies as "tmux reply deadline expired" instead of a transport loss.
-    let _ = set_keepalive_idle(socket, 30);
+    // NAT and stateful filters then black-hole the TCP connection. Keepalive
+    // makes that look like a socket error instead of a tmux reply deadline,
+    // which reconnection policy would have treated as a protocol fault.
+    let _ = set_keepalive(socket, 30, 5, 4);
     Ok(())
 }
 
-/// Seconds of silence before the first TCP keepalive probe. Not a tmux ping:
-/// RTT in the status bar is the last small control command we already sent.
-fn set_keepalive_idle(socket: &net::TcpStream, seconds: u32) -> io::Result<()> {
+/// TCP keepalive: first probe after `idle` seconds of silence, then every
+/// `interval` seconds, `count` unanswered probes close the socket. Not a tmux
+/// ping: RTT in the status bar is the last small control command we already sent.
+fn set_keepalive(socket: &net::TcpStream, idle: u32, interval: u32, count: u32) -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
         use std::os::fd::AsRawFd;
         let fd = socket.as_raw_fd();
-        let seconds = seconds as std::ffi::c_int;
+        let idle = idle as std::ffi::c_int;
+        let interval = interval as std::ffi::c_int;
+        let count = count as std::ffi::c_int;
         let on: std::ffi::c_int = 1;
         const IPPROTO_TCP: i32 = 6;
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -723,6 +734,14 @@ fn set_keepalive_idle(socket: &net::TcpStream, seconds: u32) -> io::Result<()> {
         const TCP_KEEPIDLE: i32 = 4;
         #[cfg(target_os = "macos")]
         const TCP_KEEPIDLE: i32 = 0x10;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const TCP_KEEPINTVL: i32 = 5;
+        #[cfg(target_os = "macos")]
+        const TCP_KEEPINTVL: i32 = 0x101;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const TCP_KEEPCNT: i32 = 6;
+        #[cfg(target_os = "macos")]
+        const TCP_KEEPCNT: i32 = 0x102;
         unsafe extern "C" {
             fn setsockopt(
                 sockfd: i32,
@@ -741,7 +760,10 @@ fn set_keepalive_idle(socket: &net::TcpStream, seconds: u32) -> io::Result<()> {
                 std::mem::size_of_val(value) as u32,
             )
         };
-        if set(SOL_SOCKET, SO_KEEPALIVE, &on) != 0 || set(IPPROTO_TCP, TCP_KEEPIDLE, &seconds) != 0
+        if set(SOL_SOCKET, SO_KEEPALIVE, &on) != 0
+            || set(IPPROTO_TCP, TCP_KEEPIDLE, &idle) != 0
+            || set(IPPROTO_TCP, TCP_KEEPINTVL, &interval) != 0
+            || set(IPPROTO_TCP, TCP_KEEPCNT, &count) != 0
         {
             Err(io::Error::last_os_error())
         } else {
@@ -750,7 +772,7 @@ fn set_keepalive_idle(socket: &net::TcpStream, seconds: u32) -> io::Result<()> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
-        let _ = (socket, seconds);
+        let _ = (socket, idle, interval, count);
         Ok(())
     }
 }
