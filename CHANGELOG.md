@@ -39,7 +39,9 @@ embedded SSH client and draws them in a native window.
 - **Desktop client.** Blade/egui rendering of Alacritty's terminal model, panes
   and tabs, mouse selection, scrollback, paste confirmation, and draggable pane
   dividers. Maximize is tmux zoom and keeps focus. Exit returns to the form and
-  retitles the tab from those fields. Remote resizing is opt-in.
+  retitles the tab from those fields. Remote resizing is opt-in. After keys or
+  wheel, remote echo runs at 20 fps for a short time. `make install` on macOS
+  writes `~/Applications/Starcom.app`.
 
 Prebuilt Linux, macOS, and Windows artifacts are attached below. Linux and
 Windows builds are unsigned; macOS builds are ad-hoc codesigned, not notarized.

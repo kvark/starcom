@@ -31,16 +31,18 @@ Rust is required (`rust-version` is 1.96).
 
 The crates.io `starcom` crate is a name reservation and is not a working install.
 
-## Linux desktop integration
-
-Install the binary, desktop entry, and icon to `~/.local` (the standard per-user
-prefix):
+## Desktop integration
 
 ```sh
 make install
 ```
 
-To install system-wide instead:
+On Linux this puts the binary, `.desktop` entry, and icon under `~/.local`, so
+Starcom appears in the application menu. On macOS it also writes
+`~/Applications/Starcom.app` (Launchpad and Spotlight); a `.desktop` file is
+not a macOS launcher. `$(PREFIX)/bin` is on the PATH in both cases.
+
+To install system-wide instead (`/usr` on Linux, `/Applications` on macOS):
 
 ```sh
 sudo make install PREFIX=/usr

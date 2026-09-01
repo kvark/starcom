@@ -320,7 +320,7 @@ impl winit::application::ApplicationHandler<Event> for App {
                 }
             }
             winit::event::WindowEvent::RedrawRequested => {
-                let interval = self.workspace.repaint_interval();
+                let interval = self.workspace.paint_interval();
                 let force = self.input_redraw;
                 self.input_redraw = false;
                 // Only remote coalescing uses this path (force is false). Local
@@ -373,8 +373,9 @@ impl winit::application::ApplicationHandler<Event> for App {
             Event::Repaint(when) => self.schedule(when, true),
             Event::Remote => {
                 let now = time::Instant::now();
+                let interval = self.workspace.paint_interval();
                 let when = match self.last_paint {
-                    Some(painted) => now.max(painted + self.workspace.repaint_interval()),
+                    Some(painted) => now.max(painted + interval),
                     None => now,
                 };
                 self.schedule(when, false);

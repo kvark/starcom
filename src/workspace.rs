@@ -37,6 +37,9 @@ pub(crate) struct Workspace {
     /// happens with no home directory and in the demo.
     store: Option<path::PathBuf>,
     fps: u32,
+    /// Remote frames run this fast after keys or wheel, so echo is not stuck
+    /// on the idle fps cap. None when idle.
+    echo_until: Option<time::Instant>,
     /// GUI-side copy of the last event-loop clock, used to notice a machine
     /// sleep while the SSH worker is blocked in poll.
     suspend_clock: reconnect::AliveClock,
@@ -88,6 +91,7 @@ impl Workspace {
                 .flatten()
                 .map(|home| store::path(&home)),
             fps: store::DEFAULT_FPS,
+            echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
         };
         if startup != desktop::Startup::Demo {
@@ -154,6 +158,20 @@ impl Workspace {
 
     pub(crate) fn repaint_interval(&self) -> time::Duration {
         time::Duration::from_secs_f64(1.0 / f64::from(store::clamp_fps(self.fps)))
+    }
+
+    /// Idle remote paint uses the fps slider. After we sent input, echo is
+    /// allowed up to 20 fps for a short window so typing is not 200ms behind.
+    pub(crate) fn paint_interval(&self) -> time::Duration {
+        let idle = self.repaint_interval();
+        if self
+            .echo_until
+            .is_some_and(|until| time::Instant::now() < until)
+        {
+            idle.min(time::Duration::from_millis(50))
+        } else {
+            idle
+        }
     }
 
     /// Persist after a change to which tabs exist or where they point. Failure
@@ -353,6 +371,7 @@ impl Workspace {
                 }
                 Action::Tab(id, action) => {
                     let mut save = false;
+                    let mut follow_input = false;
                     let Some(tab) = self.tabs.get_mut(self.active).filter(|tab| tab.id == id)
                     else {
                         return Ok(());
@@ -413,7 +432,9 @@ impl Workspace {
                             if actions.is_empty() {
                                 Ok(())
                             } else {
-                                tab.client.submit_batch(actions)
+                                let sent = tab.client.submit_batch(actions);
+                                follow_input = sent.is_ok();
+                                sent
                             }
                         }
                         ui::Action::ReloadConfig => {
@@ -423,6 +444,10 @@ impl Workspace {
                     };
                     if let Err(error) = result {
                         tab.client.lock().error = Some(error.to_string());
+                    }
+                    if follow_input {
+                        self.echo_until =
+                            Some(time::Instant::now() + time::Duration::from_millis(400));
                     }
                     if save {
                         self.persist();
@@ -591,6 +616,7 @@ mod tests {
             notice: None,
             store: Some(file.clone()),
             fps: store::DEFAULT_FPS,
+            echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
         };
         assert!(workspace.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
@@ -628,6 +654,7 @@ mod tests {
             notice: None,
             store: Some(file),
             fps: store::DEFAULT_FPS,
+            echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
         }
     }
@@ -732,6 +759,18 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn sending_input_raises_the_remote_paint_rate() {
+        let workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
+        let idle = workspace.repaint_interval();
+        assert_eq!(workspace.paint_interval(), idle);
+        let mut workspace = workspace;
+        workspace.echo_until = Some(time::Instant::now() + time::Duration::from_millis(400));
+        assert_eq!(workspace.paint_interval(), time::Duration::from_millis(50));
+        workspace.echo_until = Some(time::Instant::now() - time::Duration::from_millis(1));
+        assert_eq!(workspace.paint_interval(), idle);
     }
 
     #[test]

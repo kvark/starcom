@@ -167,7 +167,9 @@ Wheel handling follows the pane, not a global shortcut. If the application
 enabled mouse reporting (DEC 1000/1002/1003), the wheel is sent as a mouse
 report at the hovered cell. If it is on the alternate screen without mouse
 reporting, the wheel becomes Up/Down, matching xterm alternate-scroll. Otherwise
-the wheel examines local terminal history.
+the wheel examines local terminal history. A live wheel or trackpad event still
+sends at least one tick; leftover smoothing from egui is accumulated so it
+cannot add extra ticks after the gesture.
 
 Drag to select, double-click for a word, and triple-click for a line. Selection
 anchors live in the terminal model, so they follow incoming scrolls. Copying
@@ -186,7 +188,8 @@ sent to measure it.
 
 Remote pane output is redrawn at most 5 times per second by default (the **fps**
 control on the tab bar, saved in `workspace.conf`). Buttons, hover, typing, and
-other local UI stay immediate.
+other local UI stay immediate. After keys or wheel are sent, remote frames run
+at up to 20 fps for a short time so the echo does not wait on the idle cap.
 
 ## Pane controls
 
@@ -270,15 +273,21 @@ A full-screen application's conversation history is not necessarily terminal
 scrollback. Both tmux and Starcom retain bounded history and cannot recover data
 that the server discarded.
 
-## Linux desktop integration
+## Desktop integration
 
-`make install` builds a release binary and installs it with `etc/starcom.desktop`
-and `etc/starcom.svg` under `PREFIX` (`~/.local` by default, or `/usr` for a
-system package). Parent directories are created with `mkdir -p` so BSD `install`
-on macOS works; GNU `install -D` is not assumed. `StartupWMClass=starcom` matches
-the X11/Wayland class the window sets. The same files are packed into the `.deb`
-and `.rpm` release artifacts. The `.desktop` file is a Linux launcher entry; on
-macOS the binary still lands in `$(PREFIX)/bin`.
+`make install` builds a release binary and copies it to `$(PREFIX)/bin`
+(`~/.local` by default, or `/usr` for a system package). Parent directories are
+created with `mkdir -p` so BSD `install` on macOS works; GNU `install -D` is not
+assumed.
+
+On Linux it also installs `etc/starcom.desktop` and `etc/starcom.svg`.
+`StartupWMClass=starcom` matches the X11/Wayland class the window sets. The same
+files are packed into the `.deb` and `.rpm` release artifacts.
+
+On macOS Launchpad does not read `.desktop` files. `scripts/macos-app.sh` builds
+`Starcom.app` from the release binary, `etc/macos/Info.plist`, and the PNG icon
+family (`iconutil` + ad-hoc `codesign`, no cargo-bundle). The bundle goes to
+`~/Applications` when `PREFIX` is under `$HOME`, and `/Applications` otherwise.
 
 Window chrome uses `etc/macos/icon.png`; the Windows PE resource uses
 `etc/windows/icon.ico`. Regenerate both from `scripts/generate-icons.py` if the
