@@ -1092,7 +1092,7 @@ pub(crate) fn demo_view() -> anyhow::Result<snapshot::View> {
             terminal
                 .feed(b"\x1b[90mThis is built-in demo data, not an SSH session.\x1b[0m\r\n\r\n");
             terminal.feed(b"\x1b[32mdemo@workstation\x1b[0m:~/starcom$ cargo test\r\n\r\n");
-            terminal.feed(b"  \x1b[32mCompiling\x1b[0m starcom v0.1.0\r\n  \x1b[32mFinished\x1b[0m test profile\r\n\r\n");
+            terminal.feed(b"  \x1b[32mCompiling\x1b[0m starcom v0.1.1\r\n  \x1b[32mFinished\x1b[0m test profile\r\n\r\n");
             for name in [
                 "control framing",
                 "snapshot -> live",
