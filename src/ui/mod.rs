@@ -4,15 +4,9 @@ pub(crate) mod input;
 mod layout;
 mod terminal;
 
-use std::{collections, env, path, sync, time};
+use std::{collections, path, sync, time};
 
 use crate::{core, desktop, input as terminal_input, session, snapshot, ssh, ssh_config, store};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Authentication {
-    Agent,
-    Key,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -26,8 +20,10 @@ pub struct Form {
     pub user: String,
     session: String,
     port: u16,
-    authentication: Authentication,
     identity: String,
+    identity_files: Vec<String>,
+    identities_only: bool,
+    host_key_alias: Option<String>,
     known_hosts: String,
     socket: String,
     history: usize,
@@ -42,11 +38,13 @@ impl Default for Form {
         Self {
             destination: String::new(),
             host: String::new(),
-            user: env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).unwrap_or_default(),
+            user: desktop::local_user(),
             session: String::new(),
             port: 22,
-            authentication: Authentication::Agent,
             identity: String::new(),
+            identity_files: Vec::new(),
+            identities_only: false,
+            host_key_alias: None,
             known_hosts: desktop::home_path()
                 .map(|path| path.join(".ssh/known_hosts").to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -74,7 +72,6 @@ impl Form {
             user: self.user.clone(),
             session: self.session.clone(),
             port: self.port,
-            agent: self.authentication == Authentication::Agent,
             identity: self.identity.clone(),
             known_hosts: self.known_hosts.clone(),
             socket: self.socket.clone(),
@@ -90,15 +87,17 @@ impl Form {
         Self {
             destination: saved.destination,
             host: saved.host,
-            user: saved.user,
+            user: if saved.user.trim().is_empty() {
+                desktop::local_user()
+            } else {
+                saved.user
+            },
             session: saved.session,
             port: saved.port,
-            authentication: if saved.agent {
-                Authentication::Agent
-            } else {
-                Authentication::Key
-            },
             identity: saved.identity,
+            identity_files: Vec::new(),
+            identities_only: false,
+            host_key_alias: None,
             known_hosts: saved.known_hosts,
             socket: saved.socket,
             history: saved.history.min(snapshot::MAX_HISTORY_LINES),
@@ -112,37 +111,43 @@ impl Form {
     fn apply_profile(
         &mut self,
         profile: ssh_config::Profile,
-        default_identity: Option<path::PathBuf>,
-        agent_available: bool,
+        default_identities: Vec<path::PathBuf>,
     ) {
-        self.host = profile.host;
-        if let Some(user) = profile.user {
-            self.user = user;
-        }
+        self.host.clone_from(&profile.host);
+        self.user = profile
+            .user
+            .clone()
+            .filter(|user| !user.is_empty())
+            .unwrap_or_else(desktop::local_user);
         self.port = profile.port.unwrap_or(22);
-        if let Some(identity) = profile.identity {
-            self.identity = identity.to_string_lossy().into_owned();
-            self.authentication = Authentication::Key;
-        } else {
-            // OpenSSH still tries ~/.ssh/id_ed25519 and friends with no
-            // IdentityFile and no agent. Put that path on the form instead of
-            // insisting on an agent the user does not have.
-            if let Some(identity) = default_identity {
-                self.identity = identity.to_string_lossy().into_owned();
-                if profile.identities_only || !agent_available {
-                    self.authentication = Authentication::Key;
-                } else {
-                    self.authentication = Authentication::Agent;
-                }
-            } else if !profile.identities_only {
-                self.authentication = Authentication::Agent;
-            }
+        self.apply_routing(&profile, default_identities);
+        self.profile_error = None;
+    }
+
+    /// Routing and identity policy from the config, not from the saved tab.
+    /// A restored tab must not skip a new IdentityFile or IdentitiesOnly.
+    fn apply_routing(
+        &mut self,
+        profile: &ssh_config::Profile,
+        default_identities: Vec<path::PathBuf>,
+    ) {
+        self.identity_files = profile
+            .identities
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        if self.identity_files.is_empty() {
+            self.identity_files = default_identities
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
         }
-        if let Some(known_hosts) = profile.known_hosts {
+        self.identities_only = profile.identities_only;
+        self.host_key_alias.clone_from(&profile.host_key_alias);
+        if let Some(ref known_hosts) = profile.known_hosts {
             self.known_hosts = known_hosts.to_string_lossy().into_owned();
         }
-        self.unsupported = profile.unsupported;
-        self.profile_error = None;
+        self.unsupported.clone_from(&profile.unsupported);
     }
 
     fn host_ready(&self) -> bool {
@@ -175,22 +180,33 @@ impl Form {
             self.unsupported.join(", ")
         );
         anyhow::ensure!(self.profile_error.is_none(), "fix the SSH profile first");
-        let authentication = match self.authentication {
-            Authentication::Agent => ssh::Authentication::Agent,
-            Authentication::Key => {
-                anyhow::ensure!(
-                    !self.identity.is_empty(),
-                    "choose a private-key file or use an SSH agent"
-                );
-                ssh::Authentication::Identity(local_path(&self.identity)?)
+        let mut files = Vec::new();
+        if !self.identity.trim().is_empty() {
+            files.push(local_path(&self.identity)?);
+        }
+        for path in &self.identity_files {
+            let path = local_path(path)?;
+            if !files.contains(&path) {
+                files.push(path);
             }
+        }
+        let authentication = ssh::Authentication {
+            files,
+            agent: !self.identities_only,
+        };
+        let user = self.user.trim();
+        let user = if user.is_empty() {
+            desktop::local_user()
+        } else {
+            user.to_owned()
         };
         let options = ssh::Options {
             host: self.host.trim().to_owned(),
-            user: self.user.trim().to_owned(),
+            user,
             port: self.port,
             authentication,
             known_hosts: local_path(&self.known_hosts)?,
+            host_key_alias: self.host_key_alias.clone(),
             timeout: time::Duration::from_secs(30),
         };
         options.validate()?;
@@ -329,6 +345,12 @@ impl DesktopUi {
         self.listed_destination = self.form.destination().to_owned();
         self.auto_list = false;
         self.screen = Screen::Connection;
+        if !self.profile_source.is_empty()
+            && let Ok(profile) = self.config.resolve(&self.profile_source)
+        {
+            self.form
+                .apply_routing(&profile, self.config.default_identities());
+        }
     }
 
     pub(crate) fn saved(&self) -> store::Tab {
@@ -357,14 +379,15 @@ impl DesktopUi {
         self.form.profile_error = None;
         if destination.is_empty() {
             self.form.host.clear();
+            self.form.identity_files.clear();
+            self.form.identities_only = false;
+            self.form.host_key_alias = None;
             return;
         }
         match self.config.resolve(&destination) {
-            Ok(profile) => self.form.apply_profile(
-                profile,
-                self.config.default_identity(),
-                ssh::agent_available(),
-            ),
+            Ok(profile) => self
+                .form
+                .apply_profile(profile, self.config.default_identities()),
             Err(error) => {
                 self.form.host = destination;
                 self.form.profile_error = Some(error.to_string());
@@ -495,6 +518,7 @@ impl DesktopUi {
                         let response = ui.add_sized(
                             egui::vec2(240.0, 44.0),
                             egui::TextEdit::singleline(&mut self.form.destination)
+                                .font(egui::FontId::proportional(22.0))
                                 .hint_text("hostname, address, or alias"),
                         );
                         if response.changed() {
@@ -525,10 +549,14 @@ impl DesktopUi {
                         );
                     }
                     if !self.form.host.is_empty() {
-                        ui.weak(format!(
+                        let endpoint = format!(
                             "{}@{}:{}",
                             self.form.user, self.form.host, self.form.port
-                        ));
+                        );
+                        ui.weak(match self.form.host_key_alias {
+                            Some(ref alias) => format!("{endpoint} (host key {alias})"),
+                            None => endpoint,
+                        });
                     }
 
                     ui.add_space(12.0);
@@ -671,28 +699,29 @@ impl DesktopUi {
                         "Only transport loss is retried. Authentication, host-key, \
                          missing-session and detach failures always stop and wait for you.",
                     );
-                    ui.horizontal(|ui| {
-                        ui.radio_value(
-                            &mut self.form.authentication,
-                            Authentication::Agent,
-                            "SSH agent",
-                        );
-                        ui.radio_value(
-                            &mut self.form.authentication,
-                            Authentication::Key,
-                            "Key file",
-                        );
-                    });
-                    if self.form.authentication == Authentication::Agent && !self.agent_probe() {
+                    let mut keys = Vec::new();
+                    if !self.form.identity.trim().is_empty() {
+                        keys.push(self.form.identity.trim().to_owned());
+                    }
+                    for path in &self.form.identity_files {
+                        if !keys.iter().any(|shown| shown == path) {
+                            keys.push(path.clone());
+                        }
+                    }
+                    if !keys.is_empty() {
+                        ui.weak(format!("Keys: {}", keys.join(", ")));
+                    }
+                    if self.form.identities_only {
+                        ui.weak("IdentitiesOnly: the SSH agent will not be used.");
+                    } else if !self.agent_probe() && self.form.identity_files.is_empty() {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
-                            "No SSH agent found. Start one and add a key, or choose a key file.",
+                            "No SSH agent found and no IdentityFile. Start an agent \
+                             and add a key, or add IdentityFile to ~/.ssh/config.",
                         );
                     }
-                    if self.form.authentication == Authentication::Key {
-                        field(ui, "Private key", &mut self.form.identity);
-                    }
                     ui.collapsing("Advanced", |ui| {
+                        field(ui, "Extra identity file", &mut self.form.identity);
                         field(ui, "User", &mut self.form.user);
                         field(ui, "Host name / address", &mut self.form.host);
                         field(ui, "Known hosts", &mut self.form.known_hosts);
@@ -1243,42 +1272,73 @@ mod tests {
         assert_eq!(ui.form.host, "10.0.0.2");
         assert_eq!(ui.form.user, "alice");
         assert_eq!(ui.form.port, 2222);
-        assert_eq!(ui.form.authentication, Authentication::Key);
+        assert_eq!(ui.form.identity_files, ["/home/test/.ssh/dev"]);
+        assert!(!ui.form.identities_only);
+        assert!(ui.form.host_key_alias.is_none());
     }
 
     #[test]
-    fn a_host_without_identityfile_uses_a_default_key_when_no_agent() {
+    fn hostkeyalias_is_carried_onto_the_connection() {
+        let mut form = Form {
+            user: "alice".into(),
+            known_hosts: "/tmp/known_hosts".into(),
+            ..Form::default()
+        };
+        form.apply_profile(
+            ssh_config::Profile {
+                host: "10.2.3.4".into(),
+                host_key_alias: Some("trusted.example".into()),
+                ..ssh_config::Profile::default()
+            },
+            Vec::new(),
+        );
+        let connection = form.connection_named("work").unwrap();
+        assert_eq!(connection.options.host, "10.2.3.4");
+        assert_eq!(
+            connection.options.host_key_alias.as_deref(),
+            Some("trusted.example")
+        );
+    }
+
+    #[test]
+    fn a_host_without_user_uses_the_local_account() {
+        let mut form = Form {
+            user: "previous".into(),
+            ..Form::default()
+        };
+        form.apply_profile(
+            ssh_config::Profile {
+                host: "zork.example".into(),
+                ..ssh_config::Profile::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(form.user, desktop::local_user());
+    }
+
+    #[test]
+    fn a_host_without_identityfile_uses_every_default_key() {
         let mut form = Form::default();
         form.apply_profile(
             ssh_config::Profile {
                 host: "zork.example".into(),
                 ..ssh_config::Profile::default()
             },
-            Some(path::PathBuf::from("/home/test/.ssh/id_ed25519")),
-            false,
+            vec![
+                path::PathBuf::from("/home/test/.ssh/id_ed25519"),
+                path::PathBuf::from("/home/test/.ssh/id_rsa"),
+            ],
         );
         assert_eq!(form.host, "zork.example");
-        assert_eq!(form.authentication, Authentication::Key);
-        assert_eq!(form.identity, "/home/test/.ssh/id_ed25519");
-    }
-
-    #[test]
-    fn a_reachable_agent_is_kept_when_the_profile_has_no_identityfile() {
-        let mut form = Form::default();
-        form.apply_profile(
-            ssh_config::Profile {
-                host: "zork.example".into(),
-                ..ssh_config::Profile::default()
-            },
-            Some(path::PathBuf::from("/home/test/.ssh/id_ed25519")),
-            true,
+        assert_eq!(
+            form.identity_files,
+            ["/home/test/.ssh/id_ed25519", "/home/test/.ssh/id_rsa"]
         );
-        assert_eq!(form.authentication, Authentication::Agent);
-        assert_eq!(form.identity, "/home/test/.ssh/id_ed25519");
+        assert!(!form.identities_only);
     }
 
     #[test]
-    fn identities_only_uses_the_default_key_even_when_an_agent_is_reachable() {
+    fn identities_only_still_uses_default_keys_and_closes_the_agent() {
         let mut form = Form::default();
         form.apply_profile(
             ssh_config::Profile {
@@ -1286,11 +1346,69 @@ mod tests {
                 identities_only: true,
                 ..ssh_config::Profile::default()
             },
-            Some(path::PathBuf::from("/home/test/.ssh/id_ed25519")),
-            true,
+            vec![path::PathBuf::from("/home/test/.ssh/id_ed25519")],
         );
-        assert_eq!(form.authentication, Authentication::Key);
-        assert_eq!(form.identity, "/home/test/.ssh/id_ed25519");
+        assert_eq!(form.identity_files, ["/home/test/.ssh/id_ed25519"]);
+        assert!(form.identities_only);
+        form.user = "alice".into();
+        form.known_hosts = "/tmp/known_hosts".into();
+        let connection = form.connection_named("work").unwrap();
+        assert!(!connection.options.authentication.agent);
+        assert_eq!(
+            connection.options.authentication.files,
+            [path::PathBuf::from("/home/test/.ssh/id_ed25519")]
+        );
+    }
+
+    #[test]
+    fn extra_identity_is_tried_before_config_files_then_the_agent() {
+        let form = Form {
+            host: "zork.example".into(),
+            user: "alice".into(),
+            known_hosts: "/tmp/known_hosts".into(),
+            identity: "/home/alice/.ssh/extra".into(),
+            identity_files: vec![
+                "/home/alice/.ssh/work".into(),
+                "/home/alice/.ssh/extra".into(),
+            ],
+            ..Form::default()
+        };
+        let connection = form.connection_named("work").unwrap();
+        assert_eq!(
+            connection.options.authentication.files,
+            [
+                path::PathBuf::from("/home/alice/.ssh/extra"),
+                path::PathBuf::from("/home/alice/.ssh/work"),
+            ]
+        );
+        assert!(connection.options.authentication.agent);
+    }
+
+    #[test]
+    fn restored_tabs_re_read_identity_policy_from_config() {
+        let config = sync::Arc::new(ssh_config::Config::from_text(
+            "Host zork\nHostName zork.example\nIdentityFile ~/.ssh/work\nIdentityFile ~/.ssh/id_ed25519\nIdentitiesOnly yes\nProxyJump bastion\n",
+        ));
+        let mut ui = DesktopUi::with_config(config, None);
+        ui.restore(store::Tab {
+            destination: "zork".into(),
+            host: "saved.example".into(),
+            user: "alice".into(),
+            session: "work".into(),
+            port: 22,
+            identity: "/home/alice/.ssh/extra".into(),
+            known_hosts: "/tmp/known_hosts".into(),
+            ..store::Tab::default()
+        });
+        assert_eq!(ui.form.host, "saved.example");
+        assert_eq!(ui.form.identity, "/home/alice/.ssh/extra");
+        assert_eq!(
+            ui.form.identity_files,
+            ["/home/test/.ssh/work", "/home/test/.ssh/id_ed25519"]
+        );
+        assert!(ui.form.identities_only);
+        assert!(ui.form.unsupported.iter().any(|item| item == "proxyjump"));
+        assert!(ui.form.connection_named("work").is_err());
     }
 
     #[test]

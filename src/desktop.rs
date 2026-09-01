@@ -1088,6 +1088,14 @@ pub(crate) fn home_path() -> Option<path::PathBuf> {
     env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(path::PathBuf::from)
 }
 
+/// Local account name, used when `User` is omitted from the SSH profile.
+/// Same default `ssh` uses: `$USER` / `%USERNAME%`, then `$LOGNAME`.
+pub(crate) fn local_user() -> String {
+    env::var(if cfg!(windows) { "USERNAME" } else { "USER" })
+        .or_else(|_| env::var("LOGNAME"))
+        .unwrap_or_default()
+}
+
 pub(crate) fn demo_view() -> anyhow::Result<snapshot::View> {
     let mut panes = Vec::new();
     for (id, window_id, left, columns, rows) in [(0, 0, 0, 54, 27), (1, 0, 55, 54, 27)] {

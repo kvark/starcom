@@ -7,6 +7,11 @@ use super::{Error, Kind, remaining};
 const MAX_MESSAGE: usize = 256 * 1024;
 const MAX_IDENTITIES: u32 = 64;
 
+pub(super) struct ListedKeys {
+    pub keys: collections::VecDeque<sunset::SignKey>,
+    pub skipped: Vec<String>,
+}
+
 pub(super) struct Agent {
     stream: platform::Stream,
 }
@@ -26,10 +31,7 @@ impl Agent {
         })
     }
 
-    pub fn identities(
-        &mut self,
-        deadline: time::Instant,
-    ) -> Result<collections::VecDeque<sunset::SignKey>, Error> {
+    pub fn identities(&mut self, deadline: time::Instant) -> Result<ListedKeys, Error> {
         let reply = self.request(&[11], deadline)?;
         let mut wire = Wire::new(&reply);
         if wire.byte()? != 12 {
@@ -41,29 +43,36 @@ impl Agent {
         }
         if count == 0 {
             return Err(authentication(
-                "the SSH agent is running but holds no keys. Add one with \
-                 `ssh-add`, or choose a private-key file instead.",
+                "the SSH agent is running but holds no keys. Add one with `ssh-add`.",
             ));
         }
         let mut keys = collections::VecDeque::new();
+        let mut skipped = Vec::new();
         for _ in 0..count {
             let key = wire.string()?;
-            let _comment = wire.string()?;
+            let comment = wire.string()?;
+            let algorithm = public_key_algorithm(key).unwrap_or("unknown");
             if let Ok((public, used)) = sunset::sshwire::read_ssh::<sunset::PubKey<'_>>(key, None)
                 && used == key.len()
+                && !matches!(public, sunset::PubKey::Unknown(_))
                 && let Ok(key) = sunset::SignKey::from_agent_pubkey(&public)
             {
                 keys.push_back(key);
+            } else {
+                let label = match std::str::from_utf8(comment) {
+                    Ok(comment) if !comment.is_empty() => format!("{algorithm} ({comment})"),
+                    _ => algorithm.to_owned(),
+                };
+                if !skipped.contains(&label) {
+                    skipped.push(label);
+                }
             }
         }
         wire.finish()?;
         if keys.is_empty() {
-            return Err(authentication(
-                "the SSH agent holds keys, but none are ed25519, ECDSA P-256, or RSA \
-                 in a form Starcom can sign",
-            ));
+            return Err(authentication(unsupported_identities(count, &skipped)));
         }
-        Ok(keys)
+        Ok(ListedKeys { keys, skipped })
     }
 
     pub fn sign(
@@ -125,6 +134,14 @@ pub(super) fn parse_signature(bytes: &[u8], expected: &str) -> Result<sunset::Ow
     sunset::OwnedSig::try_from(signature).map_err(authentication)
 }
 
+/// First SSH string in a public-key blob: `ssh-ed25519`, `sk-ssh-ed25519@openssh.com`, …
+pub(super) fn public_key_algorithm(blob: &[u8]) -> Option<&str> {
+    let mut wire = Wire::new(blob);
+    std::str::from_utf8(wire.string().ok()?)
+        .ok()
+        .filter(|name| !name.is_empty() && name.len() <= 64)
+}
+
 pub(super) fn put_string(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
     if out.len().saturating_add(4).saturating_add(bytes.len()) > MAX_MESSAGE {
         return Err(authentication("agent field exceeds budget"));
@@ -169,6 +186,15 @@ impl<'a> Wire<'a> {
     }
 }
 
+fn unsupported_identities(count: u32, skipped: &[String]) -> String {
+    format!(
+        "the SSH agent holds {count} {}, {} unsupported ({})",
+        if count == 1 { "key" } else { "keys" },
+        skipped.len(),
+        skipped.join(", ")
+    )
+}
+
 fn authentication(detail: impl std::fmt::Display) -> Error {
     Error::new(Kind::Authentication, detail)
 }
@@ -179,9 +205,9 @@ mod platform {
     use std::{env, io, os::unix::net, path};
 
     pub(super) const UNSET: &str = "no SSH agent is available: SSH_AUTH_SOCK is not set. \
-        Start one and add a key (`eval $(ssh-agent)` then `ssh-add`), or choose \
-        a private-key file in the connection form instead. A desktop session \
-        often does not inherit SSH_AUTH_SOCK from a shell.";
+        Start one and add a key (`eval $(ssh-agent)` then `ssh-add`), or set \
+        IdentityFile in ~/.ssh/config. A desktop session often does not inherit \
+        SSH_AUTH_SOCK from a shell.";
 
     /// A local check, with no connection and no blocking: is an agent plausibly
     /// there? Used to warn on the connection form before a connection is tried.
@@ -204,7 +230,7 @@ mod platform {
                 // looks identical to a missing one until you see the path.
                 io::Error::other(format!(
                     "the SSH agent at {} could not be reached ({error}). Start an \
-                     agent and add a key, or choose a private-key file instead.",
+                     agent and add a key, or set IdentityFile in ~/.ssh/config.",
                     path.to_string_lossy()
                 ))
             })
@@ -256,7 +282,7 @@ mod tests {
     #[test]
     fn a_missing_agent_says_what_to_do_about_it() {
         let text = platform::UNSET;
-        for expected in ["ssh-agent", "ssh-add", "private-key file", "SSH_AUTH_SOCK"] {
+        for expected in ["ssh-agent", "ssh-add", "IdentityFile", "SSH_AUTH_SOCK"] {
             assert!(text.contains(expected), "missing {expected:?} in: {text}");
         }
         // A desktop launcher usually does not inherit the shell's agent, which
@@ -277,7 +303,7 @@ mod tests {
         let deadline = time::Instant::now() + time::Duration::from_secs(5);
         let mut agent = Agent::connect(deadline).unwrap();
         let keys = agent.identities(deadline).unwrap();
-        assert!(keys.iter().any(|key| {
+        assert!(keys.keys.iter().any(|key| {
             let mut candidate = Vec::new();
             sunset::sshwire::ssh_push_vec(&mut candidate, &key.pubkey()).unwrap();
             candidate == wire
@@ -290,6 +316,36 @@ mod tests {
         let signature =
             ssh_key::Signature::new(ssh_key::Algorithm::Ed25519, signature.to_vec()).unwrap();
         signature::Verifier::verify(&key, message, &signature).unwrap();
+    }
+
+    #[test]
+    fn public_key_algorithm_reads_the_ssh_name() {
+        let mut blob = Vec::new();
+        put_string(&mut blob, b"sk-ssh-ed25519@openssh.com").unwrap();
+        blob.extend_from_slice(&[0; 8]);
+        assert_eq!(
+            public_key_algorithm(&blob),
+            Some("sk-ssh-ed25519@openssh.com")
+        );
+        assert_eq!(public_key_algorithm(&[]), None);
+    }
+
+    #[test]
+    fn unsupported_agent_keys_are_named() {
+        let text = unsupported_identities(
+            3,
+            &[
+                "sk-ssh-ed25519@openssh.com (yubikey)".into(),
+                "sk-ecdsa-sha2-nistp256@openssh.com".into(),
+            ],
+        );
+        assert_eq!(
+            text,
+            "the SSH agent holds 3 keys, 2 unsupported (sk-ssh-ed25519@openssh.com (yubikey), sk-ecdsa-sha2-nistp256@openssh.com)"
+        );
+        let one = unsupported_identities(1, &["sk-ssh-ed25519@openssh.com".into()]);
+        assert!(one.contains("1 key"), "{one}");
+        assert!(one.contains("1 unsupported"), "{one}");
     }
 
     #[test]

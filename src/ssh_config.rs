@@ -23,14 +23,16 @@ pub struct Config {
     home: path::PathBuf,
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Profile {
     pub host: String,
     pub user: Option<String>,
     pub port: Option<u16>,
-    pub identity: Option<path::PathBuf>,
+    pub identities: Vec<path::PathBuf>,
     pub known_hosts: Option<path::PathBuf>,
     pub identities_only: bool,
+    /// Known-hosts lookup name, from `HostKeyAlias`. TCP still uses `host`.
+    pub host_key_alias: Option<String>,
     /// Retain these in the form and refuse to silently bypass them on Connect.
     pub unsupported: Vec<String>,
 }
@@ -89,12 +91,13 @@ impl Config {
         &self.aliases
     }
 
-    /// The first existing OpenSSH default identity Starcom can sign.
+    /// Existing OpenSSH default identities Starcom can sign, in offer order.
     ///
-    /// OpenSSH offers every default file plus agent keys. Starcom's form holds
-    /// one file, so this prefers Ed25519 over leftover RSA/ECDSA files.
-    pub fn default_identity(&self) -> Option<path::PathBuf> {
-        first_default_identity(&self.home)
+    /// OpenSSH offers every default file plus agent keys. Starcom tries these
+    /// files, then the agent unless IdentitiesOnly is set. Hardware-backed
+    /// `*_sk` files are omitted: they cannot be offered.
+    pub fn default_identities(&self) -> Vec<path::PathBuf> {
+        default_identities(&self.home)
     }
 
     pub fn resolve(&self, alias: &str) -> anyhow::Result<Profile> {
@@ -118,15 +121,16 @@ impl Config {
                 .is_some_and(|value| value.eq_ignore_ascii_case("yes")),
             ..Profile::default()
         };
-        if let Some(value) = first("identityfile") {
-            if values["identityfile"].len() > 1 {
+        if let Some(entries) = values.get("identityfile") {
+            for value in entries {
+                if value == "none" {
+                    profile.unsupported.push("IdentityFile none".into());
+                    profile.identities.clear();
+                    break;
+                }
                 profile
-                    .unsupported
-                    .push("multiple IdentityFile entries".into());
-            } else if value != "none" {
-                profile.identity = Some(expand_path(value, &self.home, alias, &profile)?);
-            } else {
-                profile.unsupported.push("IdentityFile none".into());
+                    .identities
+                    .push(expand_path(value, &self.home, alias, &profile)?);
             }
         }
         if let Some(value) = first("userknownhostsfile") {
@@ -138,6 +142,9 @@ impl Config {
                 profile.known_hosts = Some(expand_path(value, &self.home, alias, &profile)?);
             }
         }
+        if let Some(value) = first("hostkeyalias") {
+            profile.host_key_alias = Some(expand_name(value, alias, &profile)?);
+        }
         // These options change routing, authentication, or trust. Display them
         // as blockers rather than connecting directly or using another identity.
         for (name, neutral) in [
@@ -145,7 +152,6 @@ impl Config {
             ("proxycommand", "none"),
             ("certificatefile", "none"),
             ("identityagent", "SSH_AUTH_SOCK"),
-            ("hostkeyalias", ""),
             ("globalknownhostsfile", "none"),
             ("canonicalizehostname", "no"),
             ("bindaddress", ""),
@@ -165,8 +171,8 @@ impl Config {
             }
         }
         if first("identitiesonly").is_some_and(|value| value.eq_ignore_ascii_case("yes"))
-            && profile.identity.is_none()
-            && self.default_identity().is_none()
+            && profile.identities.is_empty()
+            && self.default_identities().is_empty()
         {
             profile
                 .unsupported
@@ -328,11 +334,14 @@ fn words(line: &str) -> anyhow::Result<Vec<String>> {
 /// Hardware-backed `*_sk`, DSA, and XMSS keys are omitted: they are unsupported.
 const DEFAULT_IDENTITY_FILES: [&str; 3] = ["id_ed25519", "id_ecdsa", "id_rsa"];
 
-fn first_default_identity(home: &path::Path) -> Option<path::PathBuf> {
-    DEFAULT_IDENTITY_FILES.iter().find_map(|name| {
-        let path = home.join(".ssh").join(name);
-        path.is_file().then_some(path)
-    })
+fn default_identities(home: &path::Path) -> Vec<path::PathBuf> {
+    DEFAULT_IDENTITY_FILES
+        .iter()
+        .filter_map(|name| {
+            let path = home.join(".ssh").join(name);
+            path.is_file().then_some(path)
+        })
+        .collect()
 }
 
 fn expand_path(
@@ -378,6 +387,37 @@ fn expand_path(
         // OpenSSH resolves a relative IdentityFile against the process directory.
         Ok(path)
     }
+}
+
+/// Hostname-shaped percent expansion for `HostKeyAlias`. Not a path: no `~/`.
+fn expand_name(value: &str, alias: &str, profile: &Profile) -> anyhow::Result<String> {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('h') => out.push_str(&profile.host),
+            Some('n') => out.push_str(alias),
+            Some('r') => out.push_str(
+                profile
+                    .user
+                    .as_deref()
+                    .context("%r needs an explicit User")?,
+            ),
+            Some('p') => out.push_str(&profile.port.unwrap_or(22).to_string()),
+            _ => anyhow::bail!("unsupported SSH HostKeyAlias token"),
+        }
+    }
+    anyhow::ensure!(
+        !out.contains("${"),
+        "environment expansion in HostKeyAlias is not supported yet"
+    );
+    anyhow::ensure!(!out.is_empty(), "HostKeyAlias is empty");
+    Ok(out)
 }
 
 struct Reader<'a> {
@@ -568,14 +608,49 @@ mod tests {
     }
 
     #[test]
+    fn multiple_identityfile_entries_are_kept_in_order() {
+        let config = config(
+            "Host dev\nIdentityFile ~/.ssh/work\nIdentityFile ~/.ssh/id_ed25519\nIdentityFile ~/.ssh/id_rsa",
+        );
+        let profile = config.resolve("dev").unwrap();
+        assert_eq!(
+            profile.identities,
+            [
+                path::PathBuf::from("/home/test/.ssh/work"),
+                path::PathBuf::from("/home/test/.ssh/id_ed25519"),
+                path::PathBuf::from("/home/test/.ssh/id_rsa"),
+            ]
+        );
+        assert!(profile.unsupported.is_empty());
+    }
+
+    #[test]
+    fn hostkeyalias_names_the_known_hosts_lookup() {
+        let config = config("Host dev\nHostName 10.2.3.4\nPort 2222\nHostKeyAlias trusted.example");
+        let profile = config.resolve("dev").unwrap();
+        assert_eq!(profile.host, "10.2.3.4");
+        assert_eq!(profile.port, Some(2222));
+        assert_eq!(profile.host_key_alias.as_deref(), Some("trusted.example"));
+        assert!(profile.unsupported.is_empty());
+        assert_eq!(
+            self::config("Host dev\nHostName 10.2.3.4\nHostKeyAlias %h")
+                .resolve("dev")
+                .unwrap()
+                .host_key_alias
+                .as_deref(),
+            Some("10.2.3.4")
+        );
+    }
+
+    #[test]
     fn quoted_paths_and_percent_tokens_are_resolved() {
         let config = config(
             "Host dev\nHostName dev.test\nUser alice\nIdentityFile \"~/.ssh/my # key\" # comment\nUserKnownHostsFile %d/.ssh/known_%h",
         );
         let profile = config.resolve("dev").unwrap();
         assert_eq!(
-            profile.identity.unwrap(),
-            path::PathBuf::from("/home/test/.ssh/my # key")
+            profile.identities,
+            [path::PathBuf::from("/home/test/.ssh/my # key")]
         );
         assert_eq!(
             profile.known_hosts.unwrap(),
@@ -658,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_identityfile_selects_ed25519_over_a_leftover_rsa_file() {
+    fn omitted_identityfile_offers_every_existing_default_in_order() {
         let root = std::env::temp_dir().join(format!(
             "starcom-identity-{}-{:?}",
             std::process::id(),
@@ -684,18 +759,18 @@ mod tests {
         fs::write(root.join(".ssh/id_ed25519"), "ed25519").unwrap();
         let config = Config::load(&root).unwrap();
         assert_eq!(
-            config.default_identity(),
-            Some(root.join(".ssh/id_ed25519"))
+            config.default_identities(),
+            [root.join(".ssh/id_ed25519"), root.join(".ssh/id_rsa")]
         );
         let profile = config.resolve("zork").unwrap();
-        assert!(profile.identity.is_none());
+        assert!(profile.identities.is_empty());
         assert!(profile.unsupported.is_empty());
         fs::write(root.join(".ssh/config"), "Host zork\nIdentitiesOnly yes\n").unwrap();
         let config = Config::load(&root).unwrap();
         assert!(config.resolve("zork").unwrap().unsupported.is_empty());
         fs::remove_file(root.join(".ssh/id_ed25519")).unwrap();
         fs::remove_file(root.join(".ssh/id_rsa")).unwrap();
-        assert!(config.default_identity().is_none());
+        assert!(config.default_identities().is_empty());
         assert_eq!(
             Config::load(&root)
                 .unwrap()

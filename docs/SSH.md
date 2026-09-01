@@ -34,9 +34,9 @@ blocks still provide defaults but are not listed as destinations.
 The embedded resolver currently supports:
 
 - `Host` wildcard/negation matching and first-value-wins ordering;
-- `HostName`, `User`, and `Port`;
-- one `IdentityFile` plus `IdentitiesOnly`, or else the first existing
-  default identity Starcom can sign (`~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`);
+- `HostName`, `User` (the local account if omitted), `Port`, and `HostKeyAlias`;
+- every `IdentityFile` in order, plus `IdentitiesOnly`; if none are set, every
+  existing default Starcom can sign (`~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`);
 - one `UserKnownHostsFile`;
 - bounded `Include` expansion, including `*` and `?` globs.
 
@@ -45,11 +45,11 @@ are bounded. Reading configuration never executes a command. `%h`, `%n`, `%r`,
 `%p`, `%d`, `%%`, and `~/` are handled where supported.
 
 The following are not approximated: `Match`, `ProxyJump`, `ProxyCommand`, host
-certificates, multiple identities, custom agent routing, hardware security keys,
-algorithm overrides, canonicalization, binding directives, revoked-key files,
-and password/MFA workflows. A profile using unsupported routing, authentication,
-or trust policy is shown as blocked. Starcom does not silently connect directly,
-select a different key, or ignore those semantics.
+certificates, custom agent routing, hardware security keys, algorithm overrides,
+canonicalization, binding directives, revoked-key files, and password/MFA
+workflows. A profile using unsupported routing, authentication, or trust policy
+is shown as blocked. Starcom does not silently connect directly, select a
+different key, or ignore those semantics.
 
 An optional system-SSH transport remains a future escape hatch for advanced
 enterprise/cluster configurations.
@@ -81,6 +81,9 @@ Supported known-host entries:
 - OpenSSH `|1|...` hashed host names;
 - Ed25519, RSA, and ECDSA P-256 public keys supported by the SSH backend.
 
+`HostKeyAlias` is the name looked up in that file. TCP still connects to
+`HostName`; the alias is not a second hop.
+
 Unknown keys and changed keys are distinct failures. Starcom displays the
 presented SHA-256 fingerprint and never edits the trust file automatically.
 
@@ -92,27 +95,34 @@ implementation or a system-SSH adapter.
 
 ## Authentication
 
-If the profile has no `IdentityFile` and no agent is reachable, the form selects
-the first existing default identity Starcom can sign (`~/.ssh/id_ed25519`, then
-`id_ecdsa`, then `id_rsa`) and shows that path. That is the usual `ssh host`
-setup: a key file on disk, no agent. Starcom still presents only one key, so a
-leftover `id_rsa` is not tried after Ed25519; change the path on the form if the
-server needs a different file.
+Identity files from the profile are offered in order, then keys from the local
+SSH agent, matching `ssh` unless `IdentitiesOnly` is set. Multiple `IdentityFile`
+entries are kept. If the profile names none, Starcom offers every existing
+default it can sign (`~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`) before the
+agent. Encrypted files are skipped with a note to `ssh-add` them. There is no
+agent-versus-key radio on the form; an extra identity path under Advanced is
+tried first.
 
-If no agent is reachable and none of those default files exist, the connection
-form says so before you press Connect, and the failure names the socket it tried
-and what to do about it. A desktop session frequently does not inherit
-`SSH_AUTH_SOCK` from a shell, so an agent that works in a terminal can be
-invisible to a launcher-started Starcom. An agent that is running but holds no
-keys is reported as such rather than as a generic authentication failure.
-Starcom never falls back to a different key during the handshake.
+Hardware-backed `sk-*` keys are not offered. Sunset has no SK public-key type,
+so they become `PubKey::Unknown` and cannot be sent. An agent that holds only
+those keys fails with a message like `the SSH agent holds 3 keys, 1 unsupported
+(sk-ssh-ed25519@openssh.com)`. Direct-file SK signing would need libfido2,
+which Starcom does not link. The Sunset pin we build against adds a client
+`direct-tcpip` open; it does not add SK.
+
+If no agent is reachable and no identity files exist, the connection form says
+so before you press Connect, and the failure names the socket it tried and what
+to do about it. A desktop session frequently does not inherit `SSH_AUTH_SOCK`
+from a shell, so an agent that works in a terminal can be invisible to a
+launcher-started Starcom. An agent that is running but holds no keys is
+reported as such rather than as a generic authentication failure.
 
 Supported identity sources:
 
 - unencrypted OpenSSH Ed25519 private keys;
 - RSA keys using `rsa-sha2-256` signatures;
 - ECDSA P-256 keys;
-- a local OpenSSH agent.
+- a local OpenSSH agent (Ed25519, RSA, and ECDSA P-256 keys only).
 
 On Unix, the agent is selected through `SSH_AUTH_SOCK`. On Windows, Starcom uses
 the local OpenSSH-agent named pipe, or another local named pipe specified through
@@ -186,8 +196,9 @@ as painting, so pane column counts match the GUI.
 
 If public-key authentication runs out of identities, the error distinguishes
 "nothing supported was available to offer" from "the server rejected the keys
-that were offered". An agent that lists only unsupported key types fails at
-load rather than after a confusing empty offer.
+that were offered", and names skipped files and unsupported agent algorithms.
+An agent that lists only unsupported key types fails at load rather than after
+a confusing empty offer.
 
 TCP keepalive is enabled so an idle control session is not black-holed by NAT.
 On Linux and macOS the first probe is after 30 seconds of silence, then every

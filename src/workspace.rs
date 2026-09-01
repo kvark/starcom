@@ -1,9 +1,11 @@
 //! Connection tabs own independent clients, forms, selection and input tokens.
 //! A new tab displays a form, never a sidebar alongside somebody else's panes.
 
-use std::{path, sync, time};
+use std::{fs, io, path, sync, time};
 
-use crate::{desktop, reconnect, ssh_config, store, ui};
+use anyhow::Context;
+
+use crate::{desktop, dialog, reconnect, ssh_config, store, ui};
 
 const MAX_TABS: usize = 16;
 type Wake = sync::Arc<dyn Fn() + Send + Sync>;
@@ -57,6 +59,21 @@ fn label(tab: &store::Tab) -> String {
 
 impl Workspace {
     pub fn new(wake: Wake, startup: desktop::Startup) -> anyhow::Result<Self> {
+        Self::try_new(wake, startup, |_, _| dialog::BrokenStore::Exit)?
+            .ok_or_else(|| anyhow::anyhow!("saved tabs were unreadable"))
+    }
+
+    /// Open a workspace, asking with a system dialog if saved tabs cannot be
+    /// read. `None` means the user chose to exit before the window opened.
+    pub(crate) fn launch(wake: Wake, startup: desktop::Startup) -> anyhow::Result<Option<Self>> {
+        Self::try_new(wake, startup, dialog::ask_clear_or_exit)
+    }
+
+    fn try_new(
+        wake: Wake,
+        startup: desktop::Startup,
+        on_broken: impl Fn(&path::Path, &anyhow::Error) -> dialog::BrokenStore,
+    ) -> anyhow::Result<Option<Self>> {
         let mut workspace = Self {
             tabs: Vec::new(),
             active: 0,
@@ -75,7 +92,9 @@ impl Workspace {
         };
         if startup != desktop::Startup::Demo {
             workspace.reload_config();
-            workspace.restore();
+            if !workspace.restore(on_broken)? {
+                return Ok(None);
+            }
         }
         if workspace.tabs.is_empty() {
             workspace.new_tab()?;
@@ -85,26 +104,40 @@ impl Workspace {
             workspace.tabs[0].label = "Demo".into();
             workspace.tabs[0].ui.open_terminal();
         }
-        Ok(workspace)
+        Ok(Some(workspace))
     }
 
     /// Reopen saved tabs on their connection forms. Restoring never connects and
     /// never authenticates: the user presses Connect, exactly as on a cold start.
-    fn restore(&mut self) {
-        let Some(ref file) = self.store else { return };
-        let saved = match store::load(file) {
+    /// `Ok(false)` means the user chose to exit and the file was left alone.
+    fn restore(
+        &mut self,
+        on_broken: impl Fn(&path::Path, &anyhow::Error) -> dialog::BrokenStore,
+    ) -> anyhow::Result<bool> {
+        let Some(file) = self.store.clone() else {
+            return Ok(true);
+        };
+        let saved = match store::load(&file) {
             Ok(Some(saved)) => saved,
-            Ok(None) => return,
-            Err(error) => {
-                // Report it and start clean, but do NOT overwrite the file we
-                // could not read; the user may still want to repair it.
-                self.notice = Some(format!(
-                    "Could not read saved tabs ({error:#}); starting with one new tab. \
-                     The file was left as it is."
-                ));
-                self.store = None;
-                return;
-            }
+            Ok(None) => return Ok(true),
+            Err(error) => match on_broken(&file, &error) {
+                dialog::BrokenStore::Exit => {
+                    // Disable saving so a later persist cannot overwrite a file
+                    // we refused to clear.
+                    self.store = None;
+                    return Ok(false);
+                }
+                dialog::BrokenStore::Clear => {
+                    match fs::remove_file(&file) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error).context(format!("clear {}", file.display()));
+                        }
+                    }
+                    return Ok(true);
+                }
+            },
         };
         for tab in saved.tabs {
             if self.new_tab().is_err() {
@@ -116,6 +149,7 @@ impl Workspace {
         }
         self.active = saved.active.min(self.tabs.len().saturating_sub(1));
         self.fps = store::clamp_fps(saved.fps);
+        Ok(true)
     }
 
     pub(crate) fn repaint_interval(&self) -> time::Duration {
@@ -479,7 +513,6 @@ mod tests {
                         user: "alice".into(),
                         session: "work".into(),
                         port: 2222,
-                        agent: true,
                         history: 300,
                         interactive: true,
                         reconnect: true,
@@ -490,7 +523,6 @@ mod tests {
                         user: "bob".into(),
                         session: "ci".into(),
                         port: 22,
-                        agent: true,
                         history: 200,
                         ..store::Tab::default()
                     },
@@ -513,7 +545,7 @@ mod tests {
             fps: store::DEFAULT_FPS,
             suspend_clock: reconnect::AliveClock::now(),
         };
-        workspace.restore();
+        assert!(workspace.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
         assert_eq!(workspace.tabs.len(), 2);
         assert_eq!(workspace.active, 1);
         // The whole point: no tab may be connecting or connected at startup.
@@ -537,8 +569,23 @@ mod tests {
         assert_eq!(reloaded.active, 1);
     }
 
+    fn broken_workspace(file: path::PathBuf) -> Workspace {
+        Workspace {
+            tabs: Vec::new(),
+            active: 0,
+            next: 1,
+            wake: sync::Arc::new(|| {}),
+            config: sync::Arc::new(ssh_config::Config::default()),
+            config_error: None,
+            notice: None,
+            store: Some(file),
+            fps: store::DEFAULT_FPS,
+            suspend_clock: reconnect::AliveClock::now(),
+        }
+    }
+
     #[test]
-    fn an_unreadable_saved_workspace_is_reported_and_left_alone() {
+    fn an_unreadable_saved_workspace_is_left_alone_when_the_user_exits() {
         let directory = std::env::temp_dir().join(format!(
             "starcom-workspace-bad-{}-{:?}",
             std::process::id(),
@@ -558,25 +605,45 @@ mod tests {
         let file = directory.join("workspace.conf");
         let original = "[tab]\nport not-a-number\n";
         std::fs::write(&file, original).unwrap();
-        let mut workspace = Workspace {
-            tabs: Vec::new(),
-            active: 0,
-            next: 1,
-            wake: sync::Arc::new(|| {}),
-            config: sync::Arc::new(ssh_config::Config::default()),
-            config_error: None,
-            notice: None,
-            store: Some(file.clone()),
-            fps: store::DEFAULT_FPS,
-            suspend_clock: reconnect::AliveClock::now(),
-        };
-        workspace.restore();
+        let mut workspace = broken_workspace(file.clone());
+        assert!(!workspace.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
         assert!(workspace.tabs.is_empty());
-        assert!(workspace.notice.is_some(), "the failure must be reported");
-        // A file we could not read must not be replaced by a guess.
         workspace.new_tab().unwrap();
         workspace.persist();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
+
+    #[test]
+    fn clearing_an_unreadable_saved_workspace_deletes_the_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "starcom-workspace-clear-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("workspace.conf");
+        std::fs::write(&file, "[tab]\nport not-a-number\n").unwrap();
+        let mut workspace = broken_workspace(file.clone());
+        assert!(
+            workspace
+                .restore(|_, _| dialog::BrokenStore::Clear)
+                .unwrap()
+        );
+        assert!(workspace.tabs.is_empty());
+        assert!(!file.exists(), "Clear must delete the unreadable file");
+        workspace.new_tab().unwrap();
+        workspace.persist();
+        assert!(store::load(&file).unwrap().is_some());
     }
 
     #[test]

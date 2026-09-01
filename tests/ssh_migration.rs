@@ -18,7 +18,8 @@ fn options() -> ssh::Options {
             .unwrap(),
         user: env::var("STARCOM_TEST_USER").unwrap(),
         known_hosts: root().join("known_hosts"),
-        authentication: ssh::Authentication::Identity(root().join("id_ed25519")),
+        authentication: ssh::Authentication::identity(root().join("id_ed25519")),
+        host_key_alias: None,
         timeout: time::Duration::from_secs(5),
     }
 }
@@ -28,7 +29,7 @@ fn options() -> ssh::Options {
 fn rustcrypto_identity_algorithms_and_rekeyed_stream_work() {
     for key in ["id_ed25519", "id_rsa", "id_ecdsa"] {
         let mut options = options();
-        options.authentication = ssh::Authentication::Identity(root().join(key));
+        options.authentication = ssh::Authentication::identity(root().join(key));
         let mut channel = ssh::Connection::connect(&options)
             .unwrap()
             .exec("python3 -c 'import sys; sys.stdout.write(\"0123456789abcdef\" * 8192)' ")

@@ -86,7 +86,7 @@ mode is the external frontend interface and works with the host's installed tmux
 | Automatic retry | Transport loss only. Authentication, trust, missing-session, server-exit, and detach always stop. |
 | Advanced SSH escape hatch | Optional system-SSH transport remains a future option, alongside the `etc/sunset` patch. |
 | Third-party patches | Carried as a pinned fork plus the patch file it holds, with measured results. Never vendored, never unpinned. |
-| Saved state | Destinations and preferences only. Restoring a tab never authenticates. |
+| Saved state | Destinations and preferences only. Restoring a tab never authenticates. An unreadable file is a system dialog: clear it, or exit and leave it. |
 | Session creation | Only from an explicit action. No failure path may create a session or a server. |
 | Repository | One Rust 2024 package; normal root sources on `main`. |
 
@@ -146,10 +146,10 @@ terminal checkpoint.
   agents; no password or MFA fallback yet.
 - GUI discovery of literal `Host` aliases from `~/.ssh/config`, including bounded
   `Include` expansion and wildcard defaults.
-- Supported resolution: `Host`, `HostName`, `User`, `Port`, one `IdentityFile`,
-  `IdentitiesOnly`, one `UserKnownHostsFile`, and OpenSSH's default
-  `id_ed25519` / `id_ecdsa` / `id_rsa` when `IdentityFile` is omitted and no
-  agent is reachable.
+- Supported resolution: `Host`, `HostName`, `User`, `Port`, `HostKeyAlias`, every `IdentityFile`
+  in order, `IdentitiesOnly`, one `UserKnownHostsFile`, and OpenSSH's default
+  `id_ed25519` / `id_ecdsa` / `id_rsa` when `IdentityFile` is omitted. Files
+  are offered first, then the agent, unless `IdentitiesOnly` closed that path.
 - `Match`, jump/proxy routing, certificates, custom agents, and security-algorithm
   overrides are reported as unsupported rather than ignored.
 
@@ -271,9 +271,13 @@ verified to fail when automatic retry is disabled.
   `TcpStream`. Until that exists, `ProxyJump` stays reported as unsupported.
 - [ ] Improve certificate, hardware-key, custom-agent, and MFA workflows.
   Sunset 0.6's client emits no keyboard-interactive event and has no certificate
-  path, so MFA and certificates cannot be driven from it at all. Hardware keys and
-  custom agents remain reachable through an agent socket and are the tractable
-  part of this item.
+  path, so MFA and certificates cannot be driven from it at all. Hardware-backed
+  `sk-*` keys are **not** offered today: Sunset's `PubKey` has no SK variant, so
+  agent identities of those types are listed as skipped (`the SSH agent holds N
+  keys, M unsupported (sk-…)`). The pinned Sunset fork adds only a client
+  `direct-tcpip` open; it does not add SK. Direct-file SK signing would need
+  libfido2, which Starcom will not link. Custom `IdentityAgent` sockets remain a
+  separate blocker.
 
 Gate: a user with several hosts can reopen yesterday's tabs, see what is running,
 and start what is missing, without Starcom authenticating or creating anything on

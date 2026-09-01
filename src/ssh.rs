@@ -14,10 +14,31 @@ const MAX_QUEUED_STDOUT: usize = 1024 * 1024;
 const MAX_QUEUED_STDERR: usize = 64 * 1024;
 const DRIVE_BUDGET: usize = 512;
 
+/// How this connection will offer public keys.
+///
+/// Files are tried in order, then the agent, matching `ssh` unless
+/// `IdentitiesOnly` closed the agent path. Hardware-backed `sk-*` keys are
+/// listed as skipped: Sunset cannot offer them.
 #[derive(Clone, Debug)]
-pub enum Authentication {
-    Identity(path::PathBuf),
-    Agent,
+pub struct Authentication {
+    pub files: Vec<path::PathBuf>,
+    pub agent: bool,
+}
+
+impl Authentication {
+    pub fn identity(path: path::PathBuf) -> Self {
+        Self {
+            files: vec![path],
+            agent: false,
+        }
+    }
+
+    pub fn agent() -> Self {
+        Self {
+            files: Vec::new(),
+            agent: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +48,9 @@ pub struct Options {
     pub user: String,
     pub known_hosts: path::PathBuf,
     pub authentication: Authentication,
+    /// Name used in known_hosts instead of `host`, from `HostKeyAlias`.
+    /// TCP still connects to `host`.
+    pub host_key_alias: Option<String>,
     /// Per-operation timeout. OS hostname resolution is not covered by this.
     pub timeout: time::Duration,
 }
@@ -69,6 +93,24 @@ impl Options {
                 "an explicit known-hosts file is required",
             ));
         }
+        if let Some(ref alias) = self.host_key_alias
+            && (alias.is_empty()
+                || alias.len() > 255
+                || !alias
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-:_".contains(&b)))
+        {
+            return Err(Error::new(
+                Kind::Configuration,
+                "HostKeyAlias must be a DNS name or an unbracketed IP address",
+            ));
+        }
+        if self.authentication.files.is_empty() && !self.authentication.agent {
+            return Err(Error::new(
+                Kind::Configuration,
+                "no identity files and no SSH agent were configured",
+            ));
+        }
         Ok(())
     }
 }
@@ -108,6 +150,12 @@ impl Error {
     /// fault that refuses to reconnect.
     pub(crate) fn timeout(detail: impl fmt::Display) -> Self {
         Self::new(Kind::Timeout, detail)
+    }
+
+    /// The message without the `SSH {kind}:` prefix. Agent skip-reasons use
+    /// this so a later "not offered" list is not nested inside `SSH Authentication:`.
+    pub(crate) fn detail(&self) -> &str {
+        &self.detail
     }
 
     /// Build any failure kind without a socket, so reconnection policy can be
@@ -354,9 +402,14 @@ impl Connection {
                             .map_err(protocol)?;
                             // Also applied to subsequent key exchanges. Never
                             // accept a changed key just because the channel exists.
-                            self.fingerprint =
-                                self.trust
-                                    .verify(&self.options.host, self.options.port, &wire)?;
+                            self.fingerprint = self.trust.verify(
+                                self.options
+                                    .host_key_alias
+                                    .as_deref()
+                                    .unwrap_or(&self.options.host),
+                                self.options.port,
+                                &wire,
+                            )?;
                             check.accept().map_err(protocol)?;
                             self.verified = true;
                         }

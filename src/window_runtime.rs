@@ -435,7 +435,7 @@ pub fn run(startup: desktop::Startup) -> anyhow::Result<()> {
             }
         }
     });
-    let workspace = workspace::Workspace::new(
+    let Some(workspace) = workspace::Workspace::launch(
         {
             let proxy = proxy.clone();
             sync::Arc::new(move || {
@@ -443,7 +443,10 @@ pub fn run(startup: desktop::Startup) -> anyhow::Result<()> {
             })
         },
         startup,
-    )?;
+    )?
+    else {
+        return Ok(());
+    };
     let mut app = App {
         workspace,
         ctx,

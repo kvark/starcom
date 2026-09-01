@@ -52,17 +52,20 @@ own.
 Currently supported:
 
 - `Host` patterns and negation, with OpenSSH-style first-value-wins ordering;
-- `HostName`, `User`, and `Port`;
-- one `IdentityFile` and `IdentitiesOnly`, or else `~/.ssh/id_ed25519` /
-  `id_ecdsa` / `id_rsa` when those default files exist;
+- `HostName`, `User` (or the local account if omitted), `Port`, and
+  `HostKeyAlias` (known-hosts lookup name; the TCP target is still `HostName`);
+- every `IdentityFile` in order, plus `IdentitiesOnly`; if none are set, every
+  existing `~/.ssh/id_ed25519` / `id_ecdsa` / `id_rsa`;
 - one `UserKnownHostsFile`;
 - bounded `Include` files and `*`/`?` include globs.
 
 Wildcard `Host` entries apply defaults but are not shown as literal suggestions.
 The parser never executes configuration commands. `Match`, `ProxyJump`,
-`ProxyCommand`, certificates, custom agents, multiple identity files, algorithm
-overrides, and other routing/security policy are displayed as blockers. Starcom
-does not silently bypass them by connecting directly or choosing another key.
+`ProxyCommand`, certificates, custom agents, algorithm overrides, and other
+routing/security policy are displayed as blockers. Starcom does not silently
+bypass them by connecting directly or choosing another key. Hardware-backed
+`sk-*` keys are skipped at authentication with a named algorithm, not treated as
+a config blocker.
 
 Use **Reload config** after editing the file. Unknown or changed host keys fail
 instead of being accepted automatically. See [SSH.md](SSH.md) for the exact trust
@@ -75,15 +78,20 @@ on Windows, or `$XDG_CONFIG_HOME` where it is set) and reopened next time.
 
 What is saved is where a tab points and how it should connect: destination alias,
 host, user, port, session name, tmux socket, history depth, whether it is
-interactive, whether it reconnects, whether it uses the agent or an identity
-file, and the global redraw cap (`fps`). Nothing that would let a reader of that file connect is written: no keys,
-no passphrases, no host-key material, and no terminal contents. An identity entry
-is the path you already chose, never the key behind it.
+interactive, whether it reconnects, an extra identity path if you typed one,
+and the global redraw cap (`fps`). Nothing that would let a reader of that file
+connect is written: no keys, no passphrases, no host-key material, and no
+terminal contents. An identity entry is the path you already chose, never the
+key behind it.
 
-Restored tabs open on their connection form with the fields filled in. Starcom
-does not connect or authenticate at startup — you press **Connect**, exactly as
-on a cold start. A saved file that cannot be read is reported and left untouched
-rather than replaced with a guess.
+Restored tabs open on their connection form with the fields filled in. Identity
+files, `IdentitiesOnly`, and unsupported-policy blockers are re-read from
+`~/.ssh/config` so a saved tab cannot skip a new `IdentityFile` or connect on
+terms the config no longer allows. Starcom does not connect or authenticate at
+startup — you press **Connect**, exactly as on a cold start. A saved file that
+cannot be read is a system dialog before the window opens: it names the file and
+the parse error, and asks whether to clear the file or exit. Exit is the default
+and leaves the file unchanged. Clearing deletes it and starts with one new tab.
 
 The demo neither reads nor writes this file.
 
@@ -115,15 +123,16 @@ blocks the window or disturbs a live attachment.
 Enable **Allow terminal input** before connecting for an interactive attachment.
 A read-only attachment remains available for inspection.
 
-Selecting a Host alias that has no `IdentityFile` uses **SSH agent** when one is
-reachable. If none is, Starcom fills **Key file** from the first existing default
-identity (`~/.ssh/id_ed25519`, then `id_ecdsa`, then `id_rsa`) — the same files
-`ssh` would offer without an agent. If **SSH agent** stays selected and no agent
-is reachable, the form says so before you connect. A desktop session often does
-not inherit `SSH_AUTH_SOCK` from a shell, so an agent that works in your terminal
-may be invisible here; start an agent in the session that launches Starcom, or
-choose a key file. The warning clears on its own once an agent appears; there is
-no need to restart Starcom.
+Selecting a Host alias offers its `IdentityFile` entries in order, then the
+local SSH agent, unless `IdentitiesOnly` is set. If the profile names no files,
+Starcom offers every existing default it can sign (`~/.ssh/id_ed25519`,
+`id_ecdsa`, `id_rsa`) before the agent. There is no agent-versus-key radio; an
+extra identity path lives under Advanced. If no agent is reachable and no
+identity files exist, the form says so before you connect. A desktop session
+often does not inherit `SSH_AUTH_SOCK` from a shell, so an agent that works in
+your terminal may be invisible here; start an agent in the session that launches
+Starcom, or add `IdentityFile` to `~/.ssh/config`. The warning clears on its own
+once an agent appears; there is no need to restart Starcom.
 
 Click a pane to focus it. Text and committed IME input are encoded as UTF-8.
 Enter, arrows, Home/End, Page Up/Down, Insert/Delete, Tab, Escape, Backspace, and

@@ -186,11 +186,22 @@ def main() -> None:
     macos.mkdir(parents=True, exist_ok=True)
     windows.mkdir(parents=True, exist_ok=True)
     (ROOT / "etc" / "starcom.svg").write_text(svg_text(), encoding="utf-8")
-    png256 = png_bytes(256, 256, render(256))
-    (macos / "icon.png").write_bytes(png256)
+    # cargo-bundle's ICNS writer maps density-1 PNGs to 16/32/64/128/256/512.
+    # 1024 px is 512@2x; the @2x filename is what sets density so the type
+    # matches. icon.png stays 256 for the winit window icon.
+    for size in (16, 32, 64, 128, 256, 512):
+        data = png_bytes(size, size, render(size))
+        (macos / f"icon_{size}.png").write_bytes(data)
+        if size == 256:
+            (macos / "icon.png").write_bytes(data)
+    png1024 = png_bytes(1024, 1024, render(1024))
+    (macos / "icon_512@2x.png").write_bytes(png1024)
     ico_images = [(size, png_bytes(size, size, render(size))) for size in (16, 24, 32, 48, 64, 128, 256)]
     (windows / "icon.ico").write_bytes(ico_bytes(ico_images))
-    print(f"wrote etc/starcom.svg, etc/macos/icon.png ({len(png256)} bytes), etc/windows/icon.ico")
+    print(
+        "wrote etc/starcom.svg, etc/macos/icon.png, etc/macos/icon_{16,32,64,128,256,512}.png, "
+        "etc/macos/icon_512@2x.png, etc/windows/icon.ico"
+    )
 
 
 if __name__ == "__main__":

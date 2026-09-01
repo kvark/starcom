@@ -4,12 +4,51 @@ on:
   push:
     tags:
       - "v*"
+  # Re-run a release without deleting and re-pushing its tag, and create the
+  # tag from here when pushing one is not an option. The tag is made at the
+  # dispatched commit if it does not already exist.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, e.g. v0.1.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
+  # Create the release once, with the notes, before any job races to upload an
+  # asset into it. The matrix below only attaches files.
+  notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Extract this tag's section from CHANGELOG.md
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          case "$TAG" in v*) ;; *) echo "not a version tag: $TAG" >&2; exit 1;; esac
+          awk -v want="## $TAG" '
+            $0 == want { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          # An empty body means the tag has no changelog entry. Say so here
+          # rather than publishing a release with nothing in it.
+          test -s notes.md
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Starcom ${{ inputs.tag || github.ref_name }}
+          body_path: notes.md
+
   release:
+    needs: notes
     strategy:
       fail-fast: false
       matrix:
@@ -18,6 +57,7 @@ jobs:
           - os: windows-latest
           - os: macos-latest
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,8 +68,11 @@ jobs:
       - name: Install packaging tools (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
+          # cargo-bundle shells out to mksquashfs to build the AppImage.
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools
           cargo install cargo-bundle --git https://github.com/burtonageo/cargo-bundle --rev 17cc8eb --locked
-          cargo install cargo-deb cargo-generate-rpm
+          cargo install cargo-deb cargo-generate-rpm --locked
 
       - name: Build + bundle (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -43,9 +86,7 @@ jobs:
 
       - name: Package AppImage (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          mkdir -p dist
-          cp target/release/bundle/appimage/starcom_*_x86_64.AppImage dist/starcom-linux-x86_64.AppImage
+        run: cp target/release/bundle/appimage/starcom_*_x86_64.AppImage dist/starcom-linux-x86_64.AppImage
 
       - name: Package deb + rpm (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -68,7 +109,7 @@ jobs:
         run: |
           mkdir -p dist
           APP=target/aarch64-apple-darwin/release/bundle/osx/Starcom.app
-          codesign --sign - --deep --force "$APP"
+          codesign --sign - --force --deep "$APP"
           ditto -c -k --sequesterRsrc --keepParent "$APP" dist/starcom-macos-aarch64.zip
           mkdir -p dmg_staging
           cp -R "$APP" dmg_staging/
@@ -92,4 +133,5 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist/*

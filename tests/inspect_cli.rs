@@ -29,9 +29,7 @@ fn invalid_options_fail_before_networking() {
             "work",
             "--known-hosts",
             "missing",
-            "--agent",
             "--identity",
-            "missing",
         ],
     ] {
         let output = process::Command::new(env!("CARGO_BIN_EXE_starcom-inspect"))

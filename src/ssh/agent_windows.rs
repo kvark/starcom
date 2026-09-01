@@ -60,7 +60,7 @@ impl Stream {
                 io::Error::other(format!(
                     "the SSH agent at {} could not be reached ({error}). Start the \
                      OpenSSH Authentication Agent service and add a key with \
-                     `ssh-add`, or choose a private-key file instead.",
+                     `ssh-add`, or set IdentityFile in ~/.ssh/config.",
                     path.to_string_lossy()
                 ))
             })?;

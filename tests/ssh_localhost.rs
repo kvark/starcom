@@ -17,7 +17,8 @@ fn options() -> ssh::Options {
             .unwrap(),
         user: env::var("STARCOM_TEST_USER").unwrap(),
         known_hosts: root().join("known_hosts"),
-        authentication: ssh::Authentication::Identity(root().join("id_ed25519")),
+        authentication: ssh::Authentication::identity(root().join("id_ed25519")),
+        host_key_alias: None,
         timeout: time::Duration::from_secs(5),
     }
 }
@@ -107,7 +108,7 @@ fn trust_failures_precede_authentication_and_do_not_rewrite_known_hosts() {
     ] {
         let mut options = options();
         options.known_hosts = root().join(name);
-        options.authentication = ssh::Authentication::Identity(root().join("DOES_NOT_EXIST"));
+        options.authentication = ssh::Authentication::identity(root().join("DOES_NOT_EXIST"));
         let before = fs::read(&options.known_hosts).unwrap();
         let error = ssh::Connection::connect(&options)
             .err()
@@ -123,7 +124,7 @@ fn hashed_known_hosts_and_explicit_agent_authentication_work() {
     let mut options = options();
     options.known_hosts = root().join("known_hosts.hashed");
     drop(ssh::Connection::connect(&options).unwrap());
-    options.authentication = ssh::Authentication::Agent;
+    options.authentication = ssh::Authentication::agent();
     drop(ssh::Connection::connect(&options).unwrap());
 }
 

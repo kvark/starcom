@@ -41,8 +41,6 @@ pub struct Tab {
     pub user: String,
     pub session: String,
     pub port: u16,
-    /// `true` selects the local SSH agent, `false` an identity file.
-    pub agent: bool,
     pub identity: String,
     pub known_hosts: String,
     pub socket: String,
@@ -186,7 +184,6 @@ fn tab(fields: &collections::BTreeMap<&str, &str>) -> anyhow::Result<Tab> {
                     | "user"
                     | "session"
                     | "port"
-                    | "auth"
                     | "identity"
                     | "known-hosts"
                     | "socket"
@@ -219,7 +216,6 @@ fn tab(fields: &collections::BTreeMap<&str, &str>) -> anyhow::Result<Tab> {
             .transpose()
             .context("invalid port")?
             .unwrap_or(22),
-        agent: fields.get("auth").is_none_or(|value| *value == "agent"),
         identity: text("identity"),
         known_hosts: text("known-hosts"),
         socket: text("socket"),
@@ -261,7 +257,6 @@ pub fn render(workspace: &Workspace) -> String {
         put("user", &tab.user);
         put("session", &tab.session);
         put("port", &tab.port.to_string());
-        put("auth", if tab.agent { "agent" } else { "identity" });
         put("identity", &tab.identity);
         put("known-hosts", &tab.known_hosts);
         put("socket", &tab.socket);
@@ -310,7 +305,6 @@ mod tests {
                     user: "alice".into(),
                     session: "work".into(),
                     port: 2222,
-                    agent: false,
                     identity: "/home/alice/.ssh/id_ed25519".into(),
                     known_hosts: "/home/alice/.ssh/known_hosts".into(),
                     socket: String::new(),
@@ -323,7 +317,6 @@ mod tests {
                     user: "bob".into(),
                     session: "ci".into(),
                     port: 22,
-                    agent: true,
                     history: 200,
                     interactive: false,
                     reconnect: false,
@@ -390,6 +383,11 @@ mod tests {
         assert!(load(&file).is_err());
         fs::write(&file, "[tab]\nnovel-setting yes\n").unwrap();
         assert!(load(&file).is_err(), "unknown keys must not be ignored");
+        fs::write(&file, "version 1\n[tab]\nhost a\nauth agent\n").unwrap();
+        assert!(
+            load(&file).is_err(),
+            "the old agent/key radio must not be guessed at"
+        );
         fs::write(&file, "version 2\n").unwrap();
         assert!(
             load(&file).is_err(),

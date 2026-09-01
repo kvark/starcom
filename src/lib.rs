@@ -27,6 +27,8 @@ pub mod terminal;
 #[cfg(feature = "gui")]
 pub mod desktop;
 #[cfg(feature = "gui")]
+mod dialog;
+#[cfg(feature = "gui")]
 mod ui;
 #[cfg(feature = "gui")]
 mod window;

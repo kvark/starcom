@@ -14,7 +14,34 @@ default-run = "starcom"
 [package.metadata.bundle]
 name = "Starcom"
 identifier = "com.starcom.app"
-icon = ["etc/macos/icon.png", "etc/windows/icon.ico"]
+# PNGs only. cargo-bundle --bin uses [package.metadata.bundle.bin.starcom]
+# below, not this table; keep both in sync. Do not list the Windows ICO:
+# macOS image::open of a PNG-compressed ICO can abort or yield a 16px tile.
+icon = [
+    "etc/starcom.svg",
+    "etc/macos/icon_16.png",
+    "etc/macos/icon_32.png",
+    "etc/macos/icon_64.png",
+    "etc/macos/icon_128.png",
+    "etc/macos/icon_256.png",
+    "etc/macos/icon_512.png",
+    "etc/macos/icon_512@2x.png",
+]
+
+# cargo-bundle --bin starcom ignores [package.metadata.bundle] and reads this.
+[package.metadata.bundle.bin.starcom]
+name = "Starcom"
+identifier = "com.starcom.app"
+icon = [
+    "etc/starcom.svg",
+    "etc/macos/icon_16.png",
+    "etc/macos/icon_32.png",
+    "etc/macos/icon_64.png",
+    "etc/macos/icon_128.png",
+    "etc/macos/icon_256.png",
+    "etc/macos/icon_512.png",
+    "etc/macos/icon_512@2x.png",
+]
 
 [[bin]]
 name = "starcom-inspect"
@@ -44,7 +71,7 @@ log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", optional = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.61.2", optional = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

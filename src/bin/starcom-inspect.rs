@@ -7,7 +7,7 @@ use starcom::{core, inspect, session, snapshot, ssh};
 const HELP: &str = "Starcom SSH/tmux inspector (read-only; no GUI)\n\
 \n\
 Usage: starcom-inspect --host HOST --user USER --session NAME --known-hosts FILE\n\
-                      [--identity FILE | --agent] [--port PORT] [--socket PATH]\n\
+                      [--identity FILE]... [--agent] [--port PORT] [--socket PATH]\n\
                       [--history LINES] [--timeout SECONDS] [--watch SECONDS]\n\
 \n\
 HOST is a DNS name or unbracketed IP, not an SSH config alias. This first backend\n\
@@ -15,8 +15,9 @@ does not read ~/.ssh/config. Supply connection settings explicitly.\n\
 Host keys must already be trusted in the supplied OpenSSH known_hosts file.\n\
 Unknown/changed keys are never accepted automatically. Marker/pattern policies\n\
 not supported by this backend are rejected, not ignored.\n\
-Use --agent for an encrypted key already loaded in an SSH agent; --identity\n\
-currently accepts an unencrypted private-key file. Exactly one is required.\n\
+--identity may be repeated; files are offered in order. --agent also offers\n\
+keys from the local SSH agent. At least one of --identity or --agent is required.\n\
+Hardware-backed sk-* keys are not offered.\n\
 Defaults: port 22, history 200 lines (max 1000), timeout 10 seconds per operation.\n\
 OS DNS resolution and local agent IPC are not covered by the network timeout.\n\
 Default captures are NOT an atomic/interactive session.\n\
@@ -38,6 +39,7 @@ fn run() -> anyhow::Result<()> {
     let mut args = env::args_os().skip(1);
     let mut values = collections::BTreeMap::<String, ffi::OsString>::new();
     let mut agent = false;
+    let mut identities = Vec::new();
     while let Some(arg) = args.next() {
         let arg = arg.to_str().context("option must be UTF-8")?;
         match arg {
@@ -49,8 +51,13 @@ fn run() -> anyhow::Result<()> {
                 anyhow::ensure!(!agent, "--agent supplied twice");
                 agent = true;
             }
-            "--host" | "--user" | "--session" | "--known-hosts" | "--identity" | "--port"
-            | "--socket" | "--history" | "--timeout" | "--watch" => {
+            "--identity" => {
+                identities.push(path::PathBuf::from(
+                    args.next().context("--identity needs a file")?,
+                ));
+            }
+            "--host" | "--user" | "--session" | "--known-hosts" | "--port" | "--socket"
+            | "--history" | "--timeout" | "--watch" => {
                 let value = args
                     .next()
                     .with_context(|| format!("{arg} needs a value"))?;
@@ -62,7 +69,7 @@ fn run() -> anyhow::Result<()> {
             _ => anyhow::bail!("unknown option {arg:?}; use --help"),
         }
     }
-    if values.is_empty() && !agent {
+    if values.is_empty() && !agent && identities.is_empty() {
         print!("{HELP}");
         return Ok(());
     }
@@ -74,14 +81,13 @@ fn run() -> anyhow::Result<()> {
             .remove("--known-hosts")
             .context("--known-hosts is required")?,
     );
-    let identity = values.remove("--identity").map(path::PathBuf::from);
     anyhow::ensure!(
-        agent != identity.is_some(),
-        "choose exactly one of --identity and --agent"
+        agent || !identities.is_empty(),
+        "supply --identity FILE and/or --agent"
     );
-    let authentication = match identity {
-        Some(path) => ssh::Authentication::Identity(path),
-        None => ssh::Authentication::Agent,
+    let authentication = ssh::Authentication {
+        files: identities,
+        agent,
     };
     let port = optional_number(&mut values, "--port", 22)?;
     let history = optional_number(&mut values, "--history", 200)?;
@@ -115,6 +121,7 @@ fn run() -> anyhow::Result<()> {
         user,
         known_hosts,
         authentication,
+        host_key_alias: None,
         timeout: time::Duration::from_secs(seconds),
     };
     if let Some(seconds) = watch_seconds {
