@@ -829,6 +829,7 @@ impl DesktopUi {
         if self.generation == state.generation {
             return;
         }
+        let previous_focus = self.focused;
         self.windows.clear();
         self.pane_ui.clear();
         self.focused = None;
@@ -846,10 +847,15 @@ impl DesktopUi {
             if let Some(id) = id
                 && let Some(panes) = grouped.get(&id)
             {
-                if let Some(node) = layout::Node::from_panes(panes) {
+                if let Some(node) = layout::Node::from_panes_or_zoom(panes) {
+                    let visible = node.pane_ids();
+                    self.focused = previous_focus
+                        .filter(|pane| visible.contains(pane))
+                        .or_else(|| (visible.len() == 1).then_some(visible[0]));
                     self.windows.insert(id, node);
                 } else {
-                    self.notice = Some(format!("Cannot lay out overlapping panes in window {id}"));
+                    self.notice =
+                        Some(format!("Cannot reconstruct the pane layout in window {id}"));
                 }
                 self.window = Some(id);
             } else {
@@ -863,7 +869,13 @@ impl DesktopUi {
 
     fn show_terminal(&mut self, root: &mut egui::Ui, state: &mut desktop::State) -> Action {
         self.refresh_tick = self.refresh_tick.wrapping_add(1);
+        let generation_changed = self.generation != state.generation;
         self.rebuild_layout(state);
+        if generation_changed && let Some(pane) = self.focused {
+            root.ctx().memory_mut(|memory| {
+                memory.request_focus(egui::Id::new(("terminal", self.generation, pane.0)))
+            });
+        }
         // Navigation and terminal steps are separate results, so a button press
         // can never quietly consume the keystrokes collected in the same frame.
         let mut action = Action::None;

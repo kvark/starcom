@@ -6,9 +6,10 @@ Updated: 2026-08-31.
 is half done. M2's gate is signed off; M3 is complete: transport loss is classified apart
 from authentication, trust, missing-session, server-exit, and detach; retries use
 cancellable jittered backoff with visible state; every attempt takes a fresh
-epoch and rebuilds models; session replacement and history truncation are
-reported. Loss during output, input, paste, and a remote layout change, plus a
-restarted tmux server, are covered by fixture tests.
+epoch and rebuilds models; a replaced session or restarted tmux server is
+reported. Alternate-screen panes and a History setting below tmux's buffer are
+not treated as lost output. Loss during output, input, paste, and a remote layout
+change, plus a restarted tmux server, are covered by fixture tests.
 
 M4 now persists non-secret tabs and restores them without authenticating, and
 adds explicit session discovery and creation. Its other three items — connection
@@ -231,7 +232,9 @@ as a gate: they are acceptance breadth, and the milestone no longer waits on the
   ahead of the monotonic clock) as transport loss, so a sleeping laptop
   reconnects instead of failing as a protocol fault. TCP keepalive probes every
   5s after 30s idle, four misses.
-- [x] Expose history truncation and server/session replacement clearly.
+- [x] Report a replaced session or restarted tmux server. History is bounded;
+  alternate-screen panes and a History setting below tmux's buffer are not
+  warned as discarded output.
 - [x] Reattach across a genuinely restarted tmux server and report it as a
   replacement. A fresh server numbers its first session `$0` again, so identity
   is the server pid, session id, and session creation time together.
@@ -261,8 +264,9 @@ verified to fail when automatic retry is disabled.
 - [ ] Add ProxyJump/bastion support or a system-SSH adapter for advanced configs.
   The backend blocker is removed. `etc/sunset/` holds a 62-line change to Sunset
   adding a client `direct-tcpip` open and a way to tell a refused open from a
-  slow one, and Starcom now builds against `kvark/sunset` pinned at that
-  revision, the way the GUI stack pins `kvark/blade`. It is validated against
+  slow one, plus agent-held `sk-ssh-ed25519` on the same pin, and Starcom now
+  builds against `kvark/sunset` pinned at that revision, the way the GUI stack
+  pins `kvark/blade`. It is validated against
   real OpenSSH in the normal fixture run: a forward carries data both ways, and
   both an unreachable destination and a server with `AllowTcpForwarding no` are
   reported as refusals rather than as timeouts.
@@ -271,13 +275,10 @@ verified to fail when automatic retry is disabled.
   `TcpStream`. Until that exists, `ProxyJump` stays reported as unsupported.
 - [ ] Improve certificate, hardware-key, custom-agent, and MFA workflows.
   Sunset 0.6's client emits no keyboard-interactive event and has no certificate
-  path, so MFA and certificates cannot be driven from it at all. Hardware-backed
-  `sk-*` keys are **not** offered today: Sunset's `PubKey` has no SK variant, so
-  agent identities of those types are listed as skipped (`the SSH agent holds N
-  keys, M unsupported (sk-…)`). The pinned Sunset fork adds only a client
-  `direct-tcpip` open; it does not add SK. Direct-file SK signing would need
-  libfido2, which Starcom will not link. Custom `IdentityAgent` sockets remain a
-  separate blocker.
+  path, so MFA and certificates cannot be driven from it at all. Agent-held
+  `sk-ssh-ed25519@openssh.com` keys are offered; signing stays in the agent
+  (no libfido2). `sk-ecdsa-*` is still skipped as unsupported. Direct-file SK
+  and custom `IdentityAgent` sockets remain blockers.
 
 Gate: a user with several hosts can reopen yesterday's tabs, see what is running,
 and start what is missing, without Starcom authenticating or creating anything on

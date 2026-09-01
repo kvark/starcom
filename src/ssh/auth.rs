@@ -1,8 +1,8 @@
 //! Keys are loaded only after the server's host key was accepted.
 //! Identity files are offered first; the local agent is appended unless
 //! `IdentitiesOnly` closed that path. RustCrypto signs files; the agent signs
-//! its own keys. Hardware-backed `sk-*` keys are not offered: Sunset has no
-//! SK public-key type, and this client does not talk to a FIDO device.
+//! its own keys, including `sk-ssh-ed25519` (the authenticator holds the
+//! private half). `sk-ecdsa-*` is still skipped.
 
 use std::{collections, fs, io, path, time};
 
@@ -110,6 +110,7 @@ impl Credentials {
             sunset::PubKey::Ed25519(_) => "ssh-ed25519",
             sunset::PubKey::RSA(_) => "rsa-sha2-256",
             sunset::PubKey::ECDSA256(_) => "ecdsa-sha2-nistp256",
+            sunset::PubKey::SkEd25519(_) => "sk-ssh-ed25519@openssh.com",
             _ => return Err(error("unsupported signing key")),
         };
         let mut key = Vec::new();
@@ -225,13 +226,13 @@ mod tests {
             &[
                 "/home/a/.ssh/id_ed25519: encrypted; add it with ssh-add so the agent can sign"
                     .into(),
-                "SSH agent (the SSH agent holds 3 keys, 1 unsupported (sk-ssh-ed25519@openssh.com))"
+                "SSH agent (the SSH agent holds 3 keys, 1 unsupported (sk-ecdsa-sha2-nistp256@openssh.com))"
                     .into(),
             ],
         );
         assert!(text.contains("none of 2 IdentityFile entries"));
         assert!(text.contains("skipped:"));
-        assert!(text.contains("sk-ssh-ed25519@openssh.com"));
+        assert!(text.contains("sk-ecdsa-sha2-nistp256@openssh.com"));
     }
 
     #[test]

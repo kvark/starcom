@@ -101,7 +101,7 @@ assets = [
 # Sunset. etc/sunset/ holds the patch as sent upstream; until it lands, build
 # against the fork carrying exactly that patch, pinned by revision.
 [patch.crates-io]
-sunset = { git = "https://github.com/kvark/sunset", rev = "15b1695" }
+sunset = { git = "https://github.com/kvark/sunset", rev = "0cc2d4a" }
 
 [profile.release]
 lto = "thin"

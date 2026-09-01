@@ -1,0 +1,296 @@
+From 0cc2d4a4e7d91f8c7a04b6aeddb2b35da6780dd2 Mon Sep 17 00:00:00 2001
+From: Dzmitry Malyshau <kvark@fastmail.com>
+Date: Mon, 31 Aug 2026 20:52:05 -0700
+Subject: [PATCH] Offer agent-held sk-ssh-ed25519@openssh.com keys
+
+Parse the SK public key (32-byte key plus application string) and the
+agent signature (64-byte sig, flags, counter). SignKey::AgentSkEd25519
+can be offered in userauth; signing still goes through the agent, which
+talks to the authenticator. No libfido2.
+---
+ src/packets.rs  | 36 +++++++++++++++++++++++++++++++--
+ src/sign.rs     | 53 ++++++++++++++++++++++++++++++++++++++++++++++---
+ src/sshnames.rs |  2 ++
+ 3 files changed, 86 insertions(+), 5 deletions(-)
+
+diff --git a/src/packets.rs b/src/packets.rs
+index 328fa31..9f9941f 100644
+--- a/src/packets.rs
++++ b/src/packets.rs
+@@ -336,6 +336,9 @@ pub enum PubKey<'a> {
+     #[sshwire(variant = SSH_NAME_ECDSA256)]
+     ECDSA256(ECDSAPubKey<p256::NistP256>),
+ 
++    #[sshwire(variant = SSH_NAME_SK_ED25519)]
++    SkEd25519(SkEd25519PubKey<'a>),
++
+     #[sshwire(unknown)]
+     Unknown(Unknown<'a>),
+ }
+@@ -349,6 +352,7 @@ impl PubKey<'_> {
+             PubKey::RSA(_) => Ok(SSH_NAME_RSA),
+             #[cfg(feature = "ecdsa256")]
+             PubKey::ECDSA256(_) => Ok(SSH_NAME_ECDSA256),
++            PubKey::SkEd25519(_) => Ok(SSH_NAME_SK_ED25519),
+             PubKey::Unknown(u) => Err(u),
+         }
+     }
+@@ -408,8 +412,7 @@ impl TryFrom<&PubKey<'_>> for ssh_key::PublicKey {
+                 Ok(k.into())
+             }
+ 
+-            PubKey::Unknown(u) => {
+-                trace!("unsupported {u}");
++            PubKey::SkEd25519(_) | PubKey::Unknown(_) => {
+                 Err(Error::msg("Unsupported OpenSSH key"))
+             }
+         }
+@@ -422,6 +425,14 @@ pub struct Ed25519PubKey {
+     pub key: Blob<[u8; 32]>,
+ }
+ 
++/// `sk-ssh-ed25519@openssh.com` public key: 32-byte key plus application string.
++#[derive(Debug, Clone, PartialEq, SSHEncode, SSHDecode)]
++#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
++pub struct SkEd25519PubKey<'a> {
++    pub key: Blob<[u8; 32]>,
++    pub application: BinString<'a>,
++}
++
+ #[cfg(feature = "rsa")]
+ #[derive(Clone, PartialEq)]
+ pub struct RSAPubKey {
+@@ -559,6 +570,9 @@ pub enum Signature<'a> {
+     #[sshwire(variant = SSH_NAME_ECDSA256)]
+     ECDSA256(Blob<ECDSASig<'a>>),
+ 
++    #[sshwire(variant = SSH_NAME_SK_ED25519)]
++    SkEd25519(SkEd25519Sig<'a>),
++
+     #[sshwire(unknown)]
+     Unknown(Unknown<'a>),
+ }
+@@ -572,6 +586,7 @@ impl<'a> Signature<'a> {
+             Signature::RSA(_) => Ok(SSH_NAME_RSA_SHA256),
+             #[cfg(feature = "ecdsa256")]
+             Signature::ECDSA256(_) => Ok(SSH_NAME_ECDSA256),
++            Signature::SkEd25519(_) => Ok(SSH_NAME_SK_ED25519),
+             Signature::Unknown(u) => Err(u),
+         }
+     }
+@@ -589,6 +604,7 @@ impl<'a> Signature<'a> {
+             PubKey::RSA(_) => Ok(SSH_NAME_RSA_SHA256),
+             #[cfg(feature = "ecdsa256")]
+             PubKey::ECDSA256(_) => Ok(SSH_NAME_ECDSA256),
++            PubKey::SkEd25519(_) => Ok(SSH_NAME_SK_ED25519),
+             PubKey::Unknown(u) => {
+                 warn!("Unknown key type \"{}\"", u);
+                 Err(Error::UnknownMethod { kind: "key" })
+@@ -603,6 +619,7 @@ impl<'a> Signature<'a> {
+             Signature::RSA(_) => Ok(SigType::RSA),
+             #[cfg(feature = "ecdsa256")]
+             Signature::ECDSA256(_) => Ok(SigType::ECDSA256),
++            Signature::SkEd25519(_) => Ok(SigType::SkEd25519),
+             Signature::Unknown(u) => {
+                 warn!("Unknown signature type \"{}\"", u);
+                 Err(Error::UnknownMethod { kind: "signature" })
+@@ -626,6 +643,13 @@ impl<'a> From<&'a OwnedSig> for Signature<'a> {
+                 r: sshwire::Mpint::new(r),
+                 s: sshwire::Mpint::new(s),
+             })),
++            OwnedSig::SkEd25519 { sig, flags, counter } => {
++                Signature::SkEd25519(SkEd25519Sig {
++                    sig: BinString(sig),
++                    flags: *flags,
++                    counter: *counter,
++                })
++            }
+         }
+     }
+ }
+@@ -636,6 +660,14 @@ pub struct Ed25519Sig<'a> {
+     pub sig: BinString<'a>,
+ }
+ 
++#[derive(Debug, SSHEncode, SSHDecode, Clone)]
++#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
++pub struct SkEd25519Sig<'a> {
++    pub sig: BinString<'a>,
++    pub flags: u8,
++    pub counter: u32,
++}
++
+ #[cfg(feature = "rsa")]
+ #[derive(Debug, SSHEncode, SSHDecode, Clone)]
+ #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+diff --git a/src/sign.rs b/src/sign.rs
+index c7bbed3..99000e5 100644
+--- a/src/sign.rs
++++ b/src/sign.rs
+@@ -13,7 +13,7 @@ use ed25519_dalek::{Signer, Verifier};
+ use zeroize::ZeroizeOnDrop;
+ 
+ use crate::*;
+-use packets::{Ed25519PubKey, Ed25519Sig, PubKey, Signature};
++use packets::{Ed25519PubKey, Ed25519Sig, PubKey, Signature, SkEd25519PubKey};
+ use sshnames::*;
+ use sshwire::{BinString, Blob, SSHDecode, SSHEncode, WireError, WireResult};
+ 
+@@ -59,6 +59,7 @@ const MAX_ED25519_SIG_MSG: usize = 1
+ #[derive(Debug, Clone, Copy)]
+ pub enum SigType {
+     Ed25519,
++    SkEd25519,
+     #[cfg(feature = "rsa")]
+     RSA,
+     #[cfg(feature = "ecdsa256")]
+@@ -77,6 +78,7 @@ impl SigType {
+     pub fn from_name(name: &'static str) -> Result<Self> {
+         match name {
+             SSH_NAME_ED25519 => Ok(SigType::Ed25519),
++            SSH_NAME_SK_ED25519 => Ok(SigType::SkEd25519),
+             #[cfg(feature = "rsa")]
+             SSH_NAME_RSA_SHA256 => Ok(SigType::RSA),
+             #[cfg(feature = "ecdsa256")]
+@@ -89,6 +91,7 @@ impl SigType {
+     pub fn algorithm_name(&self) -> &'static str {
+         match self {
+             SigType::Ed25519 => SSH_NAME_ED25519,
++            SigType::SkEd25519 => SSH_NAME_SK_ED25519,
+             #[cfg(feature = "rsa")]
+             SigType::RSA => SSH_NAME_RSA_SHA256,
+             #[cfg(feature = "ecdsa256")]
+@@ -100,6 +103,7 @@ impl SigType {
+     fn fuzz_fake_verify(&self, sig: &Signature) -> Result<()> {
+         let b = match &sig {
+             Signature::Ed25519(e) => e.sig.0,
++            Signature::SkEd25519(e) => e.sig.0,
+             #[cfg(feature = "rsa")]
+             Signature::RSA(e) => e.sig.0,
+             Signature::Unknown(_) => panic!(),
+@@ -268,6 +272,11 @@ impl SigType {
+ pub enum OwnedSig {
+     // just store raw bytes here.
+     Ed25519([u8; 64]),
++    SkEd25519 {
++        sig: [u8; 64],
++        flags: u8,
++        counter: u32,
++    },
+     #[cfg(feature = "rsa")]
+     RSA(Box<[u8]>),
+     #[cfg(feature = "ecdsa256")]
+@@ -292,6 +301,14 @@ impl TryFrom<Signature<'_>> for OwnedSig {
+                 let s: [u8; 64] = s.sig.0.try_into().map_err(|_| Error::BadSig)?;
+                 Ok(OwnedSig::Ed25519(s))
+             }
++            Signature::SkEd25519(s) => {
++                let sig: [u8; 64] = s.sig.0.try_into().map_err(|_| Error::BadSig)?;
++                Ok(OwnedSig::SkEd25519 {
++                    sig,
++                    flags: s.flags,
++                    counter: s.counter,
++                })
++            }
+             #[cfg(feature = "rsa")]
+             Signature::RSA(s) => Ok(OwnedSig::RSA(s.sig.0.into())),
+             #[cfg(feature = "ecdsa256")]
+@@ -339,6 +356,14 @@ pub enum SignKey {
+     #[zeroize(skip)]
+     AgentEd25519(dalek::VerifyingKey),
+ 
++    /// Agent-held `sk-ssh-ed25519@openssh.com`. The private key stays in the
++    /// authenticator; we only offer the public half and pass the agent signature.
++    #[zeroize(skip)]
++    AgentSkEd25519 {
++        key: [u8; 32],
++        application: heapless::Vec<u8, 64>,
++    },
++
+     #[cfg(feature = "rsa")]
+     // TODO zeroize doesn't seem supported? though BigUint has Zeroize
+     RSA(rsa::RsaPrivateKey),
+@@ -405,6 +430,13 @@ impl SignKey {
+                 PubKey::Ed25519(Ed25519PubKey { key: Blob(pk.to_bytes()) })
+             }
+ 
++            SignKey::AgentSkEd25519 { key, application } => {
++                PubKey::SkEd25519(SkEd25519PubKey {
++                    key: Blob(*key),
++                    application: BinString(application.as_slice()),
++                })
++            }
++
+             #[cfg(feature = "rsa")]
+             SignKey::RSA(k) => PubKey::RSA(RSAPubKey { key: k.into() }),
+ 
+@@ -435,6 +467,14 @@ impl SignKey {
+                 Ok(Self::AgentEd25519(k))
+             }
+ 
++            PubKey::SkEd25519(k) => {
++                let key: [u8; 32] =
++                    k.key.0.as_slice().try_into().map_err(|_| Error::BadKey)?;
++                let application = heapless::Vec::from_slice(k.application.0)
++                    .map_err(|_| Error::msg("SK application too long"))?;
++                Ok(Self::AgentSkEd25519 { key, application })
++            }
++
+             #[cfg(feature = "rsa")]
+             PubKey::RSA(k) => Ok(Self::AgentRSA(k.key.clone())),
+             #[cfg(feature = "ecdsa256")]
+@@ -451,6 +491,10 @@ impl SignKey {
+                 matches!(sig_type, SigType::Ed25519)
+             }
+ 
++            SignKey::AgentSkEd25519 { .. } => {
++                matches!(sig_type, SigType::SkEd25519)
++            }
++
+             #[cfg(feature = "rsa")]
+             SignKey::RSA(_) | SignKey::AgentRSA(_) => {
+                 matches!(sig_type, SigType::RSA)
+@@ -515,7 +559,9 @@ impl SignKey {
+             }
+ 
+             // callers should check for agent keys first
+-            SignKey::AgentEd25519(_) => unreachable!(),
++            SignKey::AgentEd25519(_) | SignKey::AgentSkEd25519 { .. } => {
++                unreachable!()
++            }
+             #[cfg(feature = "rsa")]
+             SignKey::AgentRSA(_) => unreachable!(),
+             #[cfg(feature = "ecdsa256")]
+@@ -542,7 +588,7 @@ impl SignKey {
+             #[cfg(feature = "ecdsa256")]
+             SignKey::ECDSA256(_) => false,
+ 
+-            SignKey::AgentEd25519(_) => true,
++            SignKey::AgentEd25519(_) | SignKey::AgentSkEd25519 { .. } => true,
+             #[cfg(feature = "rsa")]
+             SignKey::AgentRSA(_) => true,
+             #[cfg(feature = "ecdsa256")]
+@@ -556,6 +602,7 @@ impl core::fmt::Debug for SignKey {
+         let s = match self {
+             Self::Ed25519(_) => "Ed25519",
+             Self::AgentEd25519(_) => "AgentEd25519",
++            Self::AgentSkEd25519 { .. } => "AgentSkEd25519",
+             #[cfg(feature = "rsa")]
+             Self::RSA(_) => "RSA",
+             #[cfg(feature = "rsa")]
+diff --git a/src/sshnames.rs b/src/sshnames.rs
+index d3691aa..43ebcaf 100644
+--- a/src/sshnames.rs
++++ b/src/sshnames.rs
+@@ -28,6 +28,8 @@ pub const SSH_NAME_STRICT_KEX_C: &str = "kex-strict-c-v00@openssh.com";
+ 
+ /// [RFC8709](https://tools.ietf.org/html/rfc8709)
+ pub const SSH_NAME_ED25519: &str = "ssh-ed25519";
++/// OpenSSH [PROTOCOL.u2f](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?rev=HEAD)
++pub const SSH_NAME_SK_ED25519: &str = "sk-ssh-ed25519@openssh.com";
+ /// [RFC8332](https://tools.ietf.org/html/rfc8332)
+ pub const SSH_NAME_RSA_SHA256: &str = "rsa-sha2-256";
+ /// [RFC4253](https://tools.ietf.org/html/rfc4253). Deprecated for signatures but is a valid key type.
+-- 
+2.54.0
+

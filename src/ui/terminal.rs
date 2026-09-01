@@ -22,6 +22,9 @@ pub(crate) fn cell_metrics(ui: &mut egui::Ui, font_size: f32) -> (f32, f32) {
 pub struct PaneUi {
     pub rect: egui::Rect,
     pub painted_rows: usize,
+    /// Points of application-wheel not yet a whole tick. egui spreads one
+    /// mouse notch over later frames; rounding each fragment up sent extras.
+    remainder: f32,
 }
 
 impl Default for PaneUi {
@@ -29,8 +32,18 @@ impl Default for PaneUi {
         Self {
             rect: egui::Rect::NOTHING,
             painted_rows: 0,
+            remainder: 0.0,
         }
     }
+}
+
+/// One application tick per 40 points, the same step egui uses for a line.
+fn take_wheel_ticks(remainder: &mut f32, delta: f32) -> i32 {
+    *remainder += delta;
+    let ticks = (*remainder / 40.0) as i32;
+    let ticks = ticks.clamp(-8, 8);
+    *remainder -= ticks as f32 * 40.0;
+    ticks
 }
 
 impl PaneUi {
@@ -86,6 +99,7 @@ impl PaneUi {
                 let history = pane.terminal.model().grid().history_size();
                 let total_rows = pane.terminal.model().grid().total_lines();
                 let rows = &mut self.painted_rows;
+                let remainder = &mut self.remainder;
                 let mouse = pane.terminal.reports_mouse();
                 let wants_wheel = pane.terminal.wants_wheel();
                 let sgr_mouse = pane.terminal.sgr_mouse();
@@ -146,9 +160,10 @@ impl PaneUi {
                         }
                         if wants_wheel && response.hovered() {
                             let dy = ui.input(|input| input.smooth_scroll_delta.y);
-                            if dy.abs() > 0.5 {
-                                let up = dy > 0.0;
-                                let ticks = ((dy.abs() / 40.0).round() as u32).clamp(1, 6);
+                            let ticks = take_wheel_ticks(remainder, dy);
+                            if ticks != 0 {
+                                let up = ticks > 0;
+                                let n = ticks.unsigned_abs();
                                 if mouse {
                                     let (column, row) = response
                                         .hover_pos()
@@ -164,24 +179,26 @@ impl PaneUi {
                                             (x, y)
                                         })
                                         .unwrap_or((0, 0));
-                                    for _ in 0..ticks {
+                                    for _ in 0..n {
                                         events.push(input::Action::Bytes(
                                             input::mouse_wheel_bytes(up, column, row, sgr_mouse),
                                         ));
                                     }
                                 } else {
                                     let key = if up { input::Key::Up } else { input::Key::Down };
-                                    for _ in 0..ticks {
+                                    for _ in 0..n {
                                         events.push(input::Action::Key(
                                             key,
                                             input::Modifiers::default(),
                                         ));
                                     }
                                 }
-                                ui.ctx().input_mut(|input| {
-                                    input.smooth_scroll_delta.y = 0.0;
-                                });
                             }
+                            ui.ctx().input_mut(|input| {
+                                input.smooth_scroll_delta.y = 0.0;
+                            });
+                        } else {
+                            *remainder = 0.0;
                         }
                         if let Some(position) = response.interact_pointer_pos() {
                             let (point, side) = point_at(position);
@@ -605,5 +622,17 @@ mod tests {
             cell_colors(&cell, &colors),
             (BACKGROUND, egui::Color32::from_rgb(12, 34, 56))
         );
+    }
+
+    #[test]
+    fn partial_wheel_accumulates_instead_of_rounding_up() {
+        let mut remainder = 0.0;
+        assert_eq!(take_wheel_ticks(&mut remainder, 12.8), 0);
+        assert_eq!(take_wheel_ticks(&mut remainder, 8.7), 0);
+        assert_eq!(take_wheel_ticks(&mut remainder, 18.5), 1);
+        assert!(remainder.abs() < 1.0, "{remainder}");
+        remainder = 0.0;
+        assert_eq!(take_wheel_ticks(&mut remainder, -40.0), -1);
+        assert_eq!(remainder, 0.0);
     }
 }

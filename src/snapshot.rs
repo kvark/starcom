@@ -238,8 +238,11 @@ impl Pane {
         if let Some(bytes) = pending.first() {
             terminal.feed(&decode_escaped(bytes.as_bytes())?);
         }
+        // Alternate screen is not missing scrollback: full-screen programs do
+        // not keep their UI in the primary history. tmux having more lines than
+        // the History setting is the cap we asked for, not a surprise discard.
         let history_may_be_truncated =
-            state.alternate || state.history_size > terminal.history_capacity();
+            !state.alternate && state.history_size > terminal.history_capacity();
         Ok(Self {
             state,
             terminal,
@@ -482,6 +485,34 @@ mod tests {
         .unwrap();
         pane.terminal.feed(b"K\rnew");
         assert_eq!(pane.terminal.screen_lines()[0], "new");
+    }
+
+    #[test]
+    fn alternate_screen_is_not_truncated_history() {
+        let mut state = state(12, 3);
+        state.alternate = true;
+        state.history_size = 2000;
+        let pane = Pane::restore(
+            state,
+            &lines(&["alternate", "", ""]),
+            &lines(&["home", "", ""]),
+            &[],
+            10,
+        )
+        .unwrap();
+        assert!(!pane.history_may_be_truncated);
+    }
+
+    #[test]
+    fn primary_history_beyond_the_cap_is_truncated() {
+        let mut over = state(12, 3);
+        over.history_size = 50;
+        let pane = Pane::restore(over, &lines(&["a", "", ""]), &[], &[], 10).unwrap();
+        assert!(pane.history_may_be_truncated);
+        let mut under = state(12, 3);
+        under.history_size = 5;
+        let pane = Pane::restore(under, &lines(&["a", "", ""]), &[], &[], 10).unwrap();
+        assert!(!pane.history_may_be_truncated);
     }
 
     #[test]

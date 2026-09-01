@@ -103,12 +103,10 @@ agent. Encrypted files are skipped with a note to `ssh-add` them. There is no
 agent-versus-key radio on the form; an extra identity path under Advanced is
 tried first.
 
-Hardware-backed `sk-*` keys are not offered. Sunset has no SK public-key type,
-so they become `PubKey::Unknown` and cannot be sent. An agent that holds only
-those keys fails with a message like `the SSH agent holds 3 keys, 1 unsupported
-(sk-ssh-ed25519@openssh.com)`. Direct-file SK signing would need libfido2,
-which Starcom does not link. The Sunset pin we build against adds a client
-`direct-tcpip` open; it does not add SK.
+Hardware-backed `sk-ssh-ed25519@openssh.com` keys in the local agent are
+offered; the authenticator signs, Starcom does not talk to the FIDO device.
+`sk-ecdsa-*` is still listed as skipped. Direct-file SK signing would need
+libfido2, which Starcom does not link.
 
 If no agent is reachable and no identity files exist, the connection form says
 so before you press Connect, and the failure names the socket it tried and what
@@ -122,7 +120,7 @@ Supported identity sources:
 - unencrypted OpenSSH Ed25519 private keys;
 - RSA keys using `rsa-sha2-256` signatures;
 - ECDSA P-256 keys;
-- a local OpenSSH agent (Ed25519, RSA, and ECDSA P-256 keys only).
+- a local OpenSSH agent (Ed25519, RSA, ECDSA P-256, and `sk-ssh-ed25519`).
 
 On Unix, the agent is selected through `SSH_AUTH_SOCK`. On Windows, Starcom uses
 the local OpenSSH-agent named pipe, or another local named pipe specified through

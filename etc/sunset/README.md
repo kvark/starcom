@@ -1,13 +1,17 @@
-# Sunset patch: a client `direct-tcpip` channel
+# Sunset patches: client `direct-tcpip` and agent-held SK-Ed25519
 
 `0001-Add-a-client-direct-tcpip-channel-open.patch` applies to Sunset at tag
 `sunset-0.6.0` (upstream `https://github.com/mkj/sunset`). It is 62 lines across
 four files and adds nothing to the wire format Sunset does not already encode.
+`0002-Offer-agent-held-sk-ssh-ed25519-keys.patch` applies on top of that: it
+parses `sk-ssh-ed25519@openssh.com` public keys and agent signatures so a
+FIDO key in the local agent can be offered. Signing still happens in the
+agent; there is no libfido2.
 
-Starcom builds against it. `Cargo.toml` carries a `[patch.crates-io]` entry
-pinning `kvark/sunset` at the revision holding exactly this patch, the same way
-the GUI stack pins `kvark/blade`. This file is the change as it should reach
-upstream; the fork is how it is carried until it does.
+Starcom builds against them. `Cargo.toml` carries a `[patch.crates-io]` entry
+pinning `kvark/sunset` at the revision holding exactly these patches, the same
+way the GUI stack pins `kvark/blade`. The files here are the changes as they
+should reach upstream; the fork is how they are carried until they do.
 
 ## Why
 
@@ -32,6 +36,9 @@ it`. That is the whole of what blocks `ProxyJump` on the embedded transport.
   channel array is fixed size, so the default stays small for `no_std` targets.
   Starcom needs two channels per hop; the cap matters for sharing one connection
   across tabs, which is a separate question.
+- `PubKey::SkEd25519` and `SignKey::AgentSkEd25519`, so an agent-held
+  `sk-ssh-ed25519@openssh.com` key can be offered and the authenticator
+  signature (flags + counter) can be sent. `sk-ecdsa-*` is still unknown.
 
 ## What was measured
 
@@ -43,8 +50,8 @@ Against OpenSSH 9.x on Linux, in the normal fixture run:
   is worth knowing: the failure arrives before any data path exists.
 - A server with `AllowTcpForwarding no` — how a hardened bastion is configured —
   is also reported as a refusal rather than as a timeout.
-- Sunset's own 31 tests pass with the patch applied, and it builds both with and
-  without `many-channels`.
+- Sunset's own 31 tests pass with both patches applied, and it builds both with
+  and without `many-channels`.
 
 ## Applying it
 
@@ -62,10 +69,10 @@ cargo test --config 'patch.crates-io.sunset.path="/path/to/sunset"' --all-featur
 
 ## Status
 
-The patch is carried, not landed. `ssh::Connection::open_forward` exists and is
+The patches are carried, not landed. `ssh::Connection::open_forward` exists and is
 covered against a real server, but `ProxyJump` is still reported as unsupported:
 running a second SSH session inside the channel needs `ssh::Connection` to accept
 a transport other than a `TcpStream`, which is not written.
 
 Remove the `[patch.crates-io]` entry, this directory, and the `allow-git` entry
-in `deny.toml` once the change reaches a published Sunset release.
+in `deny.toml` once the changes reach a published Sunset release.

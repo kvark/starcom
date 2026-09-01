@@ -633,23 +633,6 @@ fn worker_loop(shared: Shared, wake: Wake) {
     }
 }
 
-/// Report scrollback that tmux could not supply in full, so a shorter view
-/// after a reattach reads as a known limit rather than as lost output.
-fn truncation_notice(view: &snapshot::View) -> Option<String> {
-    let truncated = view
-        .panes()
-        .values()
-        .filter(|pane| pane.history_may_be_truncated)
-        .count();
-    (truncated != 0).then(|| {
-        format!(
-            "Scrollback is incomplete in {truncated} of {} panes: tmux had already \
-             discarded the earlier output, or the pane is on its alternate screen.",
-            view.panes().len()
-        )
-    })
-}
-
 /// Decorrelate one tab's retry schedule from another's. This is a scheduling
 /// nicety, not a secret: nothing about the connection is derivable from it.
 fn jitter_seed(epoch: u64) -> u64 {
@@ -822,7 +805,7 @@ fn watch(
             "The remote tmux server restarted. This is a new session that only shares the old name; the earlier session and its scrollback are gone."
                 .to_owned()
         }),
-        _ => truncation_notice(&view),
+        _ => None,
     };
     let first_attach = previous.is_none();
     *previous = Some(identity);
@@ -924,7 +907,7 @@ fn watch(
                 state.generation += 1;
                 state.last_rtt = inspector.last_rtt;
                 state.phase = Phase::Watching;
-                state.continuity = truncation_notice(state.view.as_ref().expect("just set"));
+                state.continuity = None;
                 drop(state);
                 last_alive = reconnect::AliveClock::now();
                 wake();

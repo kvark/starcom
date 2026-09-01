@@ -123,6 +123,33 @@ impl Node {
         None
     }
 
+    /// Zoomed tmux windows still list every pane, overlapping. Show the largest
+    /// (the zoomed one filling the window) until tmux unzooms.
+    pub fn from_panes_or_zoom(panes: &[&snapshot::Pane]) -> Option<Self> {
+        Self::from_panes(panes).or_else(|| {
+            panes
+                .iter()
+                .max_by_key(|pane| {
+                    pane.state
+                        .size
+                        .columns()
+                        .saturating_mul(pane.state.size.rows())
+                })
+                .map(|pane| Self::Pane(pane.state.pane))
+        })
+    }
+
+    pub fn pane_ids(&self) -> Vec<tmuxctl::PaneId> {
+        match self {
+            Self::Pane(id) => vec![*id],
+            Self::Split { first, second, .. } => {
+                let mut ids = first.pane_ids();
+                ids.extend(second.pane_ids());
+                ids
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
@@ -282,6 +309,35 @@ mod tests {
                 ..
             } => assert!((0.49..0.52).contains(&ratio)),
             _ => panic!("expected side-by-side split"),
+        }
+    }
+
+    fn pane(id: u32, left: usize, top: usize, columns: usize, rows: usize) -> snapshot::Pane {
+        let state = snapshot::State::parse(&format!(
+            "%{id}|@0|{columns}|{rows}|{left}|{top}|0|0|0|0|2000|||0|{}|1|0|0|0|1|0|0|0|0|0|1|",
+            rows - 1
+        ))
+        .unwrap();
+        let size = state.size;
+        snapshot::Pane {
+            state,
+            terminal: crate::terminal::Terminal::new(size, 0),
+            history_may_be_truncated: false,
+        }
+    }
+
+    #[test]
+    fn overlapping_panes_are_treated_as_a_zoomed_window() {
+        let zoomed = pane(0, 0, 0, 80, 24);
+        let hidden = pane(1, 0, 0, 40, 24);
+        let panes = [&zoomed, &hidden];
+        assert!(
+            Node::from_panes(&panes).is_none(),
+            "overlapping geometry is not a split"
+        );
+        match Node::from_panes_or_zoom(&panes) {
+            Some(Node::Pane(id)) => assert_eq!(id, tmuxctl::PaneId(0)),
+            other => panic!("expected the larger pane, got {other:?}"),
         }
     }
 }

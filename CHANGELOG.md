@@ -12,8 +12,8 @@ embedded SSH client and draws them in a native window.
 - **Embedded SSH.** Sunset plus RustCrypto — no OpenSSL, libssh2, ring, AWS-LC,
   or `ssh` subprocess. Strict known-hosts verification with exact,
   port-qualified, and hashed entries; unknown or changed keys always fail.
-  Ed25519, RSA/SHA-256, and ECDSA P-256 keys, and Unix and Windows OpenSSH
-  agents.
+  Ed25519, RSA/SHA-256, ECDSA P-256, and agent-held `sk-ssh-ed25519` keys,
+  and Unix and Windows OpenSSH agents.
 - **`~/.ssh/config` reading, without executing anything.** `Host` patterns,
   `HostName`, `User`, `Port`, `HostKeyAlias`, every `IdentityFile` in order,
   `IdentitiesOnly`, `UserKnownHostsFile`, and bounded `Include`. Directives that cannot be
@@ -22,7 +22,7 @@ embedded SSH client and draws them in a native window.
   `id_ed25519` / `id_ecdsa` / `id_rsa` when none are set) are offered in order,
   then the local agent unless `IdentitiesOnly` is set. There is no
   agent-versus-key radio. Encrypted files and unsupported agent algorithms are
-  named in the error (`the SSH agent holds 3 keys, 1 unsupported (sk-…)`).
+  named in the error (`the SSH agent holds 3 keys, 1 unsupported (sk-ecdsa-…)`).
 - **Automatic reconnection, for transport loss only.** Authentication,
   host-key, missing-session, server-exit, and detach failures stop and wait.
   Nothing typed while offline is queued, and no uncertain input is replayed.
@@ -38,12 +38,12 @@ embedded SSH client and draws them in a native window.
   system dialog before the window opens: clear it, or exit and leave it.
 - **Desktop client.** Blade/egui rendering of Alacritty's terminal model, panes
   and tabs, mouse selection, scrollback, paste confirmation, and draggable pane
-  dividers. Remote resizing is opt-in.
+  dividers. Maximize is tmux zoom and keeps focus. Remote resizing is opt-in.
 
 Prebuilt Linux, macOS, and Windows artifacts are attached below. Linux and
 Windows builds are unsigned; macOS builds are ad-hoc codesigned, not notarized.
 
 Known limitations: MFA, host and user certificates, `ProxyJump`, `ProxyCommand`,
-hardware-backed `sk-*` keys, and reusing one SSH connection across tabs are not
-supported. Remote hosts are Linux with stock OpenSSH and tmux. No performance
-baselines are published yet.
+`sk-ecdsa` and file-based SK keys, and reusing one SSH connection across tabs
+are not supported. Remote hosts are Linux with stock OpenSSH and tmux. No
+performance baselines are published yet.

@@ -17,8 +17,8 @@ const DRIVE_BUDGET: usize = 512;
 /// How this connection will offer public keys.
 ///
 /// Files are tried in order, then the agent, matching `ssh` unless
-/// `IdentitiesOnly` closed the agent path. Hardware-backed `sk-*` keys are
-/// listed as skipped: Sunset cannot offer them.
+/// `IdentitiesOnly` closed the agent path. Agent-held `sk-ssh-ed25519`
+/// keys are offered; `sk-ecdsa-*` is listed as skipped.
 #[derive(Clone, Debug)]
 pub struct Authentication {
     pub files: Vec<path::PathBuf>,

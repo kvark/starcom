@@ -335,15 +335,15 @@ mod tests {
         let text = unsupported_identities(
             3,
             &[
-                "sk-ssh-ed25519@openssh.com (yubikey)".into(),
-                "sk-ecdsa-sha2-nistp256@openssh.com".into(),
+                "sk-ecdsa-sha2-nistp256@openssh.com (yubikey)".into(),
+                "ssh-dss".into(),
             ],
         );
         assert_eq!(
             text,
-            "the SSH agent holds 3 keys, 2 unsupported (sk-ssh-ed25519@openssh.com (yubikey), sk-ecdsa-sha2-nistp256@openssh.com)"
+            "the SSH agent holds 3 keys, 2 unsupported (sk-ecdsa-sha2-nistp256@openssh.com (yubikey), ssh-dss)"
         );
-        let one = unsupported_identities(1, &["sk-ssh-ed25519@openssh.com".into()]);
+        let one = unsupported_identities(1, &["sk-ecdsa-sha2-nistp256@openssh.com".into()]);
         assert!(one.contains("1 key"), "{one}");
         assert!(one.contains("1 unsupported"), "{one}");
     }
@@ -354,6 +354,26 @@ mod tests {
         assert!(Wire::new(&[0, 0, 0]).number().is_err());
         assert!(Wire::new(&[1]).finish().is_err());
         assert!(put_string(&mut Vec::new(), &vec![0; MAX_MESSAGE]).is_err());
+    }
+
+    #[test]
+    fn sk_ed25519_agent_signatures_round_trip() {
+        let mut wire = Vec::new();
+        put_string(&mut wire, b"sk-ssh-ed25519@openssh.com").unwrap();
+        put_string(&mut wire, &[7; 64]).unwrap();
+        wire.push(0x01);
+        wire.extend_from_slice(&42u32.to_be_bytes());
+        let sunset::OwnedSig::SkEd25519 {
+            sig,
+            flags,
+            counter,
+        } = parse_signature(&wire, "sk-ssh-ed25519@openssh.com").unwrap()
+        else {
+            panic!("expected SK signature");
+        };
+        assert_eq!(sig, [7; 64]);
+        assert_eq!(flags, 1);
+        assert_eq!(counter, 42);
     }
 
     #[test]

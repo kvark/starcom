@@ -73,9 +73,8 @@ current pen. Later output can therefore differ until the application resets or
 redraws the relevant state. Initial cell attributes are distinct from that pen.
 
 A full-screen program's conversation history is not necessarily terminal
-scrollback. History is bounded locally and remotely. A conservative truncation
-notice is exposed, including when saved-primary history cannot be inferred from
-active-alternate metadata.
+scrollback. History is bounded locally and remotely. Alternate-screen panes
+and a History setting smaller than tmux's buffer are not reported as faults.
 
 The strict control parser still rejects capture text that looks exactly like a
 control reply guard. That inherited framing limitation must not be mistaken for

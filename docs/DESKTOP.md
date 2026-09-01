@@ -64,8 +64,8 @@ The parser never executes configuration commands. `Match`, `ProxyJump`,
 `ProxyCommand`, certificates, custom agents, algorithm overrides, and other
 routing/security policy are displayed as blockers. Starcom does not silently
 bypass them by connecting directly or choosing another key. Hardware-backed
-`sk-*` keys are skipped at authentication with a named algorithm, not treated as
-a config blocker.
+`sk-ecdsa-*` keys are skipped at authentication with a named algorithm, not
+treated as a config blocker. Agent-held `sk-ssh-ed25519` is offered.
 
 Use **Reload config** after editing the file. Unknown or changed host keys fail
 instead of being accepted automatically. See [SSH.md](SSH.md) for the exact trust
@@ -197,6 +197,9 @@ Each interactive pane has window-style buttons in its top-right corner:
 - **×** close the pane (`kill-pane`), hidden when it is the last pane in the
   window
 
+Maximize is tmux zoom. Zoomed tmux still lists every pane, overlapping; Starcom
+shows the filling pane and keeps focus until you restore.
+
 Click a pane to focus it (`select-pane`). These are the same tmux operations an
 ordinary client would use, so other attached clients see them.
 
@@ -241,9 +244,9 @@ under a new connection epoch and rebuilds every pane model from a fresh snapshot
 
 Because attaching resolves the session by name, a restarted tmux server can hand
 back a different session that merely shares that name. Starcom compares the
-session identity across the reconnect and says so when it changed. It also
-reports when tmux could not supply the full scrollback, so a shorter view after
-reconnecting reads as a known limit rather than as lost output.
+session identity across the reconnect and says so when it changed. A pane on
+its alternate screen, or tmux retaining more history than the History setting,
+is not a warning: those are how full-screen programs and the history cap work.
 
 Window closure disables repaint callbacks, invalidates and wakes all workers, and
 releases Blade surface/painter/encoder resources while the winit event loop and
