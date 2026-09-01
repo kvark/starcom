@@ -36,22 +36,15 @@ impl Default for PaneUi {
     }
 }
 
-/// One egui line. Live wheel events keep at least one tick so a trackpad swipe
-/// is not waiting on this quantum; leftover smoothing only emits whole lines.
+/// One egui line. Partial motion is kept so leftover smoothing cannot add ticks.
 const WHEEL_LINE: f32 = 40.0;
 
-fn wheel_ticks(remainder: &mut f32, delta: f32, live: bool) -> i32 {
-    if live && delta.abs() > 0.5 {
-        *remainder = 0.0;
-        let sign = if delta > 0.0 { 1 } else { -1 };
-        sign * ((delta.abs() / WHEEL_LINE).round() as i32).clamp(1, 6)
-    } else {
-        *remainder += delta;
-        let ticks = (*remainder / WHEEL_LINE) as i32;
-        let ticks = ticks.clamp(-8, 8);
-        *remainder -= ticks as f32 * WHEEL_LINE;
-        ticks
-    }
+fn wheel_ticks(remainder: &mut f32, delta: f32) -> i32 {
+    *remainder += delta;
+    let ticks = (*remainder / WHEEL_LINE) as i32;
+    let ticks = ticks.clamp(-8, 8);
+    *remainder -= ticks as f32 * WHEEL_LINE;
+    ticks
 }
 
 impl PaneUi {
@@ -167,13 +160,8 @@ impl PaneUi {
                             events.push(input::Action::SelectPane);
                         }
                         if wants_wheel && response.hovered() {
-                            let (dy, live) = ui.input(|input| {
-                                (
-                                    input.smooth_scroll_delta.y,
-                                    input.time_since_last_scroll() < 0.05,
-                                )
-                            });
-                            let ticks = wheel_ticks(remainder, dy, live);
+                            let dy = ui.input(|input| input.smooth_scroll_delta.y);
+                            let ticks = wheel_ticks(remainder, dy);
                             if ticks != 0 {
                                 let up = ticks > 0;
                                 let n = ticks.unsigned_abs();
@@ -640,22 +628,13 @@ mod tests {
     #[test]
     fn leftover_wheel_accumulates_instead_of_rounding_up() {
         let mut remainder = 0.0;
-        assert_eq!(wheel_ticks(&mut remainder, 12.8, false), 0);
-        assert_eq!(wheel_ticks(&mut remainder, 8.7, false), 0);
-        assert_eq!(wheel_ticks(&mut remainder, 18.5, false), 1);
+        assert_eq!(wheel_ticks(&mut remainder, 12.8), 0);
+        assert_eq!(wheel_ticks(&mut remainder, 8.7), 0);
+        assert_eq!(wheel_ticks(&mut remainder, 18.5), 1);
         assert!(remainder.abs() < 1.0, "{remainder}");
         remainder = 0.0;
-        assert_eq!(wheel_ticks(&mut remainder, -40.0, false), -1);
+        assert_eq!(wheel_ticks(&mut remainder, -40.0), -1);
         assert_eq!(remainder, 0.0);
-    }
-
-    #[test]
-    fn live_wheel_keeps_a_tick_per_event() {
-        let mut remainder = 0.0;
-        assert_eq!(wheel_ticks(&mut remainder, 12.8, true), 1);
-        assert_eq!(remainder, 0.0);
-        assert_eq!(wheel_ticks(&mut remainder, 40.0, true), 1);
-        assert_eq!(wheel_ticks(&mut remainder, 80.0, true), 2);
-        assert_eq!(wheel_ticks(&mut remainder, -8.0, true), -1);
+        assert_eq!(wheel_ticks(&mut remainder, 80.0), 2);
     }
 }

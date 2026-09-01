@@ -167,9 +167,9 @@ Wheel handling follows the pane, not a global shortcut. If the application
 enabled mouse reporting (DEC 1000/1002/1003), the wheel is sent as a mouse
 report at the hovered cell. If it is on the alternate screen without mouse
 reporting, the wheel becomes Up/Down, matching xterm alternate-scroll. Otherwise
-the wheel examines local terminal history. A live wheel or trackpad event still
-sends at least one tick; leftover smoothing from egui is accumulated so it
-cannot add extra ticks after the gesture.
+the wheel examines local terminal history. One tick is 40 points, one egui
+line; leftover smoothing after a notch is accumulated so it cannot add extra
+ticks.
 
 Drag to select, double-click for a word, and triple-click for a line. Selection
 anchors live in the terminal model, so they follow incoming scrolls. Copying

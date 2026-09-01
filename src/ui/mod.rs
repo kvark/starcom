@@ -1282,6 +1282,14 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
 mod tests {
     use super::*;
 
+    /// `~/.ssh/<file>` after `expand_path`, including Windows separators.
+    fn tilde_identity(file: &str) -> String {
+        path::PathBuf::from("/home/test")
+            .join(format!(".ssh/{file}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn a_literal_alias_populates_the_connection_form() {
         let config = sync::Arc::new(ssh_config::Config::from_text(
@@ -1293,7 +1301,7 @@ mod tests {
         assert_eq!(ui.form.host, "10.0.0.2");
         assert_eq!(ui.form.user, "alice");
         assert_eq!(ui.form.port, 2222);
-        assert_eq!(ui.form.identity_files, ["/home/test/.ssh/dev"]);
+        assert_eq!(ui.form.identity_files, [tilde_identity("dev")]);
         assert!(!ui.form.identities_only);
         assert!(ui.form.host_key_alias.is_none());
     }
@@ -1425,7 +1433,7 @@ mod tests {
         assert_eq!(ui.form.identity, "/home/alice/.ssh/extra");
         assert_eq!(
             ui.form.identity_files,
-            ["/home/test/.ssh/work", "/home/test/.ssh/id_ed25519"]
+            [tilde_identity("work"), tilde_identity("id_ed25519")]
         );
         assert!(ui.form.identities_only);
         assert!(ui.form.unsupported.iter().any(|item| item == "proxyjump"));
