@@ -362,6 +362,7 @@ impl DesktopUi {
         self.pending_paste = None;
     }
 
+    #[cfg(test)]
     pub(crate) fn showing_form(&self) -> bool {
         self.screen == Screen::Connection
     }

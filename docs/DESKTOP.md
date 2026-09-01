@@ -29,8 +29,9 @@ panes.
 After a successful connection, the terminal workspace replaces the form in that
 tab. A failed first attach stays on the form and shows why — the toolbar phrase
 "Connection failed" is not the whole message. **Exit** always returns to the form
-in the same tab, including after a failed attach, and the strip title follows
-the form again (a restored tab is labelled the same way). Ctrl-Shift-W/Cmd-W
+in the same tab, including after a failed attach, and names the tab New
+connection. Form fields stay so you can reconnect; restored tabs that have not
+been attached this session keep their destination labels. Ctrl-Shift-W/Cmd-W
 closes the tab and detaches that Starcom client; the tmux server and remote jobs
 continue running.
 

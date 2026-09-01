@@ -18,7 +18,7 @@ Identities, hardware keys, install, and the terminal workspace after `v0.1.0`.
   window opens: clear the file, or exit and leave it. Tmux session names are
   not persisted; the host is listed when you pick it.
 - **Desktop.** Maximize is tmux zoom and keeps focus. Exit returns to the form
-  and retitles the tab from those fields. Connection tabs match the host chips
+  and names the tab **New connection**. Connection tabs match the host chips
   and no longer repeat the window title; drag a tab to reorder without dropping
   the pane's keyboard focus. Connect shows **Connecting…** on the button itself.
   A reconnecting session paints the last view in gray. Alternate-screen panes

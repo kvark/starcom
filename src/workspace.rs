@@ -8,6 +8,7 @@ use anyhow::Context;
 use crate::{desktop, dialog, reconnect, ssh_config, store, ui};
 
 const MAX_TABS: usize = 16;
+const NEW_CONNECTION: &str = "New connection";
 type Wake = sync::Arc<dyn Fn() + Send + Sync>;
 
 struct Tab {
@@ -58,7 +59,7 @@ fn label(tab: &store::Tab) -> String {
         tab.destination.trim()
     };
     match (destination.is_empty(), tab.session.trim()) {
-        (true, "") => "New connection".to_owned(),
+        (true, "") => NEW_CONNECTION.to_owned(),
         (true, session) => session.to_owned(),
         (false, "") => destination.to_owned(),
         (false, session) => format!("{destination} / {session}"),
@@ -262,7 +263,7 @@ impl Workspace {
         self.next = self.next.checked_add(1).expect("tab identity exhausted");
         self.tabs.push(Tab {
             id,
-            label: "New connection".into(),
+            label: NEW_CONNECTION.into(),
             client: desktop::Client::new(sync::Arc::clone(&self.wake))?,
             ui: ui::DesktopUi::with_config(
                 sync::Arc::clone(&self.config),
@@ -306,13 +307,6 @@ impl Workspace {
     }
 
     pub fn show(&mut self, root: &mut egui::Ui) -> Action {
-        // A tab on the form is named by where it points, like a restored tab.
-        // Exit used to leave the last attached title in the strip.
-        for tab in &mut self.tabs {
-            if tab.ui.showing_form() {
-                tab.label = label(&tab.ui.saved());
-            }
-        }
         let mut navigation = Action::None;
         let mut reorder: Option<(u64, usize)> = None;
         let new = egui::KeyboardShortcut::new(
@@ -518,7 +512,7 @@ impl Workspace {
                         ui::Action::Disconnect => {
                             tab.client.disconnect();
                             tab.ui.return_to_form();
-                            tab.label = label(&tab.ui.saved());
+                            tab.label = NEW_CONNECTION.to_owned();
                             Ok(())
                         }
                         // Resolve clipboard reads in place so the whole frame
@@ -601,7 +595,7 @@ impl Workspace {
 mod tests {
     use super::*;
     #[test]
-    fn exit_relabels_the_tab_from_the_form() {
+    fn exit_names_the_tab_a_new_connection() {
         let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
         assert_eq!(workspace.tabs[0].label, "Demo");
         let id = workspace.tabs[0].id;
@@ -611,7 +605,7 @@ mod tests {
             desktop::Phase::Disconnected
         );
         assert!(workspace.tabs[0].ui.showing_form());
-        assert_eq!(workspace.tabs[0].label, "New connection");
+        assert_eq!(workspace.tabs[0].label, NEW_CONNECTION);
 
         workspace.tabs[0].ui.restore(store::Tab {
             destination: "dev".into(),
@@ -619,8 +613,28 @@ mod tests {
             session: "work".into(),
             ..store::Tab::default()
         });
-        workspace.apply(Action::Tab(id, Box::new(ui::Action::Disconnect)), || None);
+        workspace.tabs[0].label = label(&workspace.tabs[0].ui.saved());
         assert_eq!(workspace.tabs[0].label, "dev / work");
+        workspace.apply(Action::Tab(id, Box::new(ui::Action::Disconnect)), || None);
+        assert_eq!(workspace.tabs[0].label, NEW_CONNECTION);
+        let ctx = egui::Context::default();
+        crate::window::configure(&ctx);
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 760.0),
+                )),
+                ..Default::default()
+            },
+            |root| {
+                workspace.show(root);
+            },
+        );
+        assert_eq!(
+            workspace.tabs[0].label, NEW_CONNECTION,
+            "painting the form must not put the destination back on the tab"
+        );
     }
 
     #[test]
