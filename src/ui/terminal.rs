@@ -8,6 +8,12 @@ use crate::{input, snapshot};
 const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(18, 21, 26);
 const FOREGROUND: egui::Color32 = egui::Color32::from_rgb(214, 220, 229);
 
+/// Keyboard-focus id for a pane. The white border and key translation both
+/// use this; they must stay the same widget egui's focus graph knows about.
+pub(crate) fn focus_id(generation: u64, pane: tmuxctl::PaneId) -> egui::Id {
+    egui::Id::new(("terminal", generation, pane.0))
+}
+
 /// Font cell size used both to paint and to tell tmux the client size.
 pub(crate) fn cell_metrics(ui: &mut egui::Ui, font_size: f32) -> (f32, f32) {
     let font = egui::FontId::monospace(font_size);
@@ -64,13 +70,22 @@ impl PaneUi {
     ) -> Vec<input::Action> {
         self.rect = rect;
         self.painted_rows = 0;
+        let pane_id = pane.state.pane;
+        let id = focus_id(generation, pane_id);
         if rect.width() < 16.0 || rect.height() < 40.0 {
+            if *focused == Some(pane_id) {
+                *focused = None;
+            }
             return Vec::new();
         }
         let mut events = Vec::new();
-        let pane_id = pane.state.pane;
-        let active = *focused == Some(pane_id);
-        let id = egui::Id::new(("terminal", generation, pane_id.0));
+        // The white border is keyboard focus, not a sticky selection.
+        let active = ui.ctx().memory(|memory| memory.has_focus(id));
+        if active {
+            *focused = Some(pane_id);
+        } else if *focused == Some(pane_id) {
+            *focused = None;
+        }
         let border = if active {
             ui.visuals().selection.stroke.color
         } else {
@@ -156,6 +171,23 @@ impl PaneUi {
                         {
                             *focused = Some(pane_id);
                             response.request_focus();
+                        }
+                        if response.has_focus() {
+                            // Last-frame filter is what begin_pass consults, so
+                            // this has to be set every frame we hold focus.
+                            // Otherwise ArrowUp walks to Paste and Tab/Escape
+                            // leave the remote application.
+                            ui.ctx().memory_mut(|memory| {
+                                memory.set_focus_lock_filter(
+                                    id,
+                                    egui::EventFilter {
+                                        tab: true,
+                                        horizontal_arrows: true,
+                                        vertical_arrows: true,
+                                        escape: true,
+                                    },
+                                );
+                            });
                         }
                         if response.clicked() {
                             events.push(input::Action::SelectPane);
@@ -474,7 +506,7 @@ impl PaneUi {
                             }
                         }
                     });
-                if controls {
+                if controls && *focused == Some(pane_id) {
                     let bar = egui::Rect::from_min_max(
                         egui::pos2(rect.max.x - 118.0, rect.min.y + 4.0),
                         egui::pos2(rect.max.x - 4.0, rect.min.y + 26.0),
@@ -526,9 +558,13 @@ impl PaneUi {
 }
 
 fn chrome_button(ui: &mut egui::Ui, glyph: &str, tip: &str) -> bool {
-    ui.add(egui::Button::new(egui::RichText::new(glyph).monospace()).small())
-        .on_hover_text(tip)
-        .clicked()
+    ui.add(
+        egui::Button::new(egui::RichText::new(glyph).monospace())
+            .small()
+            .sense(egui::Sense::CLICK),
+    )
+    .on_hover_text(tip)
+    .clicked()
 }
 
 pub fn copy(ctx: &egui::Context, text: String, notice: &mut Option<String>) {

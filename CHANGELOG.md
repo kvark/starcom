@@ -19,13 +19,14 @@ Identities, hardware keys, install, and the terminal workspace after `v0.1.0`.
   not persisted; the host is listed when you pick it.
 - **Desktop.** Maximize is tmux zoom and keeps focus. Exit returns to the form
   and retitles the tab from those fields. Connection tabs match the host chips
-  and no longer repeat the window title; drag a tab to reorder. Connect shows
-  **Connecting…** on the button itself. A reconnecting session paints the last
-  view in gray. Alternate-screen panes and a History setting below tmux's
-  buffer are not warned as lost output. After keys or wheel, remote echo runs
-  at 20 fps for a short time. Wheel ticks are one per 40 points; leftover
-  smoothing cannot add extra ticks. Arrow keys stay with the focused field
-  instead of highlighting other buttons.
+  and no longer repeat the window title; drag a tab to reorder without dropping
+  the pane's keyboard focus. Connect shows **Connecting…** on the button itself.
+  A reconnecting session paints the last view in gray. Alternate-screen panes
+  and a History setting below tmux's buffer are not warned as lost output.
+  After keys or wheel, remote echo runs at 20 fps for a short time. Wheel ticks
+  are one per 40 points; leftover smoothing cannot add extra ticks. The selected
+  pane is the widget with keyboard focus; arrows, Tab, and Escape stay with that
+  field or pane instead of walking to other buttons.
 - **Install.** `make install` does not assume GNU `install -D`. On macOS it
   writes `~/Applications/Starcom.app`. macOS/Windows icons use a full PNG
   family for `cargo-bundle --bin`.

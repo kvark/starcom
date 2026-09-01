@@ -408,9 +408,7 @@ impl DesktopUi {
     pub fn terminal_focused(&self, ctx: &egui::Context) -> bool {
         self.screen == Screen::Terminal
             && self.focused.is_some_and(|pane| {
-                ctx.memory(|memory| {
-                    memory.has_focus(egui::Id::new(("terminal", self.generation, pane.0)))
-                })
+                ctx.memory(|memory| memory.has_focus(terminal::focus_id(self.generation, pane)))
             })
     }
 
@@ -904,7 +902,7 @@ impl DesktopUi {
         self.rebuild_layout(state);
         if generation_changed && let Some(pane) = self.focused {
             root.ctx().memory_mut(|memory| {
-                memory.request_focus(egui::Id::new(("terminal", self.generation, pane.0)))
+                memory.request_focus(terminal::focus_id(self.generation, pane))
             });
         }
         // Navigation and terminal steps are separate results, so a button press
@@ -934,8 +932,7 @@ impl DesktopUi {
                     ui.label(state.phase.label());
                     // Cancelling a scheduled retry is the same operation as
                     // disconnecting: it ends this connection and keeps the last view.
-                    if ui
-                        .button("Exit")
+                    if click_button(ui, "Exit")
                         .on_hover_text(
                             "Drop this attachment and return to the connection form. \
                          Remote jobs keep running.",
@@ -959,8 +956,7 @@ impl DesktopUi {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button("+")
+                        if click_button(ui, "+")
                             .on_hover_text("Larger terminal text")
                             .clicked()
                         {
@@ -968,19 +964,21 @@ impl DesktopUi {
                             self.reset_client_size();
                         }
                         ui.label(format!("{} pt", self.font_size as u32));
-                        if ui
-                            .button("−")
+                        if click_button(ui, "−")
                             .on_hover_text("Smaller terminal text")
                             .clicked()
                         {
                             self.font_size = (self.font_size - 1.0).max(10.0);
                             self.reset_client_size();
                         }
-                        if ui.button("Copy selection").clicked() {
+                        if click_button(ui, "Copy selection").clicked() {
                             self.copy_selection(ui.ctx(), state);
                         }
                         if ui
-                            .add_enabled(state.input_ready(), egui::Button::new("Paste"))
+                            .add_enabled(
+                                state.input_ready(),
+                                egui::Button::new("Paste").sense(egui::Sense::CLICK),
+                            )
                             .clicked()
                             && let Some(target) = self.focused.and_then(|pane| state.target(pane))
                         {
@@ -1151,7 +1149,7 @@ impl DesktopUi {
                                     font_size,
                                     focused,
                                     notice,
-                                    controls && *focused == Some(pane_id),
+                                    controls,
                                     can_kill,
                                     !matches!(
                                         state.phase,
@@ -1292,6 +1290,11 @@ impl DesktopUi {
         let end = start + egui::vec2(width * 6.8, 0.0);
         (start, end)
     }
+}
+
+/// Click-only: arrows, Tab, and Escape must stay with the focused pane.
+fn click_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add(egui::Button::new(text).sense(egui::Sense::CLICK))
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
@@ -1575,10 +1578,25 @@ mod tests {
         );
     }
 
-    /// A frame that produces a paste request AND keystrokes must deliver both,
-    /// in order. Returning one action per frame used to discard the keystrokes.
-    #[test]
-    fn a_paste_request_does_not_displace_the_same_frame_keystrokes() {
+    fn screen_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 720.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Lay the demo pane out and hold keyboard focus long enough for egui's
+    /// last-frame EventFilter to lock arrows/tab/escape onto it.
+    fn focus_demo_pane() -> (
+        egui::Context,
+        DesktopUi,
+        desktop::State,
+        tmuxctl::PaneId,
+        desktop::Target,
+    ) {
         let ctx = egui::Context::default();
         crate::window::configure(&ctx);
         let mut state = desktop::State::interactive_demo().unwrap();
@@ -1586,28 +1604,33 @@ mod tests {
         let target = state.target(pane).expect("interactive demo target");
         let mut ui = DesktopUi::default();
         ui.open_terminal();
-        let screen = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1200.0, 720.0),
-            )),
-            ..Default::default()
-        };
-        // Lay the pane out and let the focus request settle. rebuild_layout
-        // clears the focused pane on its first pass, so ask again each frame.
+        // rebuild_layout clears the focused pane on its first pass, so ask
+        // again each frame. request_focus resets the event filter, so one
+        // extra paint is needed after the last request.
         for _ in 0..4 {
-            let _ = ctx.run_ui(screen(), |root| {
+            let _ = ctx.run_ui(screen_input(), |root| {
                 ui.show(root, &mut state);
             });
             ui.focused = Some(pane);
             ctx.memory_mut(|memory| {
-                memory.request_focus(egui::Id::new(("terminal", ui.generation, pane.0)))
+                memory.request_focus(terminal::focus_id(ui.generation, pane));
             });
         }
+        let _ = ctx.run_ui(screen_input(), |root| {
+            ui.show(root, &mut state);
+        });
         assert!(
             ui.terminal_focused(&ctx),
             "the pane must hold focus or this test proves nothing"
         );
+        (ctx, ui, state, pane, target)
+    }
+
+    /// A frame that produces a paste request AND keystrokes must deliver both,
+    /// in order. Returning one action per frame used to discard the keystrokes.
+    #[test]
+    fn a_paste_request_does_not_displace_the_same_frame_keystrokes() {
+        let (ctx, mut ui, mut state, _pane, target) = focus_demo_pane();
         let input = egui::RawInput {
             events: vec![
                 egui::Event::Key {
@@ -1620,7 +1643,7 @@ mod tests {
                 egui::Event::Text("ls".to_owned()),
             ],
             modifiers: egui::Modifiers::SHIFT,
-            ..screen()
+            ..screen_input()
         };
         let mut action = Action::None;
         let _ = ctx.run_ui(input, |root| {
@@ -1635,5 +1658,61 @@ mod tests {
             "the paste request and the keystrokes must both survive, in order"
         );
         assert!(ui.notice.is_none(), "nothing should have been dropped");
+    }
+
+    #[test]
+    fn arrow_up_stays_with_the_focused_pane() {
+        let (ctx, mut ui, mut state, pane, target) = focus_demo_pane();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..screen_input()
+        };
+        let mut action = Action::None;
+        let _ = ctx.run_ui(input, |root| {
+            action = ui.show(root, &mut state);
+        });
+        let Action::Frame(steps) = action else {
+            panic!("expected the arrow to reach the pane");
+        };
+        assert!(
+            matches!(
+                steps.as_slice(),
+                [Step::Send(
+                    sent,
+                    terminal_input::Action::Key(terminal_input::Key::Up, modifiers)
+                )] if *sent == target && !modifiers.control && !modifiers.alt && !modifiers.shift
+            ),
+            "ArrowUp must go to the remote application, not another widget"
+        );
+        assert_eq!(ui.focused, Some(pane));
+        assert!(
+            ui.terminal_focused(&ctx),
+            "egui must not walk focus to Paste or any other widget"
+        );
+    }
+
+    #[test]
+    fn losing_keyboard_focus_clears_the_pane_selection() {
+        let (ctx, mut ui, mut state, pane, _target) = focus_demo_pane();
+        ctx.memory_mut(|memory| {
+            memory.surrender_focus(terminal::focus_id(ui.generation, pane));
+        });
+        assert!(
+            !ui.terminal_focused(&ctx),
+            "surrender must drop logical focus before the next paint"
+        );
+        let _ = ctx.run_ui(screen_input(), |root| {
+            ui.show(root, &mut state);
+        });
+        assert!(
+            ui.focused.is_none(),
+            "the white border must not outlive keyboard focus"
+        );
     }
 }

@@ -418,7 +418,10 @@ impl Workspace {
         if let Some((id, insert_at)) = reorder {
             navigation = Action::Reorder { id, insert_at };
         }
-        if !matches!(navigation, Action::None) {
+        if matches!(
+            navigation,
+            Action::New | Action::Select(_) | Action::Close(_)
+        ) {
             // Switching tabs consumes the whole navigation frame. Keyboard and
             // clipboard events collected for the old tab cannot hit the new one.
             return navigation;
@@ -429,6 +432,12 @@ impl Workspace {
         let action = root
             .push_id(tab.id, |root| tab.ui.show(root, &mut tab.client.lock()))
             .inner;
+        if !matches!(navigation, Action::None) {
+            // Reorder keeps this tab painted so the focused pane stays in
+            // egui's used_ids. Skipping a frame would drop keyboard focus
+            // while the white border still claimed the pane was selected.
+            return navigation;
+        }
         Action::Tab(tab.id, Box::new(action))
     }
 
