@@ -231,6 +231,13 @@ impl Workspace {
     }
 
     pub fn show(&mut self, root: &mut egui::Ui) -> Action {
+        // A tab on the form is named by where it points, like a restored tab.
+        // Exit used to leave the last attached title in the strip.
+        for tab in &mut self.tabs {
+            if tab.ui.showing_form() {
+                tab.label = label(&tab.ui.saved());
+            }
+        }
         let mut navigation = Action::None;
         let new = egui::KeyboardShortcut::new(
             if cfg!(target_os = "macos") {
@@ -353,13 +360,8 @@ impl Workspace {
                     let result = match *action {
                         ui::Action::None => Ok(()),
                         ui::Action::Connect(connection) => {
-                            let label = format!(
-                                "{} / {}",
-                                tab.ui.form.destination(),
-                                connection.session.as_str()
-                            );
                             let started = tab.client.connect(connection).map(|()| {
-                                tab.label = label;
+                                tab.label = label(&tab.ui.saved());
                                 tab.ui.reset_client_size();
                             });
                             // Remember where a successful connection pointed, so
@@ -382,6 +384,8 @@ impl Workspace {
                         }
                         ui::Action::Disconnect => {
                             tab.client.disconnect();
+                            tab.ui.return_to_form();
+                            tab.label = label(&tab.ui.saved());
                             Ok(())
                         }
                         // Resolve clipboard reads in place so the whole frame
@@ -457,6 +461,50 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exit_relabels_the_tab_from_the_form() {
+        let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
+        assert_eq!(workspace.tabs[0].label, "Demo");
+        let id = workspace.tabs[0].id;
+        workspace.apply(Action::Tab(id, Box::new(ui::Action::Disconnect)), || None);
+        assert_eq!(
+            workspace.tabs[0].client.phase(),
+            desktop::Phase::Disconnected
+        );
+        assert!(workspace.tabs[0].ui.showing_form());
+        assert_eq!(workspace.tabs[0].label, "New connection");
+
+        workspace.tabs[0].ui.restore(store::Tab {
+            destination: "dev".into(),
+            host: "10.0.0.2".into(),
+            session: "work".into(),
+            ..store::Tab::default()
+        });
+        workspace.apply(Action::Tab(id, Box::new(ui::Action::Disconnect)), || None);
+        assert_eq!(workspace.tabs[0].label, "dev / work");
+    }
+
+    #[test]
+    fn a_tab_without_a_destination_is_labelled_by_host_and_session() {
+        assert_eq!(
+            label(&store::Tab {
+                host: "build.example.test".into(),
+                session: "ci".into(),
+                ..store::Tab::default()
+            }),
+            "build.example.test / ci"
+        );
+        assert_eq!(
+            label(&store::Tab {
+                destination: "dev".into(),
+                host: "10.0.0.2".into(),
+                session: "work".into(),
+                ..store::Tab::default()
+            }),
+            "dev / work"
+        );
+    }
+
     #[test]
     fn new_tab_preserves_existing_session_and_close_only_detaches_its_client() {
         let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();

@@ -38,7 +38,8 @@ embedded SSH client and draws them in a native window.
   system dialog before the window opens: clear it, or exit and leave it.
 - **Desktop client.** Blade/egui rendering of Alacritty's terminal model, panes
   and tabs, mouse selection, scrollback, paste confirmation, and draggable pane
-  dividers. Maximize is tmux zoom and keeps focus. Remote resizing is opt-in.
+  dividers. Maximize is tmux zoom and keeps focus. Exit returns to the form and
+  retitles the tab from those fields. Remote resizing is opt-in.
 
 Prebuilt Linux, macOS, and Windows artifacts are attached below. Linux and
 Windows builds are unsigned; macOS builds are ad-hoc codesigned, not notarized.

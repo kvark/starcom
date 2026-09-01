@@ -28,9 +28,10 @@ session and not a sidebar beside existing panes.
 After a successful connection, the terminal workspace replaces the form in that
 tab. A failed first attach stays on the form and shows why — the toolbar phrase
 "Connection failed" is not the whole message. **Exit** always returns to the form
-in the same tab, including after a failed attach. Ctrl-Shift-W/Cmd-W closes the
-tab and detaches that Starcom client; the tmux server and remote jobs continue
-running.
+in the same tab, including after a failed attach, and the strip title follows
+the form again (a restored tab is labelled the same way). Ctrl-Shift-W/Cmd-W
+closes the tab and detaches that Starcom client; the tmux server and remote jobs
+continue running.
 
 A Starcom tab is one tmux session and shows one window of that session. A
 window picker is not in this increment.
@@ -273,9 +274,11 @@ that the server discarded.
 
 `make install` builds a release binary and installs it with `etc/starcom.desktop`
 and `etc/starcom.svg` under `PREFIX` (`~/.local` by default, or `/usr` for a
-system package). `StartupWMClass=starcom` matches the X11/Wayland class the
-window sets. The same files are packed into the `.deb` and `.rpm` release
-artifacts.
+system package). Parent directories are created with `mkdir -p` so BSD `install`
+on macOS works; GNU `install -D` is not assumed. `StartupWMClass=starcom` matches
+the X11/Wayland class the window sets. The same files are packed into the `.deb`
+and `.rpm` release artifacts. The `.desktop` file is a Linux launcher entry; on
+macOS the binary still lands in `$(PREFIX)/bin`.
 
 Window chrome uses `etc/macos/icon.png`; the Windows PE resource uses
 `etc/windows/icon.ico`. Regenerate both from `scripts/generate-icons.py` if the

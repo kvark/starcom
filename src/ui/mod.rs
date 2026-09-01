@@ -362,6 +362,16 @@ impl DesktopUi {
         self.pending_paste = None;
     }
 
+    pub(crate) fn showing_form(&self) -> bool {
+        self.screen == Screen::Connection
+    }
+
+    /// Show this tab's connection form. Exit uses this; the form fields stay.
+    pub(crate) fn return_to_form(&mut self) {
+        self.screen = Screen::Connection;
+        self.cancel_transient();
+    }
+
     pub(crate) fn reset_client_size(&mut self) {
         self.client_cells = None;
         self.pending_client_cells = None;
@@ -912,8 +922,7 @@ impl DesktopUi {
                         .clicked()
                     {
                         action = Action::Disconnect;
-                        self.screen = Screen::Connection;
-                        self.cancel_transient();
+                        self.return_to_form();
                     }
                     if state.access == session::Access::Interactive {
                         let mut allow = state.allow_resize;
