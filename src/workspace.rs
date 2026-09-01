@@ -93,7 +93,7 @@ fn paint_drop_marker(ui: &egui::Ui, rect: egui::Rect, after: bool) {
     ui.painter().vline(
         x,
         rect.y_range(),
-        egui::Stroke::new(3.0, ui.visuals().selection.stroke.color),
+        egui::Stroke::new(3.0_f32, ui.visuals().selection.stroke.color),
     );
 }
 
