@@ -22,6 +22,11 @@ pub(crate) enum Action {
     New,
     Select(u64),
     Close(u64),
+    /// Move `id` so it occupies `insert_at` in the current tab list.
+    Reorder {
+        id: u64,
+        insert_at: usize,
+    },
     Tab(u64, Box<ui::Action>),
 }
 
@@ -58,6 +63,37 @@ fn label(tab: &store::Tab) -> String {
         (false, "") => destination.to_owned(),
         (false, session) => format!("{destination} / {session}"),
     }
+}
+
+fn drop_insert_at(
+    response: &egui::Response,
+    tab_id: u64,
+    index: usize,
+    pointer: Option<egui::Pos2>,
+) -> Option<usize> {
+    let dragged = response.dnd_hover_payload::<u64>()?;
+    if *dragged == tab_id {
+        return None;
+    }
+    let pointer = pointer?;
+    Some(if pointer.x < response.rect.center().x {
+        index
+    } else {
+        index + 1
+    })
+}
+
+fn paint_drop_marker(ui: &egui::Ui, rect: egui::Rect, after: bool) {
+    let x = if after {
+        rect.right() + 2.0
+    } else {
+        rect.left() - 2.0
+    };
+    ui.painter().vline(
+        x,
+        rect.y_range(),
+        egui::Stroke::new(3.0, ui.visuals().selection.stroke.color),
+    );
 }
 
 impl Workspace {
@@ -195,6 +231,27 @@ impl Workspace {
         }
     }
 
+    fn reorder(&mut self, id: u64, insert_at: usize) {
+        let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let insert_at = insert_at.min(self.tabs.len());
+        if from == insert_at || from + 1 == insert_at {
+            return;
+        }
+        let active_id = self.tabs.get(self.active).map(|tab| tab.id);
+        let tab = self.tabs.remove(from);
+        let insert_at = if insert_at > from {
+            insert_at - 1
+        } else {
+            insert_at
+        };
+        self.tabs.insert(insert_at.min(self.tabs.len()), tab);
+        if let Some(id) = active_id {
+            self.active = self.tabs.iter().position(|tab| tab.id == id).unwrap_or(0);
+        }
+    }
+
     fn new_tab(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.tabs.len() < MAX_TABS,
@@ -257,6 +314,7 @@ impl Workspace {
             }
         }
         let mut navigation = Action::None;
+        let mut reorder: Option<(u64, usize)> = None;
         let new = egui::KeyboardShortcut::new(
             if cfg!(target_os = "macos") {
                 egui::Modifiers::MAC_CMD
@@ -287,21 +345,37 @@ impl Workspace {
                     for (index, tab) in self.tabs.iter().enumerate() {
                         ui.push_id(tab.id, |ui| {
                             let text = egui::RichText::new(&tab.label).size(22.0).strong();
-                            if ui
+                            let response = ui
                                 .add(
                                     egui::Button::new(text)
                                         .selected(index == self.active)
                                         .min_size(egui::vec2(0.0, 44.0))
                                         .corner_radius(8.0)
-                                        .sense(egui::Sense::CLICK),
+                                        .sense(egui::Sense::CLICK | egui::Sense::DRAG),
                                 )
-                                .clicked()
-                            {
+                                .on_hover_text("Click to switch · drag to reorder");
+                            response.dnd_set_drag_payload(tab.id);
+                            if response.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                ui.ctx().request_repaint();
+                            }
+                            if let Some(insert_at) = drop_insert_at(
+                                &response,
+                                tab.id,
+                                index,
+                                ui.input(|i| i.pointer.interact_pos()),
+                            ) {
+                                paint_drop_marker(ui, response.rect, insert_at > index);
+                                if let Some(id) = response.dnd_release_payload::<u64>() {
+                                    reorder = Some((*id, insert_at));
+                                }
+                            }
+                            if response.clicked() {
                                 navigation = Action::Select(tab.id);
                             }
                         });
                     }
-                    if ui
+                    let add = ui
                         .add_enabled(
                             self.tabs.len() < MAX_TABS,
                             egui::Button::new(egui::RichText::new("+").size(22.0).strong())
@@ -309,9 +383,14 @@ impl Workspace {
                                 .corner_radius(8.0)
                                 .sense(egui::Sense::CLICK),
                         )
-                        .on_hover_text("New connection tab")
-                        .clicked()
-                    {
+                        .on_hover_text("New connection tab");
+                    if add.dnd_hover_payload::<u64>().is_some() {
+                        paint_drop_marker(ui, add.rect, false);
+                        if let Some(id) = add.dnd_release_payload::<u64>() {
+                            reorder = Some((*id, self.tabs.len()));
+                        }
+                    }
+                    if add.clicked() {
                         navigation = Action::New;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -336,6 +415,9 @@ impl Workspace {
                     }
                 });
             });
+        if let Some((id, insert_at)) = reorder {
+            navigation = Action::Reorder { id, insert_at };
+        }
         if !matches!(navigation, Action::None) {
             // Switching tabs consumes the whole navigation frame. Keyboard and
             // clipboard events collected for the old tab cannot hit the new one.
@@ -373,6 +455,10 @@ impl Workspace {
                         self.active = index;
                         self.persist();
                     }
+                }
+                Action::Reorder { id, insert_at } => {
+                    self.reorder(id, insert_at);
+                    self.persist();
                 }
                 Action::Close(id) => {
                     if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
@@ -547,6 +633,33 @@ mod tests {
             }),
             "dev / work"
         );
+    }
+
+    #[test]
+    fn reordering_tabs_keeps_the_active_tab() {
+        let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
+        let first = workspace.tabs[0].id;
+        workspace.new_tab().unwrap();
+        let second = workspace.tabs[1].id;
+        assert_eq!(workspace.active, 1);
+        workspace.apply(
+            Action::Reorder {
+                id: second,
+                insert_at: 0,
+            },
+            || None,
+        );
+        assert_eq!(workspace.tabs[0].id, second);
+        assert_eq!(workspace.tabs[1].id, first);
+        assert_eq!(workspace.active, 0);
+        workspace.apply(
+            Action::Reorder {
+                id: second,
+                insert_at: 0,
+            },
+            || None,
+        );
+        assert_eq!(workspace.tabs[0].id, second);
     }
 
     #[test]

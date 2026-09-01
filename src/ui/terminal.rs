@@ -60,6 +60,7 @@ impl PaneUi {
         notice: &mut Option<String>,
         controls: bool,
         can_kill: bool,
+        frozen: bool,
     ) -> Vec<input::Action> {
         self.rect = rect;
         self.painted_rows = 0;
@@ -298,7 +299,12 @@ impl PaneUi {
                                 let background = if selected {
                                     ui.visuals().selection.bg_fill
                                 } else {
-                                    cell_colors(cell, model.colors()).1
+                                    let background = cell_colors(cell, model.colors()).1;
+                                    if frozen {
+                                        freeze(background)
+                                    } else {
+                                        background
+                                    }
                                 };
                                 if background != BACKGROUND {
                                     let cell_rect = egui::Rect::from_min_size(
@@ -311,7 +317,10 @@ impl PaneUi {
                             let mut column = 0;
                             while column < columns {
                                 let cell = &grid[line][index::Column(column)];
-                                let foreground = cell_colors(cell, model.colors()).0;
+                                let foreground = {
+                                    let color = cell_colors(cell, model.colors()).0;
+                                    if frozen { freeze(color) } else { color }
+                                };
                                 if cell.flags.intersects(
                                     term::cell::Flags::WIDE_CHAR_SPACER
                                         | term::cell::Flags::LEADING_WIDE_CHAR_SPACER
@@ -403,7 +412,10 @@ impl PaneUi {
                         }
                         let cursor = model.renderable_content().cursor;
                         let row = (cursor.point.line.0 + history as i32) as usize;
-                        if range.contains(&row) && cursor.shape != ansi::CursorShape::Hidden {
+                        if !frozen
+                            && range.contains(&row)
+                            && cursor.shape != ansi::CursorShape::Hidden
+                        {
                             let rect = egui::Rect::from_min_size(
                                 egui::pos2(
                                     content.left() + cursor.point.column.0 as f32 * cell_width,
@@ -528,6 +540,12 @@ pub fn copy(ctx: &egui::Context, text: String, notice: &mut Option<String>) {
     }
 }
 
+fn freeze(color: egui::Color32) -> egui::Color32 {
+    let gray = (u16::from(color.r()) + u16::from(color.g()) + u16::from(color.b())) / 3;
+    let gray = ((gray + 120) / 2) as u8;
+    egui::Color32::from_gray(gray)
+}
+
 fn cell_colors(
     cell: &term::cell::Cell,
     colors: &term::color::Colors,
@@ -623,6 +641,13 @@ mod tests {
             cell_colors(&cell, &colors),
             (BACKGROUND, egui::Color32::from_rgb(12, 34, 56))
         );
+    }
+
+    #[test]
+    fn freeze_turns_color_into_gray() {
+        let frozen = freeze(egui::Color32::from_rgb(255, 0, 0));
+        assert_eq!(frozen.r(), frozen.g());
+        assert_eq!(frozen.g(), frozen.b());
     }
 
     #[test]

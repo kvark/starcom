@@ -22,8 +22,9 @@ attach to a tmux server.
 
 A Starcom tab owns one connection form, one SSH/tmux client, one terminal view,
 and its pending input tokens. Use **+** or Ctrl-Shift-T (Cmd-T on macOS) to create
-a connection tab. A new tab displays its connection form—not panes from another
-session and not a sidebar beside existing panes.
+a connection tab. Drag a tab to reorder the strip. A new tab displays its
+connection form—not panes from another session and not a sidebar beside existing
+panes.
 
 After a successful connection, the terminal workspace replaces the form in that
 tab. A failed first attach stays on the form and shows why — the toolbar phrase
@@ -235,7 +236,9 @@ tmux write/reply deadline (a black-holed stream), and this machine sleeping
 (wall time running ahead of the monotonic clock). Authentication failures, host-key
 failures, a missing or destroyed session, a tmux server that exited, and an
 explicit detach all stop and wait for you, because retrying any of them would
-either loop on a security decision or quietly attach somewhere else.
+either loop on a security decision or quietly attach somewhere else. While a
+retry is waiting, the last view stays on screen in gray so it reads as frozen,
+not live.
 
 Each retry waits a little longer, up to 30 seconds, with jitter so several tabs
 that drop together do not reconnect in lockstep. The status bar shows the attempt

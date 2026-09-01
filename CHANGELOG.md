@@ -19,8 +19,9 @@ Identities, hardware keys, install, and the terminal workspace after `v0.1.0`.
   not persisted; the host is listed when you pick it.
 - **Desktop.** Maximize is tmux zoom and keeps focus. Exit returns to the form
   and retitles the tab from those fields. Connection tabs match the host chips
-  and no longer repeat the window title. Connect shows **Connecting…** on the
-  button itself. Alternate-screen panes and a History setting below tmux's
+  and no longer repeat the window title; drag a tab to reorder. Connect shows
+  **Connecting…** on the button itself. A reconnecting session paints the last
+  view in gray. Alternate-screen panes and a History setting below tmux's
   buffer are not warned as lost output. After keys or wheel, remote echo runs
   at 20 fps for a short time. Wheel ticks are one per 40 points; leftover
   smoothing cannot add extra ticks. Arrow keys stay with the focused field

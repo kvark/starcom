@@ -528,11 +528,13 @@ impl DesktopUi {
                                 focus_destination = true;
                             }
                         }
-                        let response = ui.add_sized(
-                            egui::vec2(240.0, 44.0),
+                        let response = ui.add(
                             egui::TextEdit::singleline(&mut self.form.destination)
                                 .id(egui::Id::new("starcom-destination"))
                                 .font(egui::FontId::proportional(22.0))
+                                .margin(egui::Margin::symmetric(16, 10))
+                                .desired_width(240.0)
+                                .min_size(egui::vec2(240.0, 44.0))
                                 .hint_text("hostname, address, or alias"),
                         );
                         if focus_destination {
@@ -1151,6 +1153,10 @@ impl DesktopUi {
                                     notice,
                                     controls && *focused == Some(pane_id),
                                     can_kill,
+                                    !matches!(
+                                        state.phase,
+                                        desktop::Phase::Watching | desktop::Phase::Demo
+                                    ),
                                 );
                                 pane_events
                                     .extend(events.into_iter().map(|action| (pane_id, action)));
