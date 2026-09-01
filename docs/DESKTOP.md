@@ -78,12 +78,13 @@ Open tabs are saved to `~/.config/starcom/workspace.conf` (`%APPDATA%\starcom\`
 on Windows, or `$XDG_CONFIG_HOME` where it is set) and reopened next time.
 
 What is saved is where a tab points and how it should connect: destination alias,
-host, user, port, session name, tmux socket, history depth, whether it is
-interactive, whether it reconnects, an extra identity path if you typed one,
-and the global redraw cap (`fps`). Nothing that would let a reader of that file
-connect is written: no keys, no passphrases, no host-key material, and no
-terminal contents. An identity entry is the path you already chose, never the
-key behind it.
+host, user, port, tmux socket, history depth, whether it is interactive, whether
+it reconnects, an extra identity path if you typed one, and the global redraw
+cap (`fps`). The live tmux session list is queried from the host, not written.
+Older files that named a `session` still parse. Nothing that would let a reader
+of that file connect is written: no keys, no passphrases, no host-key material,
+and no terminal contents. An identity entry is the path you already chose, never
+the key behind it.
 
 Restored tabs open on their connection form with the fields filled in. Identity
 files, `IdentitiesOnly`, and unsupported-policy blockers are re-read from

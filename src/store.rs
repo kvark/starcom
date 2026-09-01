@@ -39,6 +39,8 @@ pub struct Tab {
     pub destination: String,
     pub host: String,
     pub user: String,
+    /// Accepted on load from older files; not written. The live session list
+    /// is queried from the host, not persisted.
     pub session: String,
     pub port: u16,
     pub identity: String,
@@ -234,7 +236,7 @@ pub fn render(workspace: &Workspace) -> String {
     let mut out = String::from(
         "# Starcom saved connection tabs.\n\
          # Destinations and preferences only: no keys, passphrases, host-key\n\
-         # material, or terminal contents are ever written here.\n\
+         # material, terminal contents, or tmux session names.\n\
          version 1\n",
     );
     out.push_str(&format!("active {}\n", workspace.active));
@@ -255,7 +257,6 @@ pub fn render(workspace: &Workspace) -> String {
         put("destination", &tab.destination);
         put("host", &tab.host);
         put("user", &tab.user);
-        put("session", &tab.session);
         put("port", &tab.port.to_string());
         put("identity", &tab.identity);
         put("known-hosts", &tab.known_hosts);
@@ -303,7 +304,7 @@ mod tests {
                     destination: "dev".into(),
                     host: "10.0.0.2".into(),
                     user: "alice".into(),
-                    session: "work".into(),
+                    session: String::new(),
                     port: 2222,
                     identity: "/home/alice/.ssh/id_ed25519".into(),
                     known_hosts: "/home/alice/.ssh/known_hosts".into(),
@@ -315,7 +316,6 @@ mod tests {
                 Tab {
                     host: "build.example.test".into(),
                     user: "bob".into(),
-                    session: "ci".into(),
                     port: 22,
                     history: 200,
                     interactive: false,
@@ -341,7 +341,18 @@ mod tests {
     fn tabs_survive_a_round_trip() {
         let workspace = sample();
         let text = render(&workspace);
+        assert!(
+            !text.lines().any(|line| line.starts_with("session ")),
+            "tmux session names are not persisted"
+        );
         assert_eq!(parse(&text).unwrap(), workspace);
+    }
+
+    #[test]
+    fn an_older_file_may_still_name_a_session() {
+        let parsed = parse("version 1\n[tab]\ndestination dev\nsession work\n").unwrap();
+        assert_eq!(parsed.tabs[0].session, "work");
+        assert!(!render(&parsed).contains("session work"));
     }
 
     #[test]

@@ -499,6 +499,7 @@ impl DesktopUi {
                     ui.add_space(6.0);
                     let aliases: Vec<String> =
                         self.config.aliases().iter().take(32).cloned().collect();
+                    let mut focus_destination = false;
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
                         ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
@@ -513,7 +514,8 @@ impl DesktopUi {
                                     egui::Button::new(text)
                                         .selected(selected)
                                         .min_size(egui::vec2(0.0, 44.0))
-                                        .corner_radius(8.0),
+                                        .corner_radius(8.0)
+                                        .sense(egui::Sense::CLICK),
                                 )
                                 .clicked()
                             {
@@ -523,14 +525,19 @@ impl DesktopUi {
                                 self.form.destination = alias.clone();
                                 self.refresh_profile();
                                 self.auto_list = true;
+                                focus_destination = true;
                             }
                         }
                         let response = ui.add_sized(
                             egui::vec2(240.0, 44.0),
                             egui::TextEdit::singleline(&mut self.form.destination)
+                                .id(egui::Id::new("starcom-destination"))
                                 .font(egui::FontId::proportional(22.0))
                                 .hint_text("hostname, address, or alias"),
                         );
+                        if focus_destination {
+                            response.request_focus();
+                        }
                         if response.changed() {
                             self.refresh_profile();
                             self.auto_list = false;
@@ -622,11 +629,15 @@ impl DesktopUi {
                                         if summary.attached > 0 {
                                             text.push_str(" · attached");
                                         }
-                                        let response = ui.selectable_label(selected, text);
+                                        let response = ui.add(
+                                            egui::Button::new(text)
+                                                .selected(selected)
+                                                .sense(egui::Sense::CLICK),
+                                        );
                                         if response.clicked() {
                                             chosen = Some(summary.name.clone());
                                         }
-                                        if response.double_clicked() {
+                                        if response.double_clicked() && idle && !busy {
                                             chosen = Some(summary.name.clone());
                                             self.form.session = summary.name.clone();
                                             match self.form.connection() {
@@ -650,15 +661,21 @@ impl DesktopUi {
 
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        let can_connect = host_ready && !self.form.session.trim().is_empty();
-                        if ui
-                            .add_enabled(
-                                can_connect,
-                                egui::Button::new("Connect")
-                                    .min_size(egui::vec2(112.0, 28.0)),
-                            )
-                            .clicked()
-                        {
+                        let connecting = state.phase == desktop::Phase::Connecting;
+                        let can_connect =
+                            host_ready && !self.form.session.trim().is_empty() && idle && !connecting;
+                        let connect = ui.add_enabled(
+                            can_connect || connecting,
+                            egui::Button::new(if connecting {
+                                "Connecting…"
+                            } else {
+                                "Connect"
+                            })
+                            .selected(connecting)
+                            .min_size(egui::vec2(112.0, 28.0))
+                            .sense(egui::Sense::CLICK),
+                        );
+                        if connect.clicked() && !connecting {
                             match self.form.connection() {
                                 Ok(connection) => {
                                     self.notice = None;
@@ -668,7 +685,10 @@ impl DesktopUi {
                             }
                         }
                         if ui
-                            .add_enabled(host_ready && idle && !busy, egui::Button::new("Create session"))
+                            .add_enabled(
+                                host_ready && idle && !busy,
+                                egui::Button::new("Create session").sense(egui::Sense::CLICK),
+                            )
                             .on_hover_text(
                                 "Create a named session on the host. This starts a tmux \
                                  server if none is running.",
@@ -677,7 +697,10 @@ impl DesktopUi {
                         {
                             self.confirm_create = true;
                         }
-                        if ui.button("Open local demo").clicked() {
+                        if ui
+                            .add(egui::Button::new("Open local demo").sense(egui::Sense::CLICK))
+                            .clicked()
+                        {
                             action = Action::Demo;
                         }
                         if matches!(
@@ -690,10 +713,6 @@ impl DesktopUi {
                             self.open_terminal();
                         }
                     });
-                    if state.phase == desktop::Phase::Connecting {
-                        ui.add_space(6.0);
-                        ui.weak("Connecting…");
-                    }
                     if let Some(ref error) = state.error {
                         ui.add_space(6.0);
                         ui.colored_label(ui.visuals().error_fg_color, error);

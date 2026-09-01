@@ -15,12 +15,16 @@ Identities, hardware keys, install, and the terminal workspace after `v0.1.0`.
   signing stays in the authenticator. `sk-ecdsa` and file-based SK keys are not.
 - **Saved workspace.** Restored tabs re-read identity policy and blockers from
   `~/.ssh/config`. An unreadable `workspace.conf` is a system dialog before the
-  window opens: clear the file, or exit and leave it.
+  window opens: clear the file, or exit and leave it. Tmux session names are
+  not persisted; the host is listed when you pick it.
 - **Desktop.** Maximize is tmux zoom and keeps focus. Exit returns to the form
-  and retitles the tab from those fields. Alternate-screen panes and a History
-  setting below tmux's buffer are not warned as lost output. After keys or
-  wheel, remote echo runs at 20 fps for a short time. Wheel ticks are one per
-  40 points; leftover smoothing cannot add extra ticks.
+  and retitles the tab from those fields. Connection tabs match the host chips
+  and no longer repeat the window title. Connect shows **Connecting…** on the
+  button itself. Alternate-screen panes and a History setting below tmux's
+  buffer are not warned as lost output. After keys or wheel, remote echo runs
+  at 20 fps for a short time. Wheel ticks are one per 40 points; leftover
+  smoothing cannot add extra ticks. Arrow keys stay with the focused field
+  instead of highlighting other buttons.
 - **Install.** `make install` does not assume GNU `install -D`. On macOS it
   writes `~/Applications/Starcom.app`. macOS/Windows icons use a full PNG
   family for `cargo-bundle --bin`.

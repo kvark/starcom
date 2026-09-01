@@ -274,49 +274,68 @@ impl Workspace {
         {
             navigation = Action::Close(tab.id);
         }
-        egui::Panel::top("connection-tabs").show_inside(root, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("Starcom").strong());
-                ui.separator();
-                for (index, tab) in self.tabs.iter().enumerate() {
-                    ui.push_id(tab.id, |ui| {
-                        if ui
-                            .selectable_label(index == self.active, &tab.label)
-                            .clicked()
-                        {
-                            navigation = Action::Select(tab.id);
+        egui::Panel::top("connection-tabs")
+            .frame(
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(8, 8))
+                    .fill(root.visuals().panel_fill),
+            )
+            .show_inside(root, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                    ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
+                    for (index, tab) in self.tabs.iter().enumerate() {
+                        ui.push_id(tab.id, |ui| {
+                            let text = egui::RichText::new(&tab.label).size(22.0).strong();
+                            if ui
+                                .add(
+                                    egui::Button::new(text)
+                                        .selected(index == self.active)
+                                        .min_size(egui::vec2(0.0, 44.0))
+                                        .corner_radius(8.0)
+                                        .sense(egui::Sense::CLICK),
+                                )
+                                .clicked()
+                            {
+                                navigation = Action::Select(tab.id);
+                            }
+                        });
+                    }
+                    if ui
+                        .add_enabled(
+                            self.tabs.len() < MAX_TABS,
+                            egui::Button::new(egui::RichText::new("+").size(22.0).strong())
+                                .min_size(egui::vec2(44.0, 44.0))
+                                .corner_radius(8.0)
+                                .sense(egui::Sense::CLICK),
+                        )
+                        .on_hover_text("New connection tab")
+                        .clicked()
+                    {
+                        navigation = Action::New;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut fps = self.fps;
+                        let response = ui
+                            .add(
+                                egui::DragValue::new(&mut fps)
+                                    .range(1..=i64::from(store::MAX_FPS))
+                                    .suffix(" fps"),
+                            )
+                            .on_hover_text(
+                                "Maximum redraw rate for live output. Pointer and key events \
+                             still paint immediately.",
+                            );
+                        if response.changed() {
+                            self.fps = store::clamp_fps(fps);
+                            self.persist();
                         }
                     });
-                }
-                if ui
-                    .add_enabled(self.tabs.len() < MAX_TABS, egui::Button::new("+"))
-                    .on_hover_text("New connection tab")
-                    .clicked()
-                {
-                    navigation = Action::New;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut fps = self.fps;
-                    let response = ui
-                        .add(
-                            egui::DragValue::new(&mut fps)
-                                .range(1..=i64::from(store::MAX_FPS))
-                                .suffix(" fps"),
-                        )
-                        .on_hover_text(
-                            "Maximum redraw rate for live output. Pointer and key events \
-                             still paint immediately.",
-                        );
-                    if response.changed() {
-                        self.fps = store::clamp_fps(fps);
-                        self.persist();
+                    if let Some(ref notice) = self.notice {
+                        ui.colored_label(ui.visuals().error_fg_color, notice);
                     }
                 });
-                if let Some(ref notice) = self.notice {
-                    ui.colored_label(ui.visuals().error_fg_color, notice);
-                }
             });
-        });
         if !matches!(navigation, Action::None) {
             // Switching tabs consumes the whole navigation frame. Keyboard and
             // clipboard events collected for the old tab cannot hit the new one.
@@ -631,15 +650,14 @@ mod tests {
             );
             assert!(tab.client.retry().is_none());
         }
-        assert_eq!(workspace.tabs[0].label, "dev / work");
-        assert_eq!(workspace.tabs[1].label, "build.example.test / ci");
-        // Round-tripping through the live tabs must not lose or alter anything.
+        assert_eq!(workspace.tabs[0].label, "dev");
+        assert_eq!(workspace.tabs[1].label, "build.example.test");
         workspace.persist();
         let reloaded = store::load(&file).unwrap().unwrap();
         assert_eq!(reloaded.tabs.len(), 2);
         assert_eq!(reloaded.tabs[0].host, "10.0.0.2");
         assert_eq!(reloaded.tabs[0].port, 2222);
-        assert_eq!(reloaded.tabs[1].session, "ci");
+        assert!(reloaded.tabs[1].session.is_empty());
         assert_eq!(reloaded.active, 1);
     }
 
