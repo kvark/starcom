@@ -650,10 +650,14 @@ fn a_direct_tcpip_channel_carries_data_through_the_server() {
         seen
     });
 
-    let mut channel = ssh::Connection::connect(&options())
+    let mut opts = options();
+    // Handshake plus the forwarded open can include a rekey (the fixture
+    // uses RekeyLimit 16K). Five seconds is the refusal budget, not this.
+    opts.timeout = time::Duration::from_secs(15);
+    let mut channel = ssh::Connection::connect(&opts)
         .unwrap()
         .open_forward("127.0.0.1", port)
-        .expect("the server refused a direct-tcpip channel");
+        .unwrap_or_else(|error| panic!("direct-tcpip channel: {error}"));
     channel.write_all(b"HELLO").unwrap();
     channel.flush().unwrap();
     let deadline = time::Instant::now() + time::Duration::from_secs(10);

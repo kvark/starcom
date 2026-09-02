@@ -41,6 +41,8 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 UsePAM yes
+UseDNS no
+GSSAPIAuthentication no
 # Test fixture only: the unique authorized-key path lives under /tmp.
 StrictModes no
 RekeyLimit 16K
