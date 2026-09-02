@@ -84,6 +84,37 @@ fn drop_insert_at(
     })
 }
 
+fn spin(time: f64) -> &'static str {
+    ["|", "/", "-", "\\"][((time * 8.0) as usize) % 4]
+}
+
+fn busy_phase(phase: desktop::Phase) -> bool {
+    matches!(
+        phase,
+        desktop::Phase::Connecting | desktop::Phase::Reconnecting | desktop::Phase::Resynchronizing
+    )
+}
+
+fn tab_fill(phase: desktop::Phase, selected: bool) -> Option<egui::Color32> {
+    let color = match phase {
+        desktop::Phase::Watching | desktop::Phase::Demo => egui::Color32::from_rgb(38, 98, 58),
+        desktop::Phase::Connecting
+        | desktop::Phase::Reconnecting
+        | desktop::Phase::Resynchronizing => egui::Color32::from_rgb(140, 108, 28),
+        desktop::Phase::Failed => egui::Color32::from_rgb(128, 42, 42),
+        _ => return None,
+    };
+    Some(if selected {
+        egui::Color32::from_rgb(
+            color.r().saturating_add(50),
+            color.g().saturating_add(50),
+            color.b().saturating_add(40),
+        )
+    } else {
+        color
+    })
+}
+
 fn paint_drop_marker(ui: &egui::Ui, rect: egui::Rect, after: bool) {
     let x = if after {
         rect.right() + 2.0
@@ -197,8 +228,9 @@ impl Workspace {
         time::Duration::from_secs_f64(1.0 / f64::from(store::clamp_fps(self.fps)))
     }
 
-    /// Idle remote paint uses the fps slider. After we sent input, echo is
-    /// allowed up to 20 fps for a short window so typing is not 200ms behind.
+    /// Idle remote paint uses `fps` from the saved workspace. After we sent
+    /// input, echo is allowed up to 20 fps for a short window so typing is not
+    /// 200ms behind.
     pub(crate) fn paint_interval(&self) -> time::Duration {
         let idle = self.repaint_interval();
         if self
@@ -329,24 +361,38 @@ impl Workspace {
         egui::Panel::top("connection-tabs")
             .frame(
                 egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(8, 8))
+                    .inner_margin(egui::Margin::symmetric(6, 4))
                     .fill(root.visuals().panel_fill),
             )
             .show_inside(root, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-                    ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
                     for (index, tab) in self.tabs.iter().enumerate() {
                         ui.push_id(tab.id, |ui| {
-                            let text = egui::RichText::new(&tab.label).size(22.0).strong();
+                            let phase = tab.client.phase();
+                            let mut title = tab.label.clone();
+                            if busy_phase(phase) {
+                                title = format!("{} {title}", spin(ui.ctx().time()));
+                                ui.ctx().request_repaint();
+                            }
+                            let selected = index == self.active;
+                            let text = egui::RichText::new(title).size(16.0).strong();
+                            let mut button = egui::Button::new(text)
+                                .selected(selected)
+                                .min_size(egui::vec2(0.0, 28.0))
+                                .corner_radius(5.0)
+                                .sense(egui::Sense::CLICK | egui::Sense::DRAG)
+                                .stroke(if selected {
+                                    egui::Stroke::new(2.0_f32, ui.visuals().selection.stroke.color)
+                                } else {
+                                    egui::Stroke::NONE
+                                });
+                            if let Some(fill) = tab_fill(phase, selected) {
+                                button = button.fill(fill);
+                            }
                             let response = ui
-                                .add(
-                                    egui::Button::new(text)
-                                        .selected(index == self.active)
-                                        .min_size(egui::vec2(0.0, 44.0))
-                                        .corner_radius(8.0)
-                                        .sense(egui::Sense::CLICK | egui::Sense::DRAG),
-                                )
+                                .add(button)
                                 .on_hover_text("Click to switch · drag to reorder");
                             response.dnd_set_drag_payload(tab.id);
                             if response.dragged() {
@@ -372,9 +418,9 @@ impl Workspace {
                     let add = ui
                         .add_enabled(
                             self.tabs.len() < MAX_TABS,
-                            egui::Button::new(egui::RichText::new("+").size(22.0).strong())
-                                .min_size(egui::vec2(44.0, 44.0))
-                                .corner_radius(8.0)
+                            egui::Button::new(egui::RichText::new("+").size(16.0).strong())
+                                .min_size(egui::vec2(28.0, 28.0))
+                                .corner_radius(5.0)
                                 .sense(egui::Sense::CLICK),
                         )
                         .on_hover_text("New connection tab");
@@ -387,23 +433,6 @@ impl Workspace {
                     if add.clicked() {
                         navigation = Action::New;
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut fps = self.fps;
-                        let response = ui
-                            .add(
-                                egui::DragValue::new(&mut fps)
-                                    .range(1..=i64::from(store::MAX_FPS))
-                                    .suffix(" fps"),
-                            )
-                            .on_hover_text(
-                                "Maximum redraw rate for live output. Pointer and key events \
-                             still paint immediately.",
-                            );
-                        if response.changed() {
-                            self.fps = store::clamp_fps(fps);
-                            self.persist();
-                        }
-                    });
                     if let Some(ref notice) = self.notice {
                         ui.colored_label(ui.visuals().error_fg_color, notice);
                     }
@@ -456,6 +485,7 @@ impl Workspace {
                     if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
                         self.cancel_transient();
                         self.active = index;
+                        self.tabs[index].ui.arm_focus_restore();
                         self.persist();
                     }
                 }
@@ -496,10 +526,6 @@ impl Workspace {
                             save = started.is_ok();
                             started
                         }
-                        ui::Action::Demo => tab.client.demo().map(|()| {
-                            tab.label = "Demo".into();
-                            tab.ui.open_terminal();
-                        }),
                         ui::Action::ListSessions(connection) => {
                             tab.client.list_sessions(connection)
                         }

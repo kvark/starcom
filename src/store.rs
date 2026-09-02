@@ -338,6 +338,22 @@ mod tests {
     }
 
     #[test]
+    fn the_in_repo_example_workspace_parses() {
+        let parsed = parse(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/etc/workspace.conf.example"
+        )))
+        .expect("etc/workspace.conf.example must stay a valid workspace.conf");
+        assert_eq!(parsed.fps, DEFAULT_FPS);
+        assert_eq!(parsed.tabs.len(), 1);
+        assert_eq!(parsed.tabs[0].destination, "example");
+        assert_eq!(parsed.tabs[0].host, "example.test");
+        assert!(parsed.tabs[0].interactive);
+        assert!(parsed.tabs[0].reconnect);
+        assert!(parsed.tabs[0].session.is_empty());
+    }
+
+    #[test]
     fn tabs_survive_a_round_trip() {
         let workspace = sample();
         let text = render(&workspace);

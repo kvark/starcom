@@ -204,7 +204,7 @@ impl Node {
                     .on_hover_text(if remote_resize && remote_boundary.is_some() {
                         "Release to resize the tmux pane. Other attached clients see the change."
                     } else {
-                        "Remote pane resize is off. Enable it to change tmux geometry."
+                        "This divider cannot change tmux geometry right now."
                     });
                 if response.dragged()
                     && available > 0.0

@@ -42,8 +42,9 @@ impl Default for PaneUi {
     }
 }
 
-/// One egui line. Partial motion is kept so leftover smoothing cannot add ticks.
-const WHEEL_LINE: f32 = 40.0;
+/// One application-wheel tick. Smaller than a local history line so the first
+/// trackpad fragment is not held until 40 points have piled up.
+const WHEEL_LINE: f32 = 20.0;
 
 fn wheel_ticks(remainder: &mut f32, delta: f32) -> i32 {
     *remainder += delta;
@@ -64,6 +65,7 @@ impl PaneUi {
         font_size: f32,
         focused: &mut Option<tmuxctl::PaneId>,
         notice: &mut Option<String>,
+        notice_until: &mut Option<std::time::Instant>,
         controls: bool,
         can_kill: bool,
         frozen: bool,
@@ -120,8 +122,10 @@ impl PaneUi {
                 let mouse = pane.terminal.reports_mouse();
                 let wants_wheel = pane.terminal.wants_wheel();
                 let sgr_mouse = pane.terminal.sgr_mouse();
+                // Keep the scroll id stable across layout generations so a
+                // resync cannot yank the viewport back to the live tip.
                 egui::ScrollArea::vertical()
-                    .id_salt(id.with("scroll"))
+                    .id_salt(egui::Id::new(("scroll", pane_id.0)))
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .scroll_source(if wants_wheel {
@@ -192,7 +196,21 @@ impl PaneUi {
                         if response.clicked() {
                             events.push(input::Action::SelectPane);
                         }
-                        if wants_wheel && response.hovered() {
+                        if response.secondary_clicked() {
+                            if let Some(text) = pane.terminal.selected_text() {
+                                copy(ui.ctx(), text, notice, notice_until, "selection copied");
+                            } else {
+                                copy(
+                                    ui.ctx(),
+                                    pane.terminal.screen_lines().join("\n"),
+                                    notice,
+                                    notice_until,
+                                    "full pane copied",
+                                );
+                            }
+                        }
+                        let pointer_in_pane = ui.rect_contains_pointer(rect);
+                        if wants_wheel && pointer_in_pane {
                             let dy = ui.input(|input| input.smooth_scroll_delta.y);
                             let ticks = wheel_ticks(remainder, dy);
                             if ticks != 0 {
@@ -219,7 +237,14 @@ impl PaneUi {
                                         ));
                                     }
                                 } else {
-                                    let key = if up { input::Key::Up } else { input::Key::Down };
+                                    // Alternate-screen apps that did not enable mouse
+                                    // reporting still want tmux WheelUp/WheelDown, not
+                                    // cursor keys (those move the application cursor).
+                                    let key = if up {
+                                        input::Key::WheelUp
+                                    } else {
+                                        input::Key::WheelDown
+                                    };
                                     for _ in 0..n {
                                         events.push(input::Action::Key(
                                             key,
@@ -228,10 +253,15 @@ impl PaneUi {
                                     }
                                 }
                             }
+                            // Remainder after the ±8 clamp is still a real scroll.
+                            // Paint again so it is not held until the next notch.
+                            if remainder.abs() >= WHEEL_LINE {
+                                ui.ctx().request_repaint();
+                            }
                             ui.ctx().input_mut(|input| {
                                 input.smooth_scroll_delta.y = 0.0;
                             });
-                        } else {
+                        } else if !pointer_in_pane {
                             *remainder = 0.0;
                         }
                         if let Some(position) = response.interact_pointer_pos() {
@@ -287,26 +317,8 @@ impl PaneUi {
                                     .any(|event| matches!(event, egui::Event::Copy))
                             });
                         if copying && let Some(text) = pane.terminal.selected_text() {
-                            copy(ui.ctx(), text, notice);
+                            copy(ui.ctx(), text, notice, notice_until, "selection copied");
                         }
-                        response.context_menu(|ui| {
-                            if ui
-                                .add_enabled(
-                                    pane.terminal.selection_range().is_some(),
-                                    egui::Button::new("Copy selection"),
-                                )
-                                .clicked()
-                            {
-                                if let Some(text) = pane.terminal.selected_text() {
-                                    copy(ui.ctx(), text, notice);
-                                }
-                                ui.close();
-                            }
-                            if ui.button("Copy current screen").clicked() {
-                                copy(ui.ctx(), pane.terminal.screen_lines().join("\n"), notice);
-                                ui.close();
-                            }
-                        });
                         let model = pane.terminal.model();
                         let selection_range = pane.terminal.selection_range();
                         let grid = model.grid();
@@ -536,15 +548,21 @@ impl PaneUi {
                                                 "Maximize / restore this pane",
                                             ) {
                                                 events.push(input::Action::ZoomPane);
+                                                ui.ctx()
+                                                    .memory_mut(|memory| memory.request_focus(id));
                                             }
                                             if chrome_button(ui, "-", "Split below") {
                                                 events
                                                     .push(input::Action::Split(input::Axis::Rows));
+                                                ui.ctx()
+                                                    .memory_mut(|memory| memory.request_focus(id));
                                             }
                                             if chrome_button(ui, "|", "Split right") {
                                                 events.push(input::Action::Split(
                                                     input::Axis::Columns,
                                                 ));
+                                                ui.ctx()
+                                                    .memory_mut(|memory| memory.request_focus(id));
                                             }
                                         },
                                     );
@@ -567,19 +585,30 @@ fn chrome_button(ui: &mut egui::Ui, glyph: &str, tip: &str) -> bool {
     .clicked()
 }
 
-pub fn copy(ctx: &egui::Context, text: String, notice: &mut Option<String>) {
+pub fn copy(
+    ctx: &egui::Context,
+    text: String,
+    notice: &mut Option<String>,
+    notice_until: &mut Option<std::time::Instant>,
+    message: &str,
+) {
     if text.len() > 1024 * 1024 {
         *notice = Some("Selection exceeds the 1 MiB clipboard limit.".to_owned());
+        *notice_until = None;
     } else {
         ctx.copy_text(text);
-        *notice = Some("Copied.".to_owned());
+        *notice = Some(message.to_owned());
+        *notice_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
     }
 }
 
 fn freeze(color: egui::Color32) -> egui::Color32 {
-    let gray = (u16::from(color.r()) + u16::from(color.g()) + u16::from(color.b())) / 3;
-    let gray = ((gray + 120) / 2) as u8;
-    egui::Color32::from_gray(gray)
+    let mix = |channel: u8, toward: u8| ((u16::from(channel) * 5 + u16::from(toward)) / 6) as u8;
+    egui::Color32::from_rgb(
+        mix(color.r(), BACKGROUND.r()),
+        mix(color.g(), BACKGROUND.g()),
+        mix(color.b(), BACKGROUND.b()),
+    )
 }
 
 fn cell_colors(
@@ -680,22 +709,23 @@ mod tests {
     }
 
     #[test]
-    fn freeze_turns_color_into_gray() {
+    fn freeze_dims_toward_the_background() {
         let frozen = freeze(egui::Color32::from_rgb(255, 0, 0));
-        assert_eq!(frozen.r(), frozen.g());
-        assert_eq!(frozen.g(), frozen.b());
+        assert!(frozen.r() > frozen.g(), "hue is kept, only dimmed");
+        assert!(frozen.r() < 255);
+        assert!(frozen.r() > BACKGROUND.r());
     }
 
     #[test]
     fn leftover_wheel_accumulates_instead_of_rounding_up() {
         let mut remainder = 0.0;
-        assert_eq!(wheel_ticks(&mut remainder, 12.8), 0);
-        assert_eq!(wheel_ticks(&mut remainder, 8.7), 0);
-        assert_eq!(wheel_ticks(&mut remainder, 18.5), 1);
-        assert!(remainder.abs() < 1.0, "{remainder}");
+        assert_eq!(wheel_ticks(&mut remainder, 8.0), 0);
+        assert_eq!(wheel_ticks(&mut remainder, 8.0), 0);
+        assert_eq!(wheel_ticks(&mut remainder, 8.0), 1);
+        assert!(remainder.abs() < 5.0, "{remainder}");
         remainder = 0.0;
-        assert_eq!(wheel_ticks(&mut remainder, -40.0), -1);
+        assert_eq!(wheel_ticks(&mut remainder, -20.0), -1);
         assert_eq!(remainder, 0.0);
-        assert_eq!(wheel_ticks(&mut remainder, 80.0), 2);
+        assert_eq!(wheel_ticks(&mut remainder, 80.0), 4);
     }
 }

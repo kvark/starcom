@@ -807,7 +807,6 @@ fn watch(
         }),
         _ => None,
     };
-    let first_attach = previous.is_none();
     *previous = Some(identity);
     {
         let mut state = shared
@@ -827,9 +826,7 @@ fn watch(
         state.error = None;
         state.failure = None;
         state.continuity = continuity;
-        // First interactive attach resizes tmux on divider release, like a
-        // normal client. Reconnects keep the checkbox as the user left it.
-        if first_attach && connection.access == session::Access::Interactive {
+        if connection.access == session::Access::Interactive {
             state.allow_resize = true;
         }
     }
