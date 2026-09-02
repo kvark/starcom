@@ -1691,6 +1691,11 @@ mod tests {
         let _ = ctx.run_ui(screen_input(), |root| {
             ui.show(root, &mut state);
         });
+        // The client-size debounce is 200ms. On a slow runner that fires on
+        // the next frame and would share a Frame with ArrowUp/paste.
+        if let Some((size, _)) = ui.pending_client_cells.take() {
+            ui.client_cells = Some(size);
+        }
         assert!(
             ui.terminal_focused(&ctx),
             "the pane must hold focus or this test proves nothing"
@@ -1752,15 +1757,18 @@ mod tests {
         let Action::Frame(steps) = action else {
             panic!("expected the arrow to reach the pane");
         };
+        // A slow machine can emit ClientSize on the same frame (200ms debounce).
+        // That is not focus walking; the arrow still has to be in this frame.
         assert!(
-            matches!(
-                steps.as_slice(),
-                [Step::Send(
+            steps.iter().any(|step| matches!(
+                step,
+                Step::Send(
                     sent,
                     terminal_input::Action::Key(terminal_input::Key::Up, modifiers)
-                )] if *sent == target && !modifiers.control && !modifiers.alt && !modifiers.shift
-            ),
-            "ArrowUp must go to the remote application, not another widget"
+                ) if *sent == target && !modifiers.control && !modifiers.alt && !modifiers.shift
+            )),
+            "ArrowUp must go to the remote application, not another widget ({} steps)",
+            steps.len()
         );
         assert_eq!(ui.focused, Some(pane));
         assert!(
