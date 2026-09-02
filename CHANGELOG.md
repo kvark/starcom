@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.2
+
+Terminal viewport and tab chrome after `v0.1.1`.
+
+- **History stays where you left it.** Scrolling up no longer follows new
+  output. The live tip is the last screen of the buffer, not past it, so a
+  new attach is not a blank pane. A dropped connection keeps that last view
+  on screen (dimmed) while it retries.
+- **Tabs.** Hover lightens a chip without changing the strip height. Color
+  still tracks connected, connecting, and failed.
+- **Status.** The focused pane's size sits next to Exit. A copy notice
+  replaces the hint for a moment. Idle polls do not wake the GUI unless the
+  screen changed.
+
+Prebuilt Linux, macOS, and Windows artifacts are attached below. Linux and
+Windows builds are unsigned; macOS builds are ad-hoc codesigned, not notarized.
+
+Known limitations: MFA, host and user certificates, `ProxyJump`, `ProxyCommand`,
+`sk-ecdsa` and file-based SK keys, and reusing one SSH connection across tabs
+are not supported. Remote hosts are Linux with stock OpenSSH and tmux. No
+performance baselines are published yet.
+
 ## v0.1.1
 
 Identities, hardware keys, install, and the terminal workspace after `v0.1.0`.
