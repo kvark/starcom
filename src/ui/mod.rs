@@ -1573,6 +1573,44 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_connection_keeps_the_last_view_on_screen() {
+        let mut ui = DesktopUi::default();
+        let mut state = desktop::State::interactive_demo().unwrap();
+        paint(&mut ui, &mut state);
+        assert_eq!(ui.screen, Screen::Terminal);
+        let painted: usize = ui.pane_ui.values().map(|pane| pane.painted_rows).sum();
+        assert!(painted > 0, "demo panes should paint");
+        state.phase = desktop::Phase::Reconnecting;
+        state.error =
+            Some("The connection dropped. SSH Transport: No route to host (os error 113)".into());
+        if let Some(ref mut view) = state.view {
+            view.disconnect();
+        }
+        paint(&mut ui, &mut state);
+        assert_eq!(ui.screen, Screen::Terminal);
+        let painted: usize = ui.pane_ui.values().map(|pane| pane.painted_rows).sum();
+        assert!(
+            painted > 0,
+            "the last view must stay readable while reconnecting"
+        );
+        let text = state
+            .view
+            .as_ref()
+            .expect("last view")
+            .panes()
+            .values()
+            .next()
+            .expect("pane")
+            .terminal
+            .screen_lines()
+            .join("\n");
+        assert!(
+            text.contains("Starcom") || text.contains("demo"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
     fn a_failed_first_attach_returns_to_the_form() {
         let mut ui = DesktopUi::default();
         ui.open_terminal();
