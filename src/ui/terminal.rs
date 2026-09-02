@@ -34,9 +34,6 @@ pub struct PaneUi {
     scroll_frac: f32,
     /// True while the viewport is pinned to the live tip.
     stuck: bool,
-    /// stick_to_bottom has stored a tip offset. Until then, the default
-    /// offset is 0 and would paint the oldest (often blank) history.
-    settled: bool,
 }
 
 impl Default for PaneUi {
@@ -47,7 +44,6 @@ impl Default for PaneUi {
             remainder: 0.0,
             scroll_frac: 0.0,
             stuck: true,
-            settled: false,
         }
     }
 }
@@ -66,6 +62,13 @@ fn scroll_origin(history: usize, display_offset: usize, row_height: f32, frac: f
     history.saturating_sub(display_offset) as f32 * row_height + frac
 }
 
+/// Offset that shows the last `view_height` of the buffer. The content height
+/// itself is past the last row; show_rows uses the offset before egui clamps,
+/// so that paints into empty space (blank panes with a sliver of the prompt).
+fn tip_origin(total_rows: usize, row_height: f32, view_height: f32) -> f32 {
+    (total_rows as f32 * row_height - view_height).max(0.0)
+}
+
 struct HistoryViewport {
     stuck: bool,
     frac: f32,
@@ -78,20 +81,30 @@ fn history_viewport(
     view_height: f32,
     row_height: f32,
     history: usize,
+    was_stuck: bool,
 ) -> HistoryViewport {
     if at_live_tip(scroll_y, content_height, view_height) {
-        HistoryViewport {
+        return HistoryViewport {
             stuck: true,
             frac: 0.0,
             offset: 0,
-        }
-    } else {
-        let whole = (scroll_y / row_height).floor() as usize;
-        HistoryViewport {
-            stuck: false,
-            frac: (scroll_y - whole as f32 * row_height).clamp(0.0, row_height),
-            offset: history.saturating_sub(whole),
-        }
+        };
+    }
+    // A stuck pane whose offset jumped to 0 is a lost ScrollArea state, not a
+    // user scroll to the oldest line. Treating it as the latter locks the view
+    // on blank history after a reconnect (empty frozen panes).
+    if was_stuck && scroll_y <= 1.0 {
+        return HistoryViewport {
+            stuck: true,
+            frac: 0.0,
+            offset: 0,
+        };
+    }
+    let whole = (scroll_y / row_height).floor() as usize;
+    HistoryViewport {
+        stuck: false,
+        frac: (scroll_y - whole as f32 * row_height).clamp(0.0, row_height),
+        offset: history.saturating_sub(whole),
     }
 }
 
@@ -172,11 +185,11 @@ impl PaneUi {
                 let mouse = pane.terminal.reports_mouse();
                 let wants_wheel = pane.terminal.wants_wheel();
                 let sgr_mouse = pane.terminal.sgr_mouse();
-                // Follow the live tip with stick_to_bottom. Forcing a pixel
-                // offset while stuck aims show_rows at blank history (empty
-                // screen after connect). Once the user has scrolled up,
-                // Alacritty's display_offset is the lock: new output keeps
-                // the same history lines in view.
+                // Follow the live tip with content-minus-view, not the content
+                // height: show_rows applies the offset before clamp, and an
+                // offset at the content height sits past the last row. Once
+                // the user has scrolled up, Alacritty's display_offset is
+                // the lock. Default ScrollArea offset is 0 (oldest history).
                 let mut area = egui::ScrollArea::vertical()
                     .id_salt(("starcom-scroll", pane_id.0))
                     .auto_shrink([false, false])
@@ -186,19 +199,19 @@ impl PaneUi {
                     } else {
                         egui::scroll_area::ScrollSource::ALL
                     });
-                if !self.stuck {
+                if self.stuck {
+                    area = area.vertical_scroll_offset(tip_origin(
+                        total_rows,
+                        row_height,
+                        ui.available_height(),
+                    ));
+                } else {
                     area = area.vertical_scroll_offset(scroll_origin(
                         history,
                         display,
                         row_height,
                         self.scroll_frac,
                     ));
-                } else if !self.settled {
-                    // Default offset is 0. Aim at the live screen so the first
-                    // frame is not 200 blank history lines; stick_to_bottom
-                    // then lands on the prompt.
-                    area = area.vertical_scroll_offset(history as f32 * row_height);
-                    ui.ctx().request_repaint();
                 }
                 let output = area.show_rows(ui, row_height, total_rows, |ui, range| {
                     *rows = range.len();
@@ -568,12 +581,10 @@ impl PaneUi {
                     output.inner_rect.height(),
                     row_height,
                     history,
+                    self.stuck,
                 );
                 self.stuck = viewport.stuck;
                 self.scroll_frac = viewport.frac;
-                if viewport.stuck {
-                    self.settled = true;
-                }
                 pane.terminal.scroll_history(viewport.offset);
                 if controls && *focused == Some(pane_id) {
                     let bar = egui::Rect::from_min_max(
@@ -787,6 +798,12 @@ mod tests {
     }
 
     #[test]
+    fn tip_origin_is_the_last_viewport_not_past_the_end() {
+        assert!((tip_origin(100, 20.0, 800.0) - 1200.0).abs() < 0.01);
+        assert_eq!(tip_origin(10, 20.0, 800.0), 0.0);
+    }
+
+    #[test]
     fn at_live_tip_only_when_offset_is_at_the_end() {
         assert!(!at_live_tip(800.0, 2000.0, 800.0));
         assert!(at_live_tip(1200.0, 2000.0, 800.0));
@@ -810,13 +827,23 @@ mod tests {
 
     #[test]
     fn history_viewport_at_the_tip_clears_the_offset() {
-        let tip = history_viewport(1200.0, 2000.0, 800.0, 20.0, 60);
+        let tip = history_viewport(1200.0, 2000.0, 800.0, 20.0, 60, true);
         assert!(tip.stuck);
         assert_eq!(tip.frac, 0.0);
         assert_eq!(tip.offset, 0);
-        let mid = history_viewport(800.0, 2000.0, 800.0, 20.0, 60);
+        let mid = history_viewport(800.0, 2000.0, 800.0, 20.0, 60, true);
         assert!(!mid.stuck);
         assert!((mid.frac - 0.0).abs() < 0.01);
         assert_eq!(mid.offset, 20);
+    }
+
+    #[test]
+    fn a_lost_tip_offset_does_not_lock_onto_the_oldest_line() {
+        let lost = history_viewport(0.0, 2000.0, 800.0, 20.0, 60, true);
+        assert!(lost.stuck);
+        assert_eq!(lost.offset, 0);
+        let from_top = history_viewport(0.0, 2000.0, 800.0, 20.0, 60, false);
+        assert!(!from_top.stuck);
+        assert_eq!(from_top.offset, 60);
     }
 }
