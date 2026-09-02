@@ -531,6 +531,12 @@ impl Connection {
             }
             any_progress |= progressed;
             if !progressed {
+                // A packet already in `incoming` may need another progress()
+                // before input() will take the rest. Waiting on the socket
+                // would sit until the deadline with those bytes unparsed.
+                if self.incoming_offset < self.incoming.len() {
+                    continue;
+                }
                 break;
             }
         }
