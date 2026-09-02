@@ -314,6 +314,9 @@ pub struct View {
     /// tmux's own `%exit` reason, when it gave one. Reconnection policy needs to
     /// tell an orderly detach apart from a server that went away.
     exit: Option<ExitReason>,
+    /// Bumped when a notification changes what is on screen. Idle polls that
+    /// carry no output must not wake the GUI.
+    display_seq: u64,
 }
 
 /// `%exit` carries no reason on older servers; the distinction matters, so an
@@ -355,6 +358,7 @@ impl View {
             panes: map,
             status: Status::Watching,
             exit: None,
+            display_seq: 0,
         })
     }
 
@@ -370,6 +374,7 @@ impl View {
     pub(crate) fn invalidate(&mut self) {
         if self.status == Status::Watching {
             self.status = Status::NeedsResync;
+            self.display_seq = self.display_seq.wrapping_add(1);
         }
     }
 
@@ -377,7 +382,14 @@ impl View {
         self.status
     }
     pub fn disconnect(&mut self) {
+        if self.status != Status::Disconnected {
+            self.display_seq = self.display_seq.wrapping_add(1);
+        }
         self.status = Status::Disconnected;
+    }
+
+    pub(crate) fn display_seq(&self) -> u64 {
+        self.display_seq
     }
 
     /// Why tmux ended this control session, if it said. `None` means the view
@@ -402,8 +414,15 @@ impl View {
             tmuxctl::Notification::Output { pane, bytes }
             | tmuxctl::Notification::ExtendedOutput { pane, bytes, .. } => {
                 match self.panes.get_mut(&pane) {
-                    Some(terminal) => terminal.terminal.feed(&bytes),
-                    None => self.status = Status::NeedsResync,
+                    Some(terminal) if !bytes.is_empty() => {
+                        terminal.terminal.feed(&bytes);
+                        self.display_seq = self.display_seq.wrapping_add(1);
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.status = Status::NeedsResync;
+                        self.display_seq = self.display_seq.wrapping_add(1);
+                    }
                 }
             }
             tmuxctl::Notification::Exit(_) => self.disconnect(),
@@ -419,7 +438,10 @@ impl View {
             | tmuxctl::Notification::Pause(_)
             | tmuxctl::Notification::Continue(_)
             | tmuxctl::Notification::SessionChanged(..)
-            | tmuxctl::Notification::Unknown(_) => self.status = Status::NeedsResync,
+            | tmuxctl::Notification::Unknown(_) => {
+                self.status = Status::NeedsResync;
+                self.display_seq = self.display_seq.wrapping_add(1);
+            }
             _ => {}
         }
     }

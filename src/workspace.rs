@@ -95,24 +95,35 @@ fn busy_phase(phase: desktop::Phase) -> bool {
     )
 }
 
-fn tab_fill(phase: desktop::Phase, selected: bool) -> Option<egui::Color32> {
-    let color = match phase {
+fn lift(color: egui::Color32, by: u8) -> egui::Color32 {
+    egui::Color32::from_rgb(
+        color.r().saturating_add(by),
+        color.g().saturating_add(by),
+        color.b().saturating_add(by),
+    )
+}
+
+fn tab_color(phase: desktop::Phase, idle: egui::Color32) -> egui::Color32 {
+    match phase {
         desktop::Phase::Watching | desktop::Phase::Demo => egui::Color32::from_rgb(38, 98, 58),
         desktop::Phase::Connecting
         | desktop::Phase::Reconnecting
         | desktop::Phase::Resynchronizing => egui::Color32::from_rgb(140, 108, 28),
         desktop::Phase::Failed => egui::Color32::from_rgb(128, 42, 42),
-        _ => return None,
-    };
-    Some(if selected {
-        egui::Color32::from_rgb(
-            color.r().saturating_add(50),
-            color.g().saturating_add(50),
-            color.b().saturating_add(40),
-        )
-    } else {
-        color
-    })
+        _ => idle,
+    }
+}
+
+fn paint_tab_fills(ui: &mut egui::Ui, fill: egui::Color32, hover: egui::Color32) {
+    let widgets = &mut ui.visuals_mut().widgets;
+    widgets.inactive.weak_bg_fill = fill;
+    widgets.inactive.bg_fill = fill;
+    widgets.hovered.weak_bg_fill = hover;
+    widgets.hovered.bg_fill = hover;
+    widgets.active.weak_bg_fill = hover;
+    widgets.active.bg_fill = hover;
+    widgets.open.weak_bg_fill = fill;
+    widgets.open.bg_fill = fill;
 }
 
 fn paint_drop_marker(ui: &egui::Ui, rect: egui::Rect, after: bool) {
@@ -368,6 +379,27 @@ impl Workspace {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+                    ui.spacing_mut().interact_size.y = 28.0;
+                    // Hovered buttons grow via expansion and a thicker stroke in
+                    // inner_margin. Keep those identical so the strip does not
+                    // change height. Button::fill also kills hover, so phase
+                    // color is set on the widget visuals instead.
+                    let idle_fill = ui.visuals().widgets.inactive.weak_bg_fill;
+                    let idle_hover = lift(idle_fill, 32);
+                    let selection_stroke = ui.visuals().selection.stroke.color;
+                    let stroke_width = ui.visuals().widgets.inactive.bg_stroke.width;
+                    {
+                        let widgets = &mut ui.visuals_mut().widgets;
+                        widgets.inactive.expansion = 0.0;
+                        widgets.hovered.expansion = 0.0;
+                        widgets.active.expansion = 0.0;
+                        widgets.open.expansion = 0.0;
+                        widgets.inactive.bg_stroke.width = stroke_width;
+                        widgets.hovered.bg_stroke.width = stroke_width;
+                        widgets.active.bg_stroke.width = stroke_width;
+                        widgets.open.bg_stroke.width = stroke_width;
+                    }
+                    paint_tab_fills(ui, idle_fill, idle_hover);
                     for (index, tab) in self.tabs.iter().enumerate() {
                         ui.push_id(tab.id, |ui| {
                             let phase = tab.client.phase();
@@ -378,19 +410,24 @@ impl Workspace {
                             }
                             let selected = index == self.active;
                             let text = egui::RichText::new(title).size(16.0).strong();
-                            let mut button = egui::Button::new(text)
+                            let color = tab_color(phase, idle_fill);
+                            paint_tab_fills(ui, color, lift(color, 32));
+                            if selected {
+                                ui.visuals_mut().selection.bg_fill = lift(color, 50);
+                            }
+                            let button = egui::Button::new(text)
                                 .selected(selected)
                                 .min_size(egui::vec2(0.0, 28.0))
                                 .corner_radius(5.0)
                                 .sense(egui::Sense::CLICK | egui::Sense::DRAG)
-                                .stroke(if selected {
-                                    egui::Stroke::new(2.0_f32, ui.visuals().selection.stroke.color)
-                                } else {
-                                    egui::Stroke::NONE
-                                });
-                            if let Some(fill) = tab_fill(phase, selected) {
-                                button = button.fill(fill);
-                            }
+                                .stroke(egui::Stroke::new(
+                                    2.0_f32,
+                                    if selected {
+                                        selection_stroke
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    },
+                                ));
                             let response = ui
                                 .add(button)
                                 .on_hover_text("Click to switch · drag to reorder");
@@ -415,6 +452,7 @@ impl Workspace {
                             }
                         });
                     }
+                    paint_tab_fills(ui, idle_fill, idle_hover);
                     let add = ui
                         .add_enabled(
                             self.tabs.len() < MAX_TABS,

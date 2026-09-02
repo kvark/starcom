@@ -30,6 +30,13 @@ pub struct PaneUi {
     pub painted_rows: usize,
     /// Points of leftover wheel (egui smoothing after a notch) not yet a tick.
     remainder: f32,
+    /// Sub-row remainder so a trackpad does not snap to whole history lines.
+    scroll_frac: f32,
+    /// True while the viewport is pinned to the live tip.
+    stuck: bool,
+    /// stick_to_bottom has stored a tip offset. Until then, the default
+    /// offset is 0 and would paint the oldest (often blank) history.
+    settled: bool,
 }
 
 impl Default for PaneUi {
@@ -38,6 +45,9 @@ impl Default for PaneUi {
             rect: egui::Rect::NOTHING,
             painted_rows: 0,
             remainder: 0.0,
+            scroll_frac: 0.0,
+            stuck: true,
+            settled: false,
         }
     }
 }
@@ -45,6 +55,45 @@ impl Default for PaneUi {
 /// One application-wheel tick. Smaller than a local history line so the first
 /// trackpad fragment is not held until 40 points have piled up.
 const WHEEL_LINE: f32 = 20.0;
+
+fn at_live_tip(scroll_y: f32, content_height: f32, view_height: f32) -> bool {
+    let max_off = (content_height - view_height).max(0.0);
+    max_off <= 1.0 || scroll_y >= max_off - 1.0
+}
+
+/// Pixel offset of a history viewport. `display_offset` 0 is the live tip.
+fn scroll_origin(history: usize, display_offset: usize, row_height: f32, frac: f32) -> f32 {
+    history.saturating_sub(display_offset) as f32 * row_height + frac
+}
+
+struct HistoryViewport {
+    stuck: bool,
+    frac: f32,
+    offset: usize,
+}
+
+fn history_viewport(
+    scroll_y: f32,
+    content_height: f32,
+    view_height: f32,
+    row_height: f32,
+    history: usize,
+) -> HistoryViewport {
+    if at_live_tip(scroll_y, content_height, view_height) {
+        HistoryViewport {
+            stuck: true,
+            frac: 0.0,
+            offset: 0,
+        }
+    } else {
+        let whole = (scroll_y / row_height).floor() as usize;
+        HistoryViewport {
+            stuck: false,
+            frac: (scroll_y - whole as f32 * row_height).clamp(0.0, row_height),
+            offset: history.saturating_sub(whole),
+        }
+    }
+}
 
 fn wheel_ticks(remainder: &mut f32, delta: f32) -> i32 {
     *remainder += delta;
@@ -102,7 +151,7 @@ impl PaneUi {
         );
         ui.scope_builder(
             egui::UiBuilder::new()
-                .id_salt(id)
+                .id_salt(("pane-scope", pane_id.0))
                 .max_rect(rect.shrink(4.0)),
             |ui| {
                 ui.set_clip_rect(rect.shrink(1.0).intersect(ui.clip_rect()));
@@ -117,407 +166,415 @@ impl PaneUi {
                 let (cell_width, row_height) = cell_metrics(ui, font_size);
                 let history = pane.terminal.model().grid().history_size();
                 let total_rows = pane.terminal.model().grid().total_lines();
+                let display = pane.terminal.history_offset();
                 let rows = &mut self.painted_rows;
                 let remainder = &mut self.remainder;
                 let mouse = pane.terminal.reports_mouse();
                 let wants_wheel = pane.terminal.wants_wheel();
                 let sgr_mouse = pane.terminal.sgr_mouse();
-                // Keep the scroll id stable across layout generations so a
-                // resync cannot yank the viewport back to the live tip.
-                egui::ScrollArea::vertical()
-                    .id_salt(egui::Id::new(("scroll", pane_id.0)))
+                // Follow the live tip with stick_to_bottom. Forcing a pixel
+                // offset while stuck aims show_rows at blank history (empty
+                // screen after connect). Once the user has scrolled up,
+                // Alacritty's display_offset is the lock: new output keeps
+                // the same history lines in view.
+                let mut area = egui::ScrollArea::vertical()
+                    .id_salt(("starcom-scroll", pane_id.0))
                     .auto_shrink([false, false])
-                    .stick_to_bottom(true)
+                    .stick_to_bottom(self.stuck)
                     .scroll_source(if wants_wheel {
                         egui::scroll_area::ScrollSource::NONE
                     } else {
                         egui::scroll_area::ScrollSource::ALL
-                    })
-                    .show_rows(ui, row_height, total_rows, |ui, range| {
-                        *rows = range.len();
-                        let (_, content) = ui.allocate_space(egui::vec2(
-                            columns as f32 * cell_width,
-                            range.len() as f32 * row_height,
-                        ));
-                        let kind = if pane.terminal.is_alternate_screen() {
-                            "alternate"
-                        } else {
-                            "shell"
-                        };
-                        let response = ui
-                            .interact(content, id, egui::Sense::click_and_drag())
-                            .on_hover_cursor(egui::CursorIcon::Text)
-                            .on_hover_text(format!(
-                                "Pane {pane_id} · {columns}×{screen_rows} · {kind}"
-                            ));
-                        let point_at = |position: egui::Pos2| {
-                            let row = (range.start as isize
-                                + ((position.y - content.top()) / row_height).floor() as isize)
-                                .clamp(0, total_rows as isize - 1)
-                                as usize;
-                            let x = ((position.x - content.left()) / cell_width)
-                                .clamp(0.0, columns as f32 - 0.001);
-                            (
-                                index::Point::new(
-                                    index::Line(row as i32 - history as i32),
-                                    index::Column(x as usize),
-                                ),
-                                if x.fract() < 0.5 {
-                                    index::Side::Left
-                                } else {
-                                    index::Side::Right
-                                },
-                            )
-                        };
-                        if response.clicked()
-                            || response.drag_started()
-                            || response.secondary_clicked()
-                        {
-                            *focused = Some(pane_id);
-                            response.request_focus();
-                        }
-                        if response.has_focus() {
-                            // Last-frame filter is what begin_pass consults, so
-                            // this has to be set every frame we hold focus.
-                            // Otherwise ArrowUp walks to Paste and Tab/Escape
-                            // leave the remote application.
-                            ui.ctx().memory_mut(|memory| {
-                                memory.set_focus_lock_filter(
-                                    id,
-                                    egui::EventFilter {
-                                        tab: true,
-                                        horizontal_arrows: true,
-                                        vertical_arrows: true,
-                                        escape: true,
-                                    },
-                                );
-                            });
-                        }
-                        if response.clicked() {
-                            events.push(input::Action::SelectPane);
-                        }
-                        if response.secondary_clicked() {
-                            if let Some(text) = pane.terminal.selected_text() {
-                                copy(ui.ctx(), text, notice, notice_until, "selection copied");
+                    });
+                if !self.stuck {
+                    area = area.vertical_scroll_offset(scroll_origin(
+                        history,
+                        display,
+                        row_height,
+                        self.scroll_frac,
+                    ));
+                } else if !self.settled {
+                    // Default offset is 0. Aim at the live screen so the first
+                    // frame is not 200 blank history lines; stick_to_bottom
+                    // then lands on the prompt.
+                    area = area.vertical_scroll_offset(history as f32 * row_height);
+                    ui.ctx().request_repaint();
+                }
+                let output = area.show_rows(ui, row_height, total_rows, |ui, range| {
+                    *rows = range.len();
+                    let (_, content) = ui.allocate_space(egui::vec2(
+                        columns as f32 * cell_width,
+                        range.len() as f32 * row_height,
+                    ));
+                    let response = ui
+                        .interact(content, id, egui::Sense::click_and_drag())
+                        .on_hover_cursor(egui::CursorIcon::Text);
+                    let point_at = |position: egui::Pos2| {
+                        let row = (range.start as isize
+                            + ((position.y - content.top()) / row_height).floor() as isize)
+                            .clamp(0, total_rows as isize - 1)
+                            as usize;
+                        let x = ((position.x - content.left()) / cell_width)
+                            .clamp(0.0, columns as f32 - 0.001);
+                        (
+                            index::Point::new(
+                                index::Line(row as i32 - history as i32),
+                                index::Column(x as usize),
+                            ),
+                            if x.fract() < 0.5 {
+                                index::Side::Left
                             } else {
-                                copy(
-                                    ui.ctx(),
-                                    pane.terminal.screen_lines().join("\n"),
-                                    notice,
-                                    notice_until,
-                                    "full pane copied",
-                                );
-                            }
-                        }
-                        let pointer_in_pane = ui.rect_contains_pointer(rect);
-                        if wants_wheel && pointer_in_pane {
-                            let dy = ui.input(|input| input.smooth_scroll_delta.y);
-                            let ticks = wheel_ticks(remainder, dy);
-                            if ticks != 0 {
-                                let up = ticks > 0;
-                                let n = ticks.unsigned_abs();
-                                if mouse {
-                                    let (column, row) = response
-                                        .hover_pos()
-                                        .map(|position| {
-                                            let x = ((position.x - content.left()) / cell_width)
-                                                .floor()
-                                                .clamp(0.0, columns.saturating_sub(1) as f32)
-                                                as usize;
-                                            let y = ((position.y - content.top()) / row_height)
-                                                .floor()
-                                                .clamp(0.0, screen_rows.saturating_sub(1) as f32)
-                                                as usize;
-                                            (x, y)
-                                        })
-                                        .unwrap_or((0, 0));
-                                    for _ in 0..n {
-                                        events.push(input::Action::Bytes(
-                                            input::mouse_wheel_bytes(up, column, row, sgr_mouse),
-                                        ));
-                                    }
-                                } else {
-                                    // Alternate-screen apps that did not enable mouse
-                                    // reporting still want tmux WheelUp/WheelDown, not
-                                    // cursor keys (those move the application cursor).
-                                    let key = if up {
-                                        input::Key::WheelUp
-                                    } else {
-                                        input::Key::WheelDown
-                                    };
-                                    for _ in 0..n {
-                                        events.push(input::Action::Key(
-                                            key,
-                                            input::Modifiers::default(),
-                                        ));
-                                    }
-                                }
-                            }
-                            // Remainder after the ±8 clamp is still a real scroll.
-                            // Paint again so it is not held until the next notch.
-                            if remainder.abs() >= WHEEL_LINE {
-                                ui.ctx().request_repaint();
-                            }
-                            ui.ctx().input_mut(|input| {
-                                input.smooth_scroll_delta.y = 0.0;
-                            });
-                        } else if !pointer_in_pane {
-                            *remainder = 0.0;
-                        }
-                        if let Some(position) = response.interact_pointer_pos() {
-                            let (point, side) = point_at(position);
-                            if response.triple_clicked() {
-                                pane.terminal.begin_selection(
-                                    point,
-                                    side,
-                                    selection::SelectionType::Lines,
-                                );
-                            } else if response.double_clicked() {
-                                pane.terminal.begin_selection(
-                                    point,
-                                    side,
-                                    selection::SelectionType::Semantic,
-                                );
-                            } else if response.clicked() {
-                                pane.terminal.clear_selection();
-                            } else if response.drag_started() {
-                                let origin = ui
-                                    .input(|input| input.pointer.press_origin())
-                                    .unwrap_or(position);
-                                let (anchor, anchor_side) = point_at(origin);
-                                pane.terminal.begin_selection(
-                                    anchor,
-                                    anchor_side,
-                                    selection::SelectionType::Simple,
-                                );
-                            }
-                            if response.dragged() {
-                                pane.terminal.update_selection(point, side);
-                                let clip = ui.clip_rect();
-                                let delta = if position.y < clip.top() + 12.0 {
-                                    row_height
-                                } else if position.y > clip.bottom() - 12.0 {
-                                    -row_height
-                                } else {
-                                    0.0
-                                };
-                                if delta != 0.0 {
-                                    ui.scroll_with_delta(egui::vec2(0.0, delta));
-                                    ui.ctx().request_repaint_after(
-                                        std::time::Duration::from_millis(30),
-                                    );
-                                }
-                            }
-                        }
-                        let copying = response.has_focus()
-                            && ui.input(|input| {
-                                input
-                                    .events
-                                    .iter()
-                                    .any(|event| matches!(event, egui::Event::Copy))
-                            });
-                        if copying && let Some(text) = pane.terminal.selected_text() {
+                                index::Side::Right
+                            },
+                        )
+                    };
+                    if response.clicked() || response.drag_started() || response.secondary_clicked()
+                    {
+                        *focused = Some(pane_id);
+                        response.request_focus();
+                    }
+                    if response.has_focus() {
+                        // Last-frame filter is what begin_pass consults, so
+                        // this has to be set every frame we hold focus.
+                        // Otherwise ArrowUp walks to Paste and Tab/Escape
+                        // leave the remote application.
+                        ui.ctx().memory_mut(|memory| {
+                            memory.set_focus_lock_filter(
+                                id,
+                                egui::EventFilter {
+                                    tab: true,
+                                    horizontal_arrows: true,
+                                    vertical_arrows: true,
+                                    escape: true,
+                                },
+                            );
+                        });
+                    }
+                    if response.clicked() {
+                        events.push(input::Action::SelectPane);
+                    }
+                    if response.secondary_clicked() {
+                        if let Some(text) = pane.terminal.selected_text() {
                             copy(ui.ctx(), text, notice, notice_until, "selection copied");
+                        } else {
+                            copy(
+                                ui.ctx(),
+                                pane.terminal.screen_lines().join("\n"),
+                                notice,
+                                notice_until,
+                                "full pane copied",
+                            );
                         }
-                        let model = pane.terminal.model();
-                        let selection_range = pane.terminal.selection_range();
-                        let grid = model.grid();
-                        let clip = ui.clip_rect();
-                        for row in range.clone() {
-                            let line = index::Line(row as i32 - history as i32);
-                            let y = content.top() + (row - range.start) as f32 * row_height;
-                            // Paint backgrounds before glyphs. In particular, a wide
-                            // glyph spans its following spacer cell; painting that
-                            // spacer afterwards would erase half of the glyph.
-                            for column in 0..columns {
-                                let cell = &grid[line][index::Column(column)];
-                                let point = index::Point::new(line, index::Column(column));
-                                let selected = selection_range.is_some_and(|range| {
-                                    range.contains(point)
-                                        || cell.flags.contains(term::cell::Flags::WIDE_CHAR)
-                                            && range.contains(index::Point::new(
-                                                point.line,
-                                                point.column + 1,
-                                            ))
-                                });
-                                let background = if selected {
-                                    ui.visuals().selection.bg_fill
+                    }
+                    let pointer_in_pane = ui.rect_contains_pointer(rect);
+                    if wants_wheel && pointer_in_pane {
+                        let dy = ui.input(|input| input.smooth_scroll_delta.y);
+                        let ticks = wheel_ticks(remainder, dy);
+                        if ticks != 0 {
+                            let up = ticks > 0;
+                            let n = ticks.unsigned_abs();
+                            if mouse {
+                                let (column, row) = response
+                                    .hover_pos()
+                                    .map(|position| {
+                                        let x = ((position.x - content.left()) / cell_width)
+                                            .floor()
+                                            .clamp(0.0, columns.saturating_sub(1) as f32)
+                                            as usize;
+                                        let y = ((position.y - content.top()) / row_height)
+                                            .floor()
+                                            .clamp(0.0, screen_rows.saturating_sub(1) as f32)
+                                            as usize;
+                                        (x, y)
+                                    })
+                                    .unwrap_or((0, 0));
+                                for _ in 0..n {
+                                    events.push(input::Action::Bytes(input::mouse_wheel_bytes(
+                                        up, column, row, sgr_mouse,
+                                    )));
+                                }
+                            } else {
+                                // Alternate-screen apps that did not enable mouse
+                                // reporting still want tmux WheelUp/WheelDown, not
+                                // cursor keys (those move the application cursor).
+                                let key = if up {
+                                    input::Key::WheelUp
                                 } else {
-                                    let background = cell_colors(cell, model.colors()).1;
-                                    if frozen {
-                                        freeze(background)
-                                    } else {
-                                        background
-                                    }
+                                    input::Key::WheelDown
                                 };
-                                if background != BACKGROUND {
-                                    let cell_rect = egui::Rect::from_min_size(
-                                        egui::pos2(content.left() + column as f32 * cell_width, y),
-                                        egui::vec2(cell_width, row_height),
-                                    );
-                                    ui.painter().rect_filled(cell_rect, 0.0, background);
+                                for _ in 0..n {
+                                    events
+                                        .push(input::Action::Key(key, input::Modifiers::default()));
                                 }
                             }
-                            let mut column = 0;
-                            while column < columns {
-                                let cell = &grid[line][index::Column(column)];
-                                let foreground = {
-                                    let color = cell_colors(cell, model.colors()).0;
-                                    if frozen { freeze(color) } else { color }
-                                };
-                                if cell.flags.intersects(
-                                    term::cell::Flags::WIDE_CHAR_SPACER
-                                        | term::cell::Flags::LEADING_WIDE_CHAR_SPACER
-                                        | term::cell::Flags::HIDDEN,
-                                ) {
-                                    column += 1;
-                                    continue;
-                                }
-                                // Batch ordinary ASCII into fixed-width runs. A wide or
-                                // combining glyph gets its own positioned cell cluster,
-                                // so fallback font metrics cannot move the next column.
-                                let start = column;
-                                let mut text = String::new();
-                                if cell.c.is_ascii()
-                                    && cell.zerowidth().is_none_or(<[char]>::is_empty)
-                                {
-                                    while column < columns {
-                                        let next = &grid[line][index::Column(column)];
-                                        if !next.c.is_ascii()
-                                            || next
-                                                .zerowidth()
-                                                .is_some_and(|chars| !chars.is_empty())
-                                            || next.flags != cell.flags
-                                            || next.fg != cell.fg
-                                            || next.bg != cell.bg
-                                        {
-                                            break;
-                                        }
-                                        text.push(if next.c.is_control() { ' ' } else { next.c });
-                                        column += 1;
-                                    }
+                        }
+                        // Remainder after the ±8 clamp is still a real scroll.
+                        // Paint again so it is not held until the next notch.
+                        if remainder.abs() >= WHEEL_LINE {
+                            ui.ctx().request_repaint();
+                        }
+                        ui.ctx().input_mut(|input| {
+                            input.smooth_scroll_delta.y = 0.0;
+                        });
+                    } else if !pointer_in_pane {
+                        *remainder = 0.0;
+                    }
+                    if let Some(position) = response.interact_pointer_pos() {
+                        let (point, side) = point_at(position);
+                        if response.triple_clicked() {
+                            pane.terminal.begin_selection(
+                                point,
+                                side,
+                                selection::SelectionType::Lines,
+                            );
+                        } else if response.double_clicked() {
+                            pane.terminal.begin_selection(
+                                point,
+                                side,
+                                selection::SelectionType::Semantic,
+                            );
+                        } else if response.clicked() {
+                            pane.terminal.clear_selection();
+                        } else if response.drag_started() {
+                            let origin = ui
+                                .input(|input| input.pointer.press_origin())
+                                .unwrap_or(position);
+                            let (anchor, anchor_side) = point_at(origin);
+                            pane.terminal.begin_selection(
+                                anchor,
+                                anchor_side,
+                                selection::SelectionType::Simple,
+                            );
+                        }
+                        if response.dragged() {
+                            pane.terminal.update_selection(point, side);
+                            let clip = ui.clip_rect();
+                            let delta = if position.y < clip.top() + 12.0 {
+                                row_height
+                            } else if position.y > clip.bottom() - 12.0 {
+                                -row_height
+                            } else {
+                                0.0
+                            };
+                            if delta != 0.0 {
+                                ui.scroll_with_delta(egui::vec2(0.0, delta));
+                                ui.ctx()
+                                    .request_repaint_after(std::time::Duration::from_millis(30));
+                            }
+                        }
+                    }
+                    let copying = response.has_focus()
+                        && ui.input(|input| {
+                            input
+                                .events
+                                .iter()
+                                .any(|event| matches!(event, egui::Event::Copy))
+                        });
+                    if copying && let Some(text) = pane.terminal.selected_text() {
+                        copy(ui.ctx(), text, notice, notice_until, "selection copied");
+                    }
+                    let model = pane.terminal.model();
+                    let selection_range = pane.terminal.selection_range();
+                    let grid = model.grid();
+                    let clip = ui.clip_rect();
+                    for row in range.clone() {
+                        let line = index::Line(row as i32 - history as i32);
+                        let y = content.top() + (row - range.start) as f32 * row_height;
+                        // Paint backgrounds before glyphs. In particular, a wide
+                        // glyph spans its following spacer cell; painting that
+                        // spacer afterwards would erase half of the glyph.
+                        for column in 0..columns {
+                            let cell = &grid[line][index::Column(column)];
+                            let point = index::Point::new(line, index::Column(column));
+                            let selected = selection_range.is_some_and(|range| {
+                                range.contains(point)
+                                    || cell.flags.contains(term::cell::Flags::WIDE_CHAR)
+                                        && range.contains(index::Point::new(
+                                            point.line,
+                                            point.column + 1,
+                                        ))
+                            });
+                            let background = if selected {
+                                ui.visuals().selection.bg_fill
+                            } else {
+                                let background = cell_colors(cell, model.colors()).1;
+                                if frozen {
+                                    freeze(background)
                                 } else {
-                                    text.push(cell.c);
+                                    background
+                                }
+                            };
+                            if background != BACKGROUND {
+                                let cell_rect = egui::Rect::from_min_size(
+                                    egui::pos2(content.left() + column as f32 * cell_width, y),
+                                    egui::vec2(cell_width, row_height),
+                                );
+                                ui.painter().rect_filled(cell_rect, 0.0, background);
+                            }
+                        }
+                        let mut column = 0;
+                        while column < columns {
+                            let cell = &grid[line][index::Column(column)];
+                            let foreground = {
+                                let color = cell_colors(cell, model.colors()).0;
+                                if frozen { freeze(color) } else { color }
+                            };
+                            if cell.flags.intersects(
+                                term::cell::Flags::WIDE_CHAR_SPACER
+                                    | term::cell::Flags::LEADING_WIDE_CHAR_SPACER
+                                    | term::cell::Flags::HIDDEN,
+                            ) {
+                                column += 1;
+                                continue;
+                            }
+                            // Batch ordinary ASCII into fixed-width runs. A wide or
+                            // combining glyph gets its own positioned cell cluster,
+                            // so fallback font metrics cannot move the next column.
+                            let start = column;
+                            let mut text = String::new();
+                            if cell.c.is_ascii() && cell.zerowidth().is_none_or(<[char]>::is_empty)
+                            {
+                                while column < columns {
+                                    let next = &grid[line][index::Column(column)];
+                                    if !next.c.is_ascii()
+                                        || next.zerowidth().is_some_and(|chars| !chars.is_empty())
+                                        || next.flags != cell.flags
+                                        || next.fg != cell.fg
+                                        || next.bg != cell.bg
+                                    {
+                                        break;
+                                    }
+                                    text.push(if next.c.is_control() { ' ' } else { next.c });
+                                    column += 1;
+                                }
+                            } else {
+                                text.push(cell.c);
+                                if let Some(chars) = cell.zerowidth() {
+                                    text.extend(chars);
+                                }
+                                column += 1;
+                            }
+                            if text.trim().is_empty()
+                                && !cell.flags.intersects(
+                                    term::cell::Flags::ALL_UNDERLINES
+                                        | term::cell::Flags::STRIKEOUT,
+                                )
+                            {
+                                continue;
+                            }
+                            let format = egui::TextFormat {
+                                font_id: font.clone(),
+                                color: foreground,
+                                italics: cell.flags.contains(term::cell::Flags::ITALIC),
+                                underline: if cell
+                                    .flags
+                                    .intersects(term::cell::Flags::ALL_UNDERLINES)
+                                {
+                                    egui::Stroke::new(1.0_f32, foreground)
+                                } else {
+                                    egui::Stroke::NONE
+                                },
+                                strikethrough: if cell.flags.contains(term::cell::Flags::STRIKEOUT)
+                                {
+                                    egui::Stroke::new(1.0_f32, foreground)
+                                } else {
+                                    egui::Stroke::NONE
+                                },
+                                ..Default::default()
+                            };
+                            let job = egui::text::LayoutJob::simple_format(text, format);
+                            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                            let x = content.left() + start as f32 * cell_width;
+                            let width = if cell.flags.contains(term::cell::Flags::WIDE_CHAR) {
+                                2
+                            } else {
+                                column - start
+                            };
+                            let glyph_clip = egui::Rect::from_min_size(
+                                egui::pos2(x, y),
+                                egui::vec2(width as f32 * cell_width, row_height),
+                            );
+                            ui.painter()
+                                .with_clip_rect(clip.intersect(glyph_clip))
+                                .galley(
+                                    egui::pos2(x, y + (row_height - galley.size().y) * 0.5),
+                                    galley,
+                                    foreground,
+                                );
+                        }
+                    }
+                    let cursor = model.renderable_content().cursor;
+                    let row = (cursor.point.line.0 + history as i32) as usize;
+                    if !frozen && range.contains(&row) && cursor.shape != ansi::CursorShape::Hidden
+                    {
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                content.left() + cursor.point.column.0 as f32 * cell_width,
+                                content.top() + (row - range.start) as f32 * row_height,
+                            ),
+                            egui::vec2(cell_width, row_height),
+                        );
+                        let stroke = egui::Stroke::new(1.0_f32, FOREGROUND);
+                        match cursor.shape {
+                            ansi::CursorShape::Beam => {
+                                ui.painter()
+                                    .line_segment([rect.left_top(), rect.left_bottom()], stroke);
+                            }
+                            ansi::CursorShape::Underline => {
+                                ui.painter().line_segment(
+                                    [rect.left_bottom(), rect.right_bottom()],
+                                    stroke,
+                                );
+                            }
+                            _ if active => {
+                                ui.painter().rect_filled(rect.shrink(0.5), 0.0, FOREGROUND);
+                                let cell = &grid[cursor.point.line][cursor.point.column];
+                                if !cell.c.is_control() && cell.c != ' ' {
+                                    let mut text = String::from(cell.c);
                                     if let Some(chars) = cell.zerowidth() {
                                         text.extend(chars);
                                     }
-                                    column += 1;
-                                }
-                                if text.trim().is_empty()
-                                    && !cell.flags.intersects(
-                                        term::cell::Flags::ALL_UNDERLINES
-                                            | term::cell::Flags::STRIKEOUT,
-                                    )
-                                {
-                                    continue;
-                                }
-                                let format = egui::TextFormat {
-                                    font_id: font.clone(),
-                                    color: foreground,
-                                    italics: cell.flags.contains(term::cell::Flags::ITALIC),
-                                    underline: if cell
-                                        .flags
-                                        .intersects(term::cell::Flags::ALL_UNDERLINES)
-                                    {
-                                        egui::Stroke::new(1.0_f32, foreground)
-                                    } else {
-                                        egui::Stroke::NONE
-                                    },
-                                    strikethrough: if cell
-                                        .flags
-                                        .contains(term::cell::Flags::STRIKEOUT)
-                                    {
-                                        egui::Stroke::new(1.0_f32, foreground)
-                                    } else {
-                                        egui::Stroke::NONE
-                                    },
-                                    ..Default::default()
-                                };
-                                let job = egui::text::LayoutJob::simple_format(text, format);
-                                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-                                let x = content.left() + start as f32 * cell_width;
-                                let width = if cell.flags.contains(term::cell::Flags::WIDE_CHAR) {
-                                    2
-                                } else {
-                                    column - start
-                                };
-                                let glyph_clip = egui::Rect::from_min_size(
-                                    egui::pos2(x, y),
-                                    egui::vec2(width as f32 * cell_width, row_height),
-                                );
-                                ui.painter()
-                                    .with_clip_rect(clip.intersect(glyph_clip))
-                                    .galley(
-                                        egui::pos2(x, y + (row_height - galley.size().y) * 0.5),
+                                    let format = egui::TextFormat {
+                                        font_id: font.clone(),
+                                        color: BACKGROUND,
+                                        ..Default::default()
+                                    };
+                                    let job = egui::text::LayoutJob::simple_format(text, format);
+                                    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                                    ui.painter().galley(
+                                        egui::pos2(
+                                            rect.left(),
+                                            rect.top() + (row_height - galley.size().y) * 0.5,
+                                        ),
                                         galley,
-                                        foreground,
-                                    );
-                            }
-                        }
-                        let cursor = model.renderable_content().cursor;
-                        let row = (cursor.point.line.0 + history as i32) as usize;
-                        if !frozen
-                            && range.contains(&row)
-                            && cursor.shape != ansi::CursorShape::Hidden
-                        {
-                            let rect = egui::Rect::from_min_size(
-                                egui::pos2(
-                                    content.left() + cursor.point.column.0 as f32 * cell_width,
-                                    content.top() + (row - range.start) as f32 * row_height,
-                                ),
-                                egui::vec2(cell_width, row_height),
-                            );
-                            let stroke = egui::Stroke::new(1.0_f32, FOREGROUND);
-                            match cursor.shape {
-                                ansi::CursorShape::Beam => {
-                                    ui.painter().line_segment(
-                                        [rect.left_top(), rect.left_bottom()],
-                                        stroke,
-                                    );
-                                }
-                                ansi::CursorShape::Underline => {
-                                    ui.painter().line_segment(
-                                        [rect.left_bottom(), rect.right_bottom()],
-                                        stroke,
-                                    );
-                                }
-                                _ if active => {
-                                    ui.painter().rect_filled(rect.shrink(0.5), 0.0, FOREGROUND);
-                                    let cell = &grid[cursor.point.line][cursor.point.column];
-                                    if !cell.c.is_control() && cell.c != ' ' {
-                                        let mut text = String::from(cell.c);
-                                        if let Some(chars) = cell.zerowidth() {
-                                            text.extend(chars);
-                                        }
-                                        let format = egui::TextFormat {
-                                            font_id: font.clone(),
-                                            color: BACKGROUND,
-                                            ..Default::default()
-                                        };
-                                        let job =
-                                            egui::text::LayoutJob::simple_format(text, format);
-                                        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-                                        ui.painter().galley(
-                                            egui::pos2(
-                                                rect.left(),
-                                                rect.top() + (row_height - galley.size().y) * 0.5,
-                                            ),
-                                            galley,
-                                            BACKGROUND,
-                                        );
-                                    }
-                                }
-                                _ => {
-                                    ui.painter().rect_stroke(
-                                        rect.shrink(0.5),
-                                        0.0,
-                                        stroke,
-                                        egui::StrokeKind::Inside,
+                                        BACKGROUND,
                                     );
                                 }
                             }
+                            _ => {
+                                ui.painter().rect_stroke(
+                                    rect.shrink(0.5),
+                                    0.0,
+                                    stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
                         }
-                    });
+                    }
+                });
+                let viewport = history_viewport(
+                    output.state.offset.y,
+                    output.content_size.y,
+                    output.inner_rect.height(),
+                    row_height,
+                    history,
+                );
+                self.stuck = viewport.stuck;
+                self.scroll_frac = viewport.frac;
+                if viewport.stuck {
+                    self.settled = true;
+                }
+                pane.terminal.scroll_history(viewport.offset);
                 if controls && *focused == Some(pane_id) {
                     let bar = egui::Rect::from_min_max(
                         egui::pos2(rect.max.x - 118.0, rect.min.y + 4.0),
@@ -727,5 +784,39 @@ mod tests {
         assert_eq!(wheel_ticks(&mut remainder, -20.0), -1);
         assert_eq!(remainder, 0.0);
         assert_eq!(wheel_ticks(&mut remainder, 80.0), 4);
+    }
+
+    #[test]
+    fn at_live_tip_only_when_offset_is_at_the_end() {
+        assert!(!at_live_tip(800.0, 2000.0, 800.0));
+        assert!(at_live_tip(1200.0, 2000.0, 800.0));
+        assert!(at_live_tip(0.0, 200.0, 800.0));
+    }
+
+    #[test]
+    fn viewport_moves_up_the_list_when_history_is_full() {
+        let row_height = 20.0;
+        let origin = scroll_origin(8, 3, row_height, 4.0);
+        let after = scroll_origin(8, 4, row_height, 4.0);
+        assert!((origin - after - row_height).abs() < 0.01);
+    }
+
+    #[test]
+    fn viewport_stays_when_history_and_offset_grow_together() {
+        let origin = scroll_origin(8, 3, 20.0, 4.0);
+        let after = scroll_origin(9, 4, 20.0, 4.0);
+        assert!((origin - after).abs() < 0.01);
+    }
+
+    #[test]
+    fn history_viewport_at_the_tip_clears_the_offset() {
+        let tip = history_viewport(1200.0, 2000.0, 800.0, 20.0, 60);
+        assert!(tip.stuck);
+        assert_eq!(tip.frac, 0.0);
+        assert_eq!(tip.offset, 0);
+        let mid = history_viewport(800.0, 2000.0, 800.0, 20.0, 60);
+        assert!(!mid.stuck);
+        assert!((mid.frac - 0.0).abs() < 0.01);
+        assert_eq!(mid.offset, 20);
     }
 }

@@ -26,9 +26,14 @@ Identities, hardware keys, install, and the terminal workspace after `v0.1.0`.
   Create a session in a field beside the session list, not a dialog. Right-click
   copies the selection or the whole pane. Divider drags always resize tmux.
   After keys or wheel, remote echo runs at 20 fps for a short time. The idle
-  paint rate is `fps` in `workspace.conf` (`etc/workspace.conf.example`). The
-  selected pane is the widget with keyboard focus; arrows, Tab, and Escape stay
-  with that field or pane instead of walking to other buttons.
+  paint rate is `fps` in `workspace.conf` (`etc/workspace.conf.example`);
+  polls that do not change the screen do not wake the GUI. Hovering a tab
+  lightens it without changing the strip height. Scrolling up in history stays
+  on those lines while new output arrives; the live tip still follows. The
+  status line shows the focused pane's size, and a copy notice replaces the
+  hint for a moment. The selected pane is the widget with keyboard focus;
+  arrows, Tab, and Escape stay with that field or pane instead of walking to
+  other buttons.
 - **Install.** `make install` does not assume GNU `install -D`. On macOS it
   writes `~/Applications/Starcom.app`. macOS/Windows icons use a full PNG
   family for `cargo-bundle --bin`.
