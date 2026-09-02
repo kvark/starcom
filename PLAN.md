@@ -166,8 +166,7 @@ terminal checkpoint.
 - Local scrollback, selection, word/line selection, copying, and font sizing.
 - Interactive UTF-8/IME commits, conventional special keys, terminal Ctrl keys,
   clipboard paste, and multiline-paste confirmation.
-- Divider dragging that resizes tmux on release, with an opt-out for
-  attachments that must not change the shared layout.
+- Divider dragging that resizes tmux on release.
 - Event-driven redraw and a worker thread that does no network I/O under the UI
   model lock.
 - Automatic reconnection after transport loss: classification, cancellable
@@ -208,7 +207,7 @@ terminal checkpoint.
 - [x] Wheel to the application when it reports mouse or is on the alternate screen;
   pane split/zoom/kill chrome.
 - [x] Guarded keyboard input and paste; no stale/offline replay.
-- [x] Opt-in remote divider resizing followed by server-authoritative resync.
+- [x] Remote divider resizing followed by server-authoritative resync.
 - [x] Native Linux/X11 render, clipboard, resize, and clean-close smoke test.
 - [x] Real localhost SSH/tmux test for input, paste-once, resize, and broadcast guard.
 - [ ] Native macOS and Windows GUI interaction/close tests.

@@ -6,7 +6,9 @@ mod terminal;
 
 use std::{collections, path, sync, time};
 
-use crate::{core, desktop, input as terminal_input, session, snapshot, ssh, ssh_config, store};
+use crate::{
+    core, desktop, input as terminal_input, reconnect, session, snapshot, ssh, ssh_config, store,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Screen {
@@ -242,7 +244,6 @@ pub enum Action {
     /// confirmed button press, never from a failed attach.
     CreateSession(desktop::Connection),
     Disconnect,
-    Demo,
     /// Every terminal step this frame produced, in order. Never a subset: a
     /// frame that cannot deliver all of its steps reports that to the user.
     Frame(Vec<Step>),
@@ -263,15 +264,18 @@ pub struct DesktopUi {
     pane_ui: collections::BTreeMap<tmuxctl::PaneId, terminal::PaneUi>,
     pending_paste: Option<(desktop::Target, terminal_input::Paste)>,
     notice: Option<String>,
+    notice_until: Option<time::Instant>,
+    /// Restore keyboard focus the next time this tab's panes are painted.
+    restore_focus: bool,
+    /// Name for an as-yet-uncreated session, kept apart from the selected one
+    /// so typing it cannot be overwritten by the live listing.
+    create_name: String,
     /// Whether a local SSH agent looked reachable, and when that was last
     /// asked. A hint for the form only; the connection still authenticates as
     /// configured. Rechecked while the form is open so that starting an agent
     /// clears the warning without restarting Starcom.
     agent_available: bool,
     agent_checked: time::Instant,
-    /// Set while the user is confirming that creating a session may start a
-    /// tmux server on a host that has none.
-    confirm_create: bool,
     /// Destination we last asked the host to list sessions for. Empty means
     /// never listed. Restored tabs copy the destination here so opening a
     /// workspace does not authenticate.
@@ -281,7 +285,6 @@ pub struct DesktopUi {
     /// Last cell size sent to tmux, so we do not spam refresh-client -C.
     client_cells: Option<core::Size>,
     pending_client_cells: Option<(core::Size, time::Instant)>,
-    refresh_tick: u64,
 }
 
 impl Default for DesktopUi {
@@ -309,14 +312,15 @@ impl DesktopUi {
             pane_ui: collections::BTreeMap::new(),
             pending_paste: None,
             notice: None,
+            notice_until: None,
+            restore_focus: false,
+            create_name: String::new(),
             agent_available: ssh::agent_available(),
             agent_checked: time::Instant::now(),
-            confirm_create: false,
             listed_destination: String::new(),
             auto_list: false,
             client_cells: None,
             pending_client_cells: None,
-            refresh_tick: 0,
         }
     }
 
@@ -380,7 +384,10 @@ impl DesktopUi {
 
     pub fn cancel_transient(&mut self) {
         self.pending_paste = None;
-        self.confirm_create = false;
+    }
+
+    pub(crate) fn arm_focus_restore(&mut self) {
+        self.restore_focus = true;
     }
 
     pub fn refresh_profile(&mut self) {
@@ -458,6 +465,20 @@ impl DesktopUi {
             )
         {
             self.screen = Screen::Connection;
+        }
+        // Typing `exit` in the last shell destroys the tmux session. Treat that
+        // the same as the Exit button: back to the form, tab renamed there.
+        if self.screen == Screen::Terminal
+            && matches!(
+                state.failure,
+                Some(reconnect::Failure::Detached | reconnect::Failure::MissingSession)
+            )
+            && matches!(
+                state.phase,
+                desktop::Phase::Disconnected | desktop::Phase::Failed
+            )
+        {
+            return Action::Disconnect;
         }
         match self.screen {
             Screen::Connection => self.show_connection(root, state),
@@ -658,6 +679,35 @@ impl DesktopUi {
                                 ui.weak("Sessions appear after the host is contacted.");
                             }
                         }
+                        if host_ready {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.create_name)
+                                    .hint_text("new session")
+                                    .desired_width(160.0)
+                                    .min_size(egui::vec2(160.0, 28.0)),
+                            );
+                            if ui
+                                .add_enabled(
+                                    idle
+                                        && !busy
+                                        && !self.create_name.trim().is_empty(),
+                                    egui::Button::new("Create").sense(egui::Sense::CLICK),
+                                )
+                                .on_hover_text(
+                                    "Create a named session on the host. This starts a tmux \
+                                     server if none is running.",
+                                )
+                                .clicked()
+                            {
+                                match self.form.connection_named(self.create_name.trim()) {
+                                    Ok(connection) => {
+                                        self.notice = None;
+                                        action = Action::CreateSession(connection);
+                                    }
+                                    Err(error) => self.notice = Some(error.to_string()),
+                                }
+                            }
+                        }
                     });
 
                     ui.add_space(12.0);
@@ -665,16 +715,20 @@ impl DesktopUi {
                         let connecting = state.phase == desktop::Phase::Connecting;
                         let can_connect =
                             host_ready && !self.form.session.trim().is_empty() && idle && !connecting;
+                        let connect_label = if connecting {
+                            format!("{} Connecting…", spinner(ui.ctx()))
+                        } else {
+                            "Connect".to_owned()
+                        };
+                        if connecting {
+                            ui.ctx().request_repaint();
+                        }
                         let connect = ui.add_enabled(
                             can_connect || connecting,
-                            egui::Button::new(if connecting {
-                                "Connecting…"
-                            } else {
-                                "Connect"
-                            })
-                            .selected(connecting)
-                            .min_size(egui::vec2(112.0, 28.0))
-                            .sense(egui::Sense::CLICK),
+                            egui::Button::new(connect_label)
+                                .selected(connecting)
+                                .min_size(egui::vec2(112.0, 28.0))
+                                .sense(egui::Sense::CLICK),
                         );
                         if connect.clicked() && !connecting {
                             match self.form.connection() {
@@ -684,25 +738,6 @@ impl DesktopUi {
                                 }
                                 Err(error) => self.notice = Some(error.to_string()),
                             }
-                        }
-                        if ui
-                            .add_enabled(
-                                host_ready && idle && !busy,
-                                egui::Button::new("Create session").sense(egui::Sense::CLICK),
-                            )
-                            .on_hover_text(
-                                "Create a named session on the host. This starts a tmux \
-                                 server if none is running.",
-                            )
-                            .clicked()
-                        {
-                            self.confirm_create = true;
-                        }
-                        if ui
-                            .add(egui::Button::new("Open local demo").sense(egui::Sense::CLICK))
-                            .clicked()
-                        {
-                            action = Action::Demo;
                         }
                         if matches!(
                             state.phase,
@@ -810,48 +845,6 @@ impl DesktopUi {
                 }
             }
         }
-        if self.confirm_create {
-            let mut confirmed = false;
-            egui::Window::new("Create a tmux session?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(root.ctx(), |ui| {
-                    ui.label(format!("Create a session on {}?", self.form.host.trim()));
-                    ui.add_space(4.0);
-                    field(ui, "Session name", &mut self.form.session);
-                    ui.add_space(4.0);
-                    ui.weak(
-                        "If the host is not already running tmux, this starts a server. \
-                         Starcom never does that on its own.",
-                    );
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
-                            self.confirm_create = false;
-                        }
-                        if ui
-                            .add_enabled(
-                                !self.form.session.trim().is_empty(),
-                                egui::Button::new("Create session"),
-                            )
-                            .clicked()
-                        {
-                            confirmed = true;
-                        }
-                    });
-                });
-            if confirmed {
-                self.confirm_create = false;
-                match self.form.connection() {
-                    Ok(connection) => {
-                        self.notice = None;
-                        action = Action::CreateSession(connection);
-                    }
-                    Err(error) => self.notice = Some(error.to_string()),
-                }
-            }
-        }
         action
     }
 
@@ -898,13 +891,24 @@ impl DesktopUi {
     }
 
     fn show_terminal(&mut self, root: &mut egui::Ui, state: &mut desktop::State) -> Action {
-        self.refresh_tick = self.refresh_tick.wrapping_add(1);
         let generation_changed = self.generation != state.generation;
         self.rebuild_layout(state);
-        if generation_changed && let Some(pane) = self.focused {
+        if (generation_changed || self.restore_focus)
+            && let Some(pane) = self.focused
+        {
             root.ctx().memory_mut(|memory| {
                 memory.request_focus(terminal::focus_id(self.generation, pane))
             });
+        }
+        self.restore_focus = false;
+        if let Some(until) = self.notice_until
+            && until <= time::Instant::now()
+        {
+            self.notice = None;
+            self.notice_until = None;
+        } else if let Some(until) = self.notice_until {
+            root.ctx()
+                .request_repaint_after(until.saturating_duration_since(time::Instant::now()));
         }
         // Navigation and terminal steps are separate results, so a button press
         // can never quietly consume the keystrokes collected in the same frame.
@@ -912,59 +916,46 @@ impl DesktopUi {
         let mut steps: Vec<Step> = Vec::new();
         let connection_epoch = state.epoch();
 
-        egui::Panel::top("toolbar")
-            .frame(
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(8, 4))
-                    .fill(root.visuals().panel_fill),
-            )
-            .show_inside(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(if state.access == session::Access::Interactive {
-                            "INTERACTIVE"
-                        } else {
-                            "READ-ONLY"
-                        })
-                        .small()
-                        .color(ui.visuals().weak_text_color()),
-                    );
-                    ui.separator();
-                    ui.label(state.phase.label());
-                    // Cancelling a scheduled retry is the same operation as
-                    // disconnecting: it ends this connection and keeps the last view.
-                    if click_button(ui, "Exit")
-                        .on_hover_text(
-                            "Drop this attachment and return to the connection form. \
+        egui::Panel::bottom("status").show_inside(root, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if click_button(ui, "Exit")
+                    .on_hover_text(
+                        "Drop this attachment and return to the connection form. \
                          Remote jobs keep running.",
-                        )
-                        .clicked()
-                    {
-                        action = Action::Disconnect;
-                        self.return_to_form();
-                    }
-                    if state.access == session::Access::Interactive {
-                        let mut allow = state.allow_resize;
-                        if ui
-                            .checkbox(&mut allow, "Resize remote panes")
-                            .on_hover_text(
-                                "Divider drags send resize-pane to tmux, like an ordinary \
-                             terminal client. Other attached clients see the change.",
-                            )
-                            .changed()
-                        {
-                            state.allow_resize = allow;
+                    )
+                    .clicked()
+                {
+                    action = Action::Disconnect;
+                    self.return_to_form();
+                }
+                ui.with_layout(
+                    egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                    |ui| {
+                        let spin = spinner(ui.ctx());
+                        egui::Frame::NONE
+                            .fill(ui.visuals().code_bg_color)
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::symmetric(6, 2))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(spin).monospace());
+                            });
+                        if matches!(
+                            state.phase,
+                            desktop::Phase::Connecting
+                                | desktop::Phase::Reconnecting
+                                | desktop::Phase::Resynchronizing
+                        ) {
+                            ui.ctx().request_repaint();
                         }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if click_button(ui, "+")
-                            .on_hover_text("Larger terminal text")
-                            .clicked()
-                        {
-                            self.font_size = (self.font_size + 1.0).min(28.0);
-                            self.reset_client_size();
+                        if let Some(rtt) = state.last_rtt {
+                            ui.separator();
+                            ui.small(if rtt.as_millis() == 0 {
+                                "<1 ms".to_owned()
+                            } else {
+                                format!("{} ms", rtt.as_millis())
+                            });
                         }
-                        ui.label(format!("{} pt", self.font_size as u32));
+                        ui.separator();
                         if click_button(ui, "−")
                             .on_hover_text("Smaller terminal text")
                             .clicked()
@@ -972,8 +963,21 @@ impl DesktopUi {
                             self.font_size = (self.font_size - 1.0).max(10.0);
                             self.reset_client_size();
                         }
-                        if click_button(ui, "Copy selection").clicked() {
-                            self.copy_selection(ui.ctx(), state);
+                        ui.small(format!("{} pt", self.font_size as u32));
+                        if click_button(ui, "+")
+                            .on_hover_text("Larger terminal text")
+                            .clicked()
+                        {
+                            self.font_size = (self.font_size + 1.0).min(28.0);
+                            self.reset_client_size();
+                        }
+                        if click_button(ui, "Copy")
+                            .on_hover_text(
+                                "Copy the selection, or the whole pane if nothing is selected",
+                            )
+                            .clicked()
+                        {
+                            self.copy_pane(ui.ctx(), state);
                         }
                         if ui
                             .add_enabled(
@@ -985,44 +989,22 @@ impl DesktopUi {
                         {
                             steps.push(Step::RequestPaste(target));
                         }
-                    });
-                });
-            });
-
-        egui::Panel::bottom("status").show_inside(root, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let spin = ["|", "/", "-", "\\"][(self.refresh_tick as usize) % 4];
-                egui::Frame::NONE
-                    .fill(ui.visuals().code_bg_color)
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::symmetric(6, 2))
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new(spin).monospace());
-                    });
-                if let Some(rtt) = state.last_rtt {
-                    ui.separator();
-                    ui.small(if rtt.as_millis() == 0 {
-                        "<1 ms".to_owned()
-                    } else {
-                        format!("{} ms", rtt.as_millis())
-                    });
-                }
-                ui.separator();
-                ui.small(if state.phase == desktop::Phase::Demo {
+                        ui.separator();
+                        ui.small(if state.phase == desktop::Phase::Demo {
                     "Local demo — no SSH connection"
                 } else if state.input_ready() {
-                    "Click a pane to type · Wheel to scroll · Drag to select · Ctrl-Shift-C/V or Cmd-C/V"
+                    "Click a pane to type · Wheel to scroll · Drag to select · Right-click to copy"
                 } else {
                     "Wheel to scroll · Drag to select · Right-click to copy"
                 });
-                if let Some(retry) = state.retry {
-                    // The countdown is the only thing on screen that changes on
-                    // its own, so ask for exactly the frames it needs.
-                    ui.ctx().request_repaint_after(
-                        retry.remaining().min(time::Duration::from_millis(250)),
-                    );
-                    ui.separator();
-                    ui.colored_label(
+                        if let Some(retry) = state.retry {
+                            // The countdown is the only thing on screen that changes on
+                            // its own, so ask for exactly the frames it needs.
+                            ui.ctx().request_repaint_after(
+                                retry.remaining().min(time::Duration::from_millis(250)),
+                            );
+                            ui.separator();
+                            ui.colored_label(
                         ui.visuals().warn_fg_color,
                         format!(
                             "Reconnecting: attempt {} in {:.0}s. Nothing you type now is queued.",
@@ -1030,19 +1012,21 @@ impl DesktopUi {
                             retry.remaining().as_secs_f32().ceil()
                         ),
                     );
-                }
-                if let Some(ref continuity) = state.continuity {
-                    ui.separator();
-                    ui.colored_label(ui.visuals().warn_fg_color, continuity);
-                }
-                if let Some(ref notice) = self.notice {
-                    ui.separator();
-                    ui.small(notice);
-                }
-                if let Some(ref error) = state.error {
-                    ui.separator();
-                    ui.colored_label(ui.visuals().error_fg_color, error);
-                }
+                        }
+                        if let Some(ref continuity) = state.continuity {
+                            ui.separator();
+                            ui.colored_label(ui.visuals().warn_fg_color, continuity);
+                        }
+                        if let Some(ref notice) = self.notice {
+                            ui.separator();
+                            ui.small(notice);
+                        }
+                        if let Some(ref error) = state.error {
+                            ui.separator();
+                            ui.colored_label(ui.visuals().error_fg_color, error);
+                        }
+                    },
+                );
             });
         });
 
@@ -1063,16 +1047,10 @@ impl DesktopUi {
                     });
                     return;
                 }
-                if !matches!(state.phase, desktop::Phase::Watching | desktop::Phase::Demo) {
-                    ui.label(
-                        egui::RichText::new("Showing the last received view; it may be stale.")
-                            .color(ui.visuals().warn_fg_color),
-                    );
-                }
                 let rect = ui.available_rect_before_wrap();
                 let (cell_width, row_height) = terminal::cell_metrics(ui, self.font_size);
                 let controls = state.access == session::Access::Interactive && state.input_ready();
-                if state.allow_resize && state.input_ready() {
+                if state.input_ready() {
                     let inner = rect.shrink(4.0);
                     let columns = ((inner.width() / cell_width).floor() as usize).max(1);
                     let rows = ((inner.height() / row_height).floor() as usize).max(1);
@@ -1124,6 +1102,7 @@ impl DesktopUi {
                     let pane_ui = &mut self.pane_ui;
                     let focused = &mut self.focused;
                     let notice = &mut self.notice;
+                    let notice_until = &mut self.notice_until;
                     let mut resizes = Vec::new();
                     let mut pane_events = Vec::new();
                     let can_kill = view
@@ -1136,7 +1115,7 @@ impl DesktopUi {
                         ui,
                         rect,
                         egui::Id::new(("split", id.0, generation, connection_epoch)),
-                        state.allow_resize,
+                        controls,
                         cell_width,
                         row_height,
                         &mut resizes,
@@ -1150,6 +1129,7 @@ impl DesktopUi {
                                     font_size,
                                     focused,
                                     notice,
+                                    notice_until,
                                     controls,
                                     can_kill,
                                     !matches!(
@@ -1186,7 +1166,7 @@ impl DesktopUi {
                                 actions.into_iter().map(|action| Step::Send(target, action)),
                             );
                         }
-                        Ok(Some(input::Event::Copy)) => self.copy_selection(root.ctx(), state),
+                        Ok(Some(input::Event::Copy)) => self.copy_pane(root.ctx(), state),
                         Ok(Some(input::Event::Paste(paste))) => {
                             if paste.is_multiline() {
                                 self.pending_paste = Some((target, paste));
@@ -1258,19 +1238,33 @@ impl DesktopUi {
         }
     }
 
-    fn copy_selection(&mut self, ctx: &egui::Context, state: &desktop::State) {
-        let text = self.focused.and_then(|id| {
-            state
-                .view
-                .as_ref()?
-                .panes()
-                .get(&id)?
-                .terminal
-                .selected_text()
-        });
-        match text {
-            Some(text) => terminal::copy(ctx, text, &mut self.notice),
-            None => self.notice = Some("Select text in a pane first.".to_owned()),
+    fn copy_pane(&mut self, ctx: &egui::Context, state: &desktop::State) {
+        let Some(id) = self.focused else {
+            self.notice = Some("Click a pane first.".to_owned());
+            self.notice_until = None;
+            return;
+        };
+        let Some(pane) = state.view.as_ref().and_then(|view| view.panes().get(&id)) else {
+            self.notice = Some("Click a pane first.".to_owned());
+            self.notice_until = None;
+            return;
+        };
+        if let Some(text) = pane.terminal.selected_text() {
+            terminal::copy(
+                ctx,
+                text,
+                &mut self.notice,
+                &mut self.notice_until,
+                "selection copied",
+            );
+        } else {
+            terminal::copy(
+                ctx,
+                pane.terminal.screen_lines().join("\n"),
+                &mut self.notice,
+                &mut self.notice_until,
+                "full pane copied",
+            );
         }
     }
 
@@ -1296,6 +1290,10 @@ impl DesktopUi {
 /// Click-only: arrows, Tab, and Escape must stay with the focused pane.
 fn click_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
     ui.add(egui::Button::new(text).sense(egui::Sense::CLICK))
+}
+
+fn spinner(ctx: &egui::Context) -> &'static str {
+    ["|", "/", "-", "\\"][((ctx.time() * 8.0) as usize) % 4]
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
@@ -1534,6 +1532,26 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_new_session_name_is_not_replaced_by_the_listing() {
+        let mut ui = DesktopUi::default();
+        ui.form.destination = "zork".to_owned();
+        ui.form.host = "10.0.0.2".to_owned();
+        ui.listed_destination = "zork".to_owned();
+        ui.create_name = "fresh".to_owned();
+        let mut state = desktop::State::default();
+        state.discovery = Some(desktop::Discovery::Sessions(vec![
+            crate::sessions::Summary {
+                name: "0".into(),
+                windows: 1,
+                attached: 0,
+            },
+        ]));
+        paint(&mut ui, &mut state);
+        assert_eq!(ui.create_name, "fresh");
+        assert_eq!(ui.form.session, "0");
+    }
+
+    #[test]
     fn restored_tabs_do_not_list_on_first_paint() {
         let mut ui = DesktopUi::default();
         ui.restore(store::Tab {
@@ -1562,6 +1580,17 @@ mod tests {
         );
         paint(&mut ui, &mut state);
         assert_eq!(ui.screen, Screen::Connection);
+    }
+
+    #[test]
+    fn a_destroyed_session_disconnects_like_exit() {
+        let mut ui = DesktopUi::default();
+        let mut state = desktop::State::interactive_demo().unwrap();
+        paint(&mut ui, &mut state);
+        assert_eq!(ui.screen, Screen::Terminal);
+        state.phase = desktop::Phase::Failed;
+        state.failure = Some(reconnect::Failure::MissingSession);
+        assert!(matches!(paint(&mut ui, &mut state), Action::Disconnect));
     }
 
     #[test]

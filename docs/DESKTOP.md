@@ -27,13 +27,13 @@ connection form—not panes from another session and not a sidebar beside existi
 panes.
 
 After a successful connection, the terminal workspace replaces the form in that
-tab. A failed first attach stays on the form and shows why — the toolbar phrase
-"Connection failed" is not the whole message. **Exit** always returns to the form
-in the same tab, including after a failed attach, and names the tab New
+tab. A failed first attach stays on the form and shows why. **Exit**, and typing
+`exit` in the last shell, return to the form in the same tab and name it New
 connection. Form fields stay so you can reconnect; restored tabs that have not
-been attached this session keep their destination labels. Ctrl-Shift-W/Cmd-W
-closes the tab and detaches that Starcom client; the tmux server and remote jobs
-continue running.
+been attached this session keep their destination labels. Tabs are green while
+connected, yellow while connecting or reconnecting, and red after a failure.
+Ctrl-Shift-W/Cmd-W closes the tab and detaches that Starcom client; the tmux
+server and remote jobs continue running.
 
 A Starcom tab is one tmux session and shows one window of that session. A
 window picker is not in this increment.
@@ -82,7 +82,8 @@ on Windows, or `$XDG_CONFIG_HOME` where it is set) and reopened next time.
 What is saved is where a tab points and how it should connect: destination alias,
 host, user, port, tmux socket, history depth, whether it is interactive, whether
 it reconnects, an extra identity path if you typed one, and the global redraw
-cap (`fps`). The live tmux session list is queried from the host, not written.
+cap (`fps`, default 5; see `etc/workspace.conf.example`). The live tmux session
+list is queried from the host, not written.
 Older files that named a `session` still parse. Nothing that would let a reader
 of that file connect is written: no keys, no passphrases, no host-key material,
 and no terminal contents. An identity entry is the path you already chose, never
@@ -112,12 +113,11 @@ list is exactly the missing information. No other failure triggers it —
 authentication and host-key failures could not list anyway, and the others
 already say what happened.
 
-**Create session** makes the named session on the host, after a confirmation that
-says plainly that this starts a tmux server if none is running. It is the only
-path in Starcom that may start one, it is reachable only from that button, and it
-leaves the new session detached — you still press **Connect** to attach. No
-failure anywhere else falls back to it: an attach that cannot find its session
-still fails, exactly as before.
+The **new session** field beside the list, then **Create**, makes that session on
+the host. This starts a tmux server if none is running. It is the only path in
+Starcom that may start one, and it leaves the new session detached — you still
+press **Connect** to attach. No failure anywhere else falls back to it: an attach
+that cannot find its session still fails, exactly as before.
 
 Both run on the tab's worker over their own short-lived connection, so neither
 blocks the window or disturbs a live attachment.
@@ -147,8 +147,8 @@ Local clipboard shortcuts are:
 
 - Ctrl-Shift-C / Ctrl-Shift-V on Linux and Windows;
 - Cmd-C / Cmd-V on macOS;
-- the **Copy selection** and **Paste** buttons;
-- the pane context menu for copying.
+- the **Copy** and **Paste** buttons on the status bar;
+- right-click in a pane, which copies the selection or the whole pane.
 
 Single-line clipboard data can be submitted immediately. Multiline paste opens a
 confirmation dialog with a bounded preview. Paste rejects escape/C1 and other
@@ -189,10 +189,11 @@ liveness mark FileMan uses. Next to it, when a recent small tmux command has
 finished, its round-trip time is shown. That is not a probe: nothing extra is
 sent to measure it.
 
-Remote pane output is redrawn at most 5 times per second by default (the **fps**
-control on the tab bar, saved in `workspace.conf`). Buttons, hover, typing, and
-other local UI stay immediate. After keys or wheel are sent, remote frames run
-at up to 20 fps for a short time so the echo does not wait on the idle cap.
+Remote pane output is redrawn at most 5 times per second by default (`fps` in
+`workspace.conf`; `etc/workspace.conf.example` is the documented file). Buttons,
+hover, typing, and other local UI stay immediate. After keys or wheel are sent,
+remote frames run at up to 20 fps for a short time so the echo does not wait on
+the idle cap.
 
 ## Pane controls
 
@@ -215,8 +216,7 @@ ordinary client would use, so other attached clients see them.
 Dragging a divider previews the split locally. On release, an interactive
 connection sends `resize-pane` to tmux — the same shared layout change a normal
 tmux client would make — then reconstructs from the server's geometry. Cells
-stay at the real font size; they are not scaled. Uncheck **Resize remote panes**
-if this attachment must not change the layout others are using.
+stay at the real font size; they are not scaled.
 
 Nested or unusual layouts that cannot be mapped to a safe tmux boundary stay
 local-only.
@@ -227,8 +227,9 @@ block the resize transaction.
 
 ## Disconnect and exit behavior
 
-**Exit** preserves the last received view for reading and copying, marks it
-stale, and disables input. It is available in every connection phase, including
+**Exit** returns to the connection form and names the tab New connection. The
+form fields stay so you can reconnect. Typing `exit` in the last pane of the
+session does the same. It is available in every connection phase, including
 **Connection failed**.
 
 **Reconnect automatically after connection loss** is on by default in the
@@ -239,7 +240,7 @@ failures, a missing or destroyed session, a tmux server that exited, and an
 explicit detach all stop and wait for you, because retrying any of them would
 either loop on a security decision or quietly attach somewhere else. While a
 retry is waiting, the last view stays on screen in gray so it reads as frozen,
-not live.
+not live, and the tab is yellow with a spinner.
 
 Each retry waits a little longer, up to 30 seconds, with jitter so several tabs
 that drop together do not reconnect in lockstep. The status bar shows the attempt
