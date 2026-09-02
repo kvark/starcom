@@ -182,6 +182,26 @@ impl Terminal {
     pub fn wants_wheel(&self) -> bool {
         self.reports_mouse() || self.is_alternate_screen()
     }
+
+    /// Lines between the live tip and the local history viewport. 0 follows
+    /// new output; a positive value is how far the user has scrolled up.
+    pub fn history_offset(&self) -> usize {
+        self.model.grid().display_offset()
+    }
+
+    /// Pin the local history viewport. New output keeps this offset so a
+    /// scrolled-up view does not walk with the live tip.
+    pub fn scroll_history(&mut self, offset: usize) {
+        use grid::Dimensions;
+        let current = self.model.grid().display_offset();
+        let target = offset.min(self.model.grid().history_size());
+        let delta = target as i32 - current as i32;
+        if delta != 0 {
+            self.model
+                .grid_mut()
+                .scroll_display(grid::Scroll::Delta(delta));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -214,6 +234,37 @@ mod tests {
         terminal.resize(core::Size::new(8, 3).unwrap());
         assert_eq!(terminal.size(), core::Size::new(8, 3).unwrap());
         assert_eq!(terminal.screen_lines().len(), 3);
+    }
+
+    fn line_text(terminal: &Terminal, line: i32) -> String {
+        let columns = terminal.size().columns();
+        terminal
+            .model
+            .bounds_to_string(
+                index::Point::new(index::Line(line), index::Column(0)),
+                index::Point::new(index::Line(line), index::Column(columns.saturating_sub(1))),
+            )
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn scrolled_history_stays_put_when_a_line_is_appended() {
+        use grid::Dimensions;
+        let mut terminal = Terminal::new(core::Size::new(20, 4).unwrap(), 8);
+        for i in 0..12 {
+            terminal.feed(format!("line{i:02}\r\n").as_bytes());
+        }
+        assert_eq!(terminal.model().grid().history_size(), 8);
+        terminal.scroll_history(3);
+        let offset = terminal.history_offset();
+        assert_eq!(offset, 3);
+        let shown = line_text(&terminal, -(offset as i32));
+        assert!(!shown.is_empty(), "{shown:?}");
+        terminal.feed(b"ping\r\n");
+        let offset_after = terminal.history_offset();
+        assert_eq!(offset_after, offset + 1);
+        assert_eq!(line_text(&terminal, -(offset_after as i32)), shown);
     }
 
     #[test]

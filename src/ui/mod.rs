@@ -928,6 +928,12 @@ impl DesktopUi {
                     action = Action::Disconnect;
                     self.return_to_form();
                 }
+                if let Some(pane) = self.focused.and_then(|id| {
+                    state.view.as_ref().and_then(|view| view.panes().get(&id))
+                }) {
+                    let size = pane.terminal.size();
+                    ui.small(format!("{}×{}", size.columns(), size.rows()));
+                }
                 ui.with_layout(
                     egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
                     |ui| {
@@ -990,13 +996,15 @@ impl DesktopUi {
                             steps.push(Step::RequestPaste(target));
                         }
                         ui.separator();
-                        ui.small(if state.phase == desktop::Phase::Demo {
-                    "Local demo — no SSH connection"
-                } else if state.input_ready() {
-                    "Click a pane to type · Wheel to scroll · Drag to select · Right-click to copy"
-                } else {
-                    "Wheel to scroll · Drag to select · Right-click to copy"
-                });
+                        ui.small(if let Some(ref notice) = self.notice {
+                            notice.as_str()
+                        } else if state.phase == desktop::Phase::Demo {
+                            "Local demo — no SSH connection"
+                        } else if state.input_ready() {
+                            "Click a pane to type · Wheel to scroll · Drag to select · Right-click to copy"
+                        } else {
+                            "Wheel to scroll · Drag to select · Right-click to copy"
+                        });
                         if let Some(retry) = state.retry {
                             // The countdown is the only thing on screen that changes on
                             // its own, so ask for exactly the frames it needs.
@@ -1016,10 +1024,6 @@ impl DesktopUi {
                         if let Some(ref continuity) = state.continuity {
                             ui.separator();
                             ui.colored_label(ui.visuals().warn_fg_color, continuity);
-                        }
-                        if let Some(ref notice) = self.notice {
-                            ui.separator();
-                            ui.small(notice);
                         }
                         if let Some(ref error) = state.error {
                             ui.separator();

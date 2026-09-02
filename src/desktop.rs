@@ -1031,12 +1031,16 @@ fn watch(
                     return Ok(Outcome::Cancelled);
                 }
                 let view = state.view.as_mut().expect("view published");
+                let seq = view.display_seq();
                 for notification in notifications {
                     view.apply(notification);
                 }
+                let changed = view.display_seq() != seq;
                 drop(state);
                 last_alive = reconnect::AliveClock::now();
-                wake();
+                if changed {
+                    wake();
+                }
             }
         }
     }
