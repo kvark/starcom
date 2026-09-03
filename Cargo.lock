@@ -3240,7 +3240,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sunset"
 version = "0.6.0"
-source = "git+https://github.com/kvark/sunset?rev=e059a65#e059a657274c3cd34faf75f650aec2c830dbe7cd"
+source = "git+https://github.com/navigato-rs/sunset?rev=e059a65#e059a657274c3cd34faf75f650aec2c830dbe7cd"
 dependencies = [
  "aes",
  "ascii",
@@ -3271,7 +3271,7 @@ dependencies = [
 [[package]]
 name = "sunset-sshwire-derive"
 version = "0.3.0"
-source = "git+https://github.com/kvark/sunset?rev=e059a65#e059a657274c3cd34faf75f650aec2c830dbe7cd"
+source = "git+https://github.com/navigato-rs/sunset?rev=e059a65#e059a657274c3cd34faf75f650aec2c830dbe7cd"
 dependencies = [
  "virtue",
 ]
