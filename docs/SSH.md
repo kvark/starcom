@@ -55,19 +55,18 @@ An optional system-SSH transport remains a future escape hatch for advanced
 enterprise/cluster configurations.
 
 `ProxyJump` needs a `direct-tcpip` channel, which published Sunset 0.6 rejects
-outright. Starcom builds against `kvark/sunset` pinned at the revision carrying
-`etc/sunset/*.patch`, which adds the client-side open; see that README for what
-was measured. `ProxyJump` is still reported as unsupported rather than
-half-supported: running a second SSH session inside such a channel needs the
-transport to accept something other than a `TcpStream`, which is not written.
+outright. Starcom builds against `kvark/sunset` on `main`, which adds the
+client-side open. The fork is the SSH stack, not a pin waiting on upstream.
+`ProxyJump` is still reported as unsupported rather than half-supported: running
+a second SSH session inside such a channel needs the transport to accept
+something other than a `TcpStream`, which is not written.
 
 Sunset 0.6 emits no keyboard-interactive event and has no certificate path, which
 is what blocks MFA and host/user certificates rather than any decision here.
 
-Reusing one connection across tabs is a separate question. Sunset caps a
-connection at four channels (the patch raises it to sixteen), but a shared
-transport would couple every tab on a host to one failure. Each tab keeps its own
-connection.
+Reusing one connection across tabs is a separate question. The fork caps a
+connection at sixteen channels, but a shared transport would couple every tab on
+a host to one failure. Each tab keeps its own connection.
 
 ## Trust
 

@@ -85,8 +85,8 @@ mode is the external frontend interface and works with the host's installed tmux
 | SSH | Embedded Sunset + RustCrypto; no libssh2/OpenSSL/ring/AWS-LC backend. |
 | Dependency risk | Owning the SSH stack means owning its advisories: `deny.toml` gates every change and runs weekly. |
 | Automatic retry | Transport loss only. Authentication, trust, missing-session, server-exit, and detach always stop. |
-| Advanced SSH escape hatch | Optional system-SSH transport remains a future option, alongside the `etc/sunset` patch. |
-| Third-party patches | Carried as a pinned fork plus the patch file it holds, with measured results. Never vendored, never unpinned. |
+| Advanced SSH escape hatch | Optional system-SSH transport remains a future option, alongside the Sunset fork. |
+| Third-party patches | Forks pinned by revision on `main` (Blade, Sunset). Never vendored, never unpinned. |
 | Saved state | Destinations and preferences only. Restoring a tab never authenticates. An unreadable file is a system dialog: clear it, or exit and leave it. |
 | Session creation | Only from an explicit action. No failure path may create a session or a server. |
 | Repository | One Rust 2024 package; normal root sources on `main`. |
@@ -253,22 +253,18 @@ verified to fail when automatic retry is disabled.
   missing: the user has already authenticated and the list is the answer. No
   other failure asks, and listing still never attaches or creates.
 - [ ] Reuse one SSH connection per host where the SSH backend supports it safely.
-  Sunset caps a connection at `config::MAX_CHANNELS = 4`, a compile-time
-  constant, so at most four of the sixteen tabs could ever share one. The pinned
-  fork raises that to 16 behind a `many-channels` feature, which removes the cap
-  but not the objection: sharing still couples every tab on a host to one
-  transport, and that is why it was deferred. Starcom leaves the feature off
-  until the coupling question is answered; the channel count was never the
-  blocker.
+  The fork caps a connection at `config::MAX_CHANNELS = 16`, so the sixteen tabs
+  could share one from a channel-count perspective. Sharing still couples every
+  tab on a host to one transport, and that is why it was deferred. The channel
+  count was never the blocker.
 - [ ] Add ProxyJump/bastion support or a system-SSH adapter for advanced configs.
-  The backend blocker is removed. `etc/sunset/` holds a 62-line change to Sunset
-  adding a client `direct-tcpip` open and a way to tell a refused open from a
-  slow one, plus agent-held `sk-ssh-ed25519` on the same pin, and Starcom now
-  builds against `kvark/sunset` pinned at that revision, the way the GUI stack
-  pins `kvark/blade`. It is validated against
-  real OpenSSH in the normal fixture run: a forward carries data both ways, and
-  both an unreachable destination and a server with `AllowTcpForwarding no` are
-  reported as refusals rather than as timeouts.
+  The backend blocker is removed. `kvark/sunset` adds a client `direct-tcpip`
+  open, a way to tell a refused open from a slow one, `MAX_CHANNELS` 16, and
+  agent-held `sk-ssh-ed25519`. Starcom builds against that fork pinned at a
+  `main` revision, the way the GUI stack pins `kvark/blade`. It is validated
+  against real OpenSSH in the normal fixture run: a forward carries data both
+  ways, and both an unreachable destination and a server with
+  `AllowTcpForwarding no` are reported as refusals rather than as timeouts.
   What remains is the larger half: running a second SSH session inside that
   channel needs `ssh::Connection` to accept a transport other than a
   `TcpStream`. Until that exists, `ProxyJump` stays reported as unsupported.
@@ -307,15 +303,13 @@ pinned fork, leaving the transport work rather than an open question.
 
 ## Immediate work order
 
-1. Send `etc/sunset/*.patch` upstream, so the pinned fork can be dropped for a
-   published release.
-2. Give `ssh::Connection` a transport other than a `TcpStream`, which is what
+1. Give `ssh::Connection` a transport other than a `TcpStream`, which is what
    `ProxyJump` needs on top of the forwarding channel that now exists.
-3. Begin M5 with the measurement harness, not with optimizations. There is still
+2. Begin M5 with the measurement harness, not with optimizations. There is still
    no recorded startup time, idle CPU, per-pane memory, or input latency.
-4. Add native macOS/Windows close, clipboard, and input acceptance.
-5. Exercise reconnection on a real network path, not only a killed local client.
-6. Extend SSH configuration only where semantics can be tested end to end.
+3. Add native macOS/Windows close, clipboard, and input acceptance.
+4. Exercise reconnection on a real network path, not only a killed local client.
+5. Extend SSH configuration only where semantics can be tested end to end.
 
 ## Validation policy
 

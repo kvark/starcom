@@ -23,8 +23,8 @@ Start with one Rust 2024 package, a small binary, and a reusable library. Split
 modules rather than introducing multiple crates prematurely. Proposed modules
 are listed in PLAN.md; create them when implemented, not as empty placeholders.
 Use `tests/data/` for small synthetic fixtures, `scripts/` for development tools,
-and `etc/` for desktop metadata (entry, SVG, PNG, ICO), replay screenshots, and
-patches to dependencies. Icon rasters come from `scripts/generate-icons.py`.
+and `etc/` for desktop metadata (entry, SVG, PNG, ICO) and replay screenshots.
+Icon rasters come from `scripts/generate-icons.py`.
 
 Use FileMan's Blade/egui/winit versions together when introducing the GUI.
 Do not copy image/archive/SFTP dependencies that Starcom does not use. Do not add
@@ -107,13 +107,13 @@ replaces the first rather than appearing twice, so a partial re-run is safe.
 
 Sometimes a dependency is missing something Starcom needs. Carry that as a patch
 file under `etc/<crate>/`, with a README stating what it changes and what was
-measured. `etc/sunset/` is the worked example: the patch file is the change as it
-should reach upstream, and `Cargo.toml` pins a fork carrying exactly it.
+measured.
 
 Do not vendor a dependency's source into this repository. Pointing the default
 build at a fork is a decision to record in PLAN.md, with the `deny.toml`
-`allow-git` entry and a note saying what removes it — a published release. A
-patch nobody has decided how to carry is a patch, not a dependency.
+`allow-git` entry. Blade and Sunset are pinned by revision on `main`; Blade's
+pin ends with a published crate, Sunset is the SSH stack. A patch nobody has
+decided how to carry is a patch, not a dependency.
 
 ## Dependency advisories
 
