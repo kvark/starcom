@@ -258,7 +258,7 @@ verified to fail when automatic retry is disabled.
   tab on a host to one transport, and that is why it was deferred. The channel
   count was never the blocker.
 - [ ] Add ProxyJump/bastion support or a system-SSH adapter for advanced configs.
-  The backend blocker is removed. `kvark/sunset` adds a client `direct-tcpip`
+  The backend blocker is removed. `navigato-rs/sunset` adds a client `direct-tcpip`
   open, a way to tell a refused open from a slow one, `MAX_CHANNELS` 16, and
   agent-held `sk-ssh-ed25519`. Starcom builds against that fork pinned at a
   `main` revision, the way the GUI stack pins `kvark/blade`. It is validated
@@ -352,6 +352,6 @@ terminal scrollback, and Starcom cannot reconstruct output tmux has discarded.
 - [tmux control implementation](https://github.com/tmux/tmux/blob/master/control.c)
 - [`tmuxctl`](https://docs.rs/tmuxctl/latest/tmuxctl/)
 - [`alacritty_terminal`](https://docs.rs/alacritty_terminal/latest/alacritty_terminal/)
-- [Sunset](https://docs.rs/sunset/0.6.0/sunset/)
+- [Sunset](https://github.com/navigato-rs/sunset)
 - [OpenSSH configuration](https://man.openbsd.org/ssh_config)
 - [FileMan](https://github.com/kvark/fileman)

@@ -5,7 +5,7 @@ description = "Session Terminal And Remote COMmander"
 keywords = ["terminal", "tmux", "ssh"]
 categories = ["command-line-utilities"]
 license = "MIT"
-repository = "https://github.com/kvark/starcom"
+repository = "https://github.com/navigato-rs/starcom"
 authors = ["Dzmitry Malyshau"]
 edition = "2024"
 rust-version = "1.96"
@@ -52,7 +52,7 @@ required-features = ["ssh"]
 anyhow = "1.0"
 alacritty_terminal = "0.26"
 tmuxctl = { version = "=0.1.0", default-features = false }
-sunset = { version = "0.6.0", git = "https://github.com/kvark/sunset", rev = "e059a65", default-features = false, features = ["std", "rsa", "ecdsa256", "larger"], optional = true }
+sunset = { version = "0.6.0", git = "https://github.com/navigato-rs/sunset", rev = "e059a65", default-features = false, features = ["std", "rsa", "ecdsa256", "larger"], optional = true }
 ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "ed25519", "rsa", "p256"], optional = true }
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", optional = true }

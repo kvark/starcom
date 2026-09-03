@@ -10,7 +10,7 @@ Built with Rust, Blade, egui, and Alacritty's terminal core.
 
 ## Install
 
-Prebuilt binaries are attached to each [GitHub Release](https://github.com/kvark/starcom/releases)
+Prebuilt binaries are attached to each [GitHub Release](https://github.com/navigato-rs/starcom/releases)
 on `v*` tags. Linux and Windows builds are unsigned; macOS builds are ad-hoc
 codesigned, not notarized.
 
@@ -23,7 +23,7 @@ codesigned, not notarized.
 From source:
 
 ```sh
-cargo install --locked --git https://github.com/kvark/starcom
+cargo install --locked --git https://github.com/navigato-rs/starcom
 ```
 
 That builds the desktop client. Run `starcom` or `starcom --demo`. A recent stable
