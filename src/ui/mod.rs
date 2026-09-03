@@ -366,7 +366,6 @@ impl DesktopUi {
         self.pending_paste = None;
     }
 
-    #[cfg(test)]
     pub(crate) fn showing_form(&self) -> bool {
         self.screen == Screen::Connection
     }
@@ -466,12 +465,17 @@ impl DesktopUi {
         {
             self.screen = Screen::Connection;
         }
-        // Typing `exit` in the last shell destroys the tmux session. Treat that
-        // the same as the Exit button: back to the form, tab renamed there.
+        // The control session ended on purpose: last pane `exit`, an explicit
+        // detach, or tmux itself going away. Same as the Exit button. Transport
+        // loss still reconnects; that is the only automatic retry.
         if self.screen == Screen::Terminal
             && matches!(
                 state.failure,
-                Some(reconnect::Failure::Detached | reconnect::Failure::MissingSession)
+                Some(
+                    reconnect::Failure::Detached
+                        | reconnect::Failure::MissingSession
+                        | reconnect::Failure::ServerExit
+                )
             )
             && matches!(
                 state.phase,
@@ -916,7 +920,13 @@ impl DesktopUi {
         let mut steps: Vec<Step> = Vec::new();
         let connection_epoch = state.epoch();
 
-        egui::Panel::bottom("status").show_inside(root, |ui| {
+        // egui remembers last frame's panel rect with no max. A single wrap
+        // to a tall status bar then never shrinks, which is the "status ate
+        // the window" failure after a long session.
+        egui::Panel::bottom("status")
+            .resizable(false)
+            .exact_size(36.0_f32)
+            .show_inside(root, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if click_button(ui, "Exit")
                     .on_hover_text(
@@ -935,7 +945,7 @@ impl DesktopUi {
                     ui.small(format!("{}×{}", size.columns(), size.rows()));
                 }
                 ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                    egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         let spin = spinner(ui.ctx());
                         egui::Frame::NONE
@@ -1012,22 +1022,40 @@ impl DesktopUi {
                                 retry.remaining().min(time::Duration::from_millis(250)),
                             );
                             ui.separator();
-                            ui.colored_label(
-                        ui.visuals().warn_fg_color,
-                        format!(
-                            "Reconnecting: attempt {} in {:.0}s. Nothing you type now is queued.",
-                            retry.attempt,
-                            retry.remaining().as_secs_f32().ceil()
-                        ),
-                    );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "Reconnecting: attempt {} in {:.0}s. Nothing you type now is queued.",
+                                        retry.attempt,
+                                        retry.remaining().as_secs_f32().ceil()
+                                    ))
+                                    .color(ui.visuals().warn_fg_color)
+                                    .small(),
+                                )
+                                .truncate(),
+                            );
                         }
                         if let Some(ref continuity) = state.continuity {
                             ui.separator();
-                            ui.colored_label(ui.visuals().warn_fg_color, continuity);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(continuity.as_str())
+                                        .color(ui.visuals().warn_fg_color)
+                                        .small(),
+                                )
+                                .truncate(),
+                            );
                         }
                         if let Some(ref error) = state.error {
                             ui.separator();
-                            ui.colored_label(ui.visuals().error_fg_color, error);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(error.as_str())
+                                        .color(ui.visuals().error_fg_color)
+                                        .small(),
+                                )
+                                .truncate(),
+                            );
                         }
                     },
                 );
@@ -1633,6 +1661,15 @@ mod tests {
         state.phase = desktop::Phase::Failed;
         state.failure = Some(reconnect::Failure::MissingSession);
         assert!(matches!(paint(&mut ui, &mut state), Action::Disconnect));
+        let mut ui = DesktopUi::default();
+        let mut state = desktop::State::interactive_demo().unwrap();
+        paint(&mut ui, &mut state);
+        state.phase = desktop::Phase::Failed;
+        state.failure = Some(reconnect::Failure::ServerExit);
+        assert!(
+            matches!(paint(&mut ui, &mut state), Action::Disconnect),
+            "a tmux server/session end is not a reconnect"
+        );
     }
 
     #[test]
