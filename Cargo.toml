@@ -52,7 +52,7 @@ required-features = ["ssh"]
 anyhow = "1.0"
 alacritty_terminal = "0.26"
 tmuxctl = { version = "=0.1.0", default-features = false }
-sunset = { version = "=0.6.0", default-features = false, features = ["std", "rsa", "ecdsa256", "larger"], optional = true }
+sunset = { version = "0.6.0", git = "https://github.com/kvark/sunset", rev = "e059a65", default-features = false, features = ["std", "rsa", "ecdsa256", "larger"], optional = true }
 ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "ed25519", "rsa", "p256"], optional = true }
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", optional = true }
@@ -96,12 +96,6 @@ assets = [
     { source = "etc/starcom.desktop", dest = "/usr/share/applications/starcom.desktop", mode = "644" },
     { source = "etc/starcom.svg", dest = "/usr/share/icons/hicolor/scalable/apps/starcom.svg", mode = "644" },
 ]
-
-# The client direct-tcpip open that ProxyJump needs is not in a published
-# Sunset. etc/sunset/ holds the patch as sent upstream; until it lands, build
-# against the fork carrying exactly that patch, pinned by revision.
-[patch.crates-io]
-sunset = { git = "https://github.com/kvark/sunset", rev = "0cc2d4a" }
 
 [profile.release]
 lto = "thin"
