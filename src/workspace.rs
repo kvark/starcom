@@ -400,7 +400,13 @@ impl Workspace {
                         widgets.open.bg_stroke.width = stroke_width;
                     }
                     paint_tab_fills(ui, idle_fill, idle_hover);
+                    let hide_form_chip = self.tabs.len() == 1
+                        && self.tabs[0].ui.showing_form()
+                        && self.tabs[0].label == NEW_CONNECTION;
                     for (index, tab) in self.tabs.iter().enumerate() {
+                        if hide_form_chip {
+                            continue;
+                        }
                         ui.push_id(tab.id, |ui| {
                             let phase = tab.client.phase();
                             let mut title = tab.label.clone();
@@ -548,80 +554,101 @@ impl Workspace {
                 Action::Tab(id, action) => {
                     let mut save = false;
                     let mut follow_input = false;
-                    let Some(tab) = self.tabs.get_mut(self.active).filter(|tab| tab.id == id)
-                    else {
-                        return Ok(());
-                    };
-                    let result = match *action {
-                        ui::Action::None => Ok(()),
-                        ui::Action::Connect(connection) => {
-                            let started = tab.client.connect(connection).map(|()| {
-                                tab.label = label(&tab.ui.saved());
-                                tab.ui.reset_client_size();
-                            });
-                            // Remember where a successful connection pointed, so
-                            // the next start reopens the same form.
-                            save = started.is_ok();
-                            started
-                        }
-                        ui::Action::ListSessions(connection) => {
-                            tab.client.list_sessions(connection)
-                        }
-                        ui::Action::CreateSession(connection) => {
-                            // A creation size only sets the new session's initial
-                            // geometry; tmux owns it from then on.
-                            tab.client
-                                .create_session(connection, crate::core::Size::default())
-                        }
-                        ui::Action::Disconnect => {
-                            tab.client.disconnect();
-                            tab.ui.return_to_form();
-                            tab.label = NEW_CONNECTION.to_owned();
-                            Ok(())
-                        }
-                        // Resolve clipboard reads in place so the whole frame
-                        // still reaches the worker as one ordered, atomic batch.
-                        ui::Action::Frame(steps) => {
-                            let mut actions = Vec::with_capacity(steps.len());
-                            for step in steps {
-                                match step {
-                                    ui::Step::Send(target, action) => {
-                                        actions.push((target, action))
-                                    }
-                                    ui::Step::RequestPaste(target) => {
-                                        if let Some(text) = clipboard()
-                                            && let Some(action) = tab.ui.clipboard_paste(
-                                                &tab.client.lock(),
-                                                target,
-                                                &text,
-                                            )
-                                        {
-                                            actions.push((target, action));
+                    let mut close_after_exit = None;
+                    let several_tabs = self.tabs.len() > 1;
+                    {
+                        let Some(tab) = self.tabs.get_mut(self.active).filter(|tab| tab.id == id)
+                        else {
+                            return Ok(());
+                        };
+                        let result = match *action {
+                            ui::Action::None => Ok(()),
+                            ui::Action::Connect(connection) => {
+                                let started = tab.client.connect(connection).map(|()| {
+                                    tab.label = label(&tab.ui.saved());
+                                    tab.ui.reset_client_size();
+                                });
+                                // Remember where a successful connection pointed, so
+                                // the next start reopens the same form.
+                                save = started.is_ok();
+                                started
+                            }
+                            ui::Action::ListSessions(connection) => {
+                                tab.client.list_sessions(connection)
+                            }
+                            ui::Action::CreateSession(connection) => {
+                                // A creation size only sets the new session's initial
+                                // geometry; tmux owns it from then on.
+                                tab.client
+                                    .create_session(connection, crate::core::Size::default())
+                            }
+                            ui::Action::Disconnect => {
+                                tab.client.disconnect();
+                                tab.ui.return_to_form();
+                                tab.label = NEW_CONNECTION.to_owned();
+                                // A leftover "New connection" chip next to + is
+                                // just another empty form. Close it when another
+                                // tab remains; the last tab keeps the form.
+                                if several_tabs {
+                                    close_after_exit = Some(id);
+                                }
+                                Ok(())
+                            }
+                            // Resolve clipboard reads in place so the whole frame
+                            // still reaches the worker as one ordered, atomic batch.
+                            ui::Action::Frame(steps) => {
+                                let mut actions = Vec::with_capacity(steps.len());
+                                for step in steps {
+                                    match step {
+                                        ui::Step::Send(target, action) => {
+                                            actions.push((target, action))
+                                        }
+                                        ui::Step::RequestPaste(target) => {
+                                            if let Some(text) = clipboard()
+                                                && let Some(action) = tab.ui.clipboard_paste(
+                                                    &tab.client.lock(),
+                                                    target,
+                                                    &text,
+                                                )
+                                            {
+                                                actions.push((target, action));
+                                            }
                                         }
                                     }
                                 }
+                                if actions.is_empty() {
+                                    Ok(())
+                                } else {
+                                    let sent = tab.client.submit_batch(actions);
+                                    follow_input = sent.is_ok();
+                                    sent
+                                }
                             }
-                            if actions.is_empty() {
-                                Ok(())
-                            } else {
-                                let sent = tab.client.submit_batch(actions);
-                                follow_input = sent.is_ok();
-                                sent
+                            ui::Action::ReloadConfig => {
+                                self.reload_config();
+                                return Ok(());
                             }
+                        };
+                        if let Err(error) = result {
+                            tab.client.lock().error = Some(error.to_string());
                         }
-                        ui::Action::ReloadConfig => {
-                            self.reload_config();
-                            return Ok(());
-                        }
-                    };
-                    if let Err(error) = result {
-                        tab.client.lock().error = Some(error.to_string());
                     }
                     if follow_input {
                         self.echo_until =
                             Some(time::Instant::now() + time::Duration::from_millis(400));
                     }
                     if save {
+                        self.persist();
+                    }
+                    if let Some(id) = close_after_exit
+                        && let Some(index) = self.tabs.iter().position(|tab| tab.id == id)
+                    {
+                        self.cancel_transient();
+                        self.tabs.remove(index);
+                        if index < self.active {
+                            self.active -= 1;
+                        }
+                        self.active = self.active.min(self.tabs.len().saturating_sub(1));
                         self.persist();
                     }
                 }
@@ -658,6 +685,20 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exit_closes_the_tab_when_another_connection_remains() {
+        let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
+        workspace.apply(Action::New, || None);
+        assert_eq!(workspace.tabs.len(), 2);
+        let first = workspace.tabs[0].id;
+        workspace.apply(Action::Select(first), || None);
+        workspace.apply(Action::Tab(first, Box::new(ui::Action::Disconnect)), || {
+            None
+        });
+        assert_eq!(workspace.tabs.len(), 1);
+        assert_ne!(workspace.tabs[0].id, first);
+    }
+
     #[test]
     fn exit_names_the_tab_a_new_connection() {
         let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
@@ -965,6 +1006,13 @@ mod tests {
                 workspace.show(root);
             });
         }
+        let status_h = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("status"))
+            .map(|state| state.rect.height())
+            .unwrap_or(0.0);
+        assert!(
+            (1.0..48.0).contains(&status_h),
+            "status bar must not eat the window, height was {status_h}"
+        );
         let (start, end) = workspace.tabs[0].ui.smoke_selection(&ctx);
         assert!(start.x > 0.0 && start.x < end.x);
         if let Some(path) = std::env::var_os("STARCOM_SMOKE_GEOMETRY") {
