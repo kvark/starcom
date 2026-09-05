@@ -2,8 +2,9 @@
 //!
 //! This file records where to connect and how, never anything that would let a
 //! reader connect: no keys, no passphrases, no agent handles, no host-key
-//! material, and no terminal contents. Restoring a tab reopens its form with
-//! the fields filled in; it never authenticates on its own.
+//! material, or terminal contents. A last-used session name is a form hint
+//! only. Restoring a tab reopens its form with the fields filled in; it never
+//! authenticates on its own.
 //!
 //! The format is a few bounded lines rather than a serialization dependency,
 //! for the same reason the SSH-config reader is: reading it must not be able to
@@ -23,6 +24,14 @@ pub const MAX_TABS: usize = 16;
 /// means "use the default" rather than "never paint".
 pub const DEFAULT_FPS: u32 = 5;
 pub const MAX_FPS: u32 = 60;
+/// Seconds a healthy tab may sit without a view change before its chip turns
+/// blue. 0 disables the hint.
+pub const DEFAULT_IDLE: u32 = 30;
+pub const MAX_IDLE: u32 = 3600;
+pub const DEFAULT_HISTORY: usize = 1000;
+/// Cumulative seconds the app has been open. Caps so a corrupt file cannot
+/// invent an absurd lifetime.
+pub const MAX_OPEN_SECS: u64 = 100 * 365 * 24 * 60 * 60;
 
 pub fn clamp_fps(fps: u32) -> u32 {
     if fps == 0 {
@@ -39,8 +48,8 @@ pub struct Tab {
     pub destination: String,
     pub host: String,
     pub user: String,
-    /// Accepted on load from older files; not written. The live session list
-    /// is queried from the host, not persisted.
+    /// Last session this tab attached to. Restoring a workspace fills the form
+    /// with it; it never authenticates on its own.
     pub session: String,
     pub port: u16,
     pub identity: String,
@@ -56,6 +65,8 @@ pub struct Workspace {
     pub tabs: Vec<Tab>,
     pub active: usize,
     pub fps: u32,
+    pub idle: u32,
+    pub open_secs: u64,
 }
 
 impl Default for Workspace {
@@ -64,6 +75,8 @@ impl Default for Workspace {
             tabs: Vec::new(),
             active: 0,
             fps: DEFAULT_FPS,
+            idle: DEFAULT_IDLE,
+            open_secs: 0,
         }
     }
 }
@@ -155,6 +168,24 @@ fn parse(text: &str) -> anyhow::Result<Workspace> {
                 );
                 workspace.fps = clamp_fps(fps);
             }
+            None if key == "idle" => {
+                let idle: u32 = value.parse().with_context(where_)?;
+                anyhow::ensure!(
+                    idle <= MAX_IDLE,
+                    "{}: idle must be at most {MAX_IDLE} seconds",
+                    where_()
+                );
+                workspace.idle = idle;
+            }
+            None if key == "open" => {
+                let open: u64 = value.parse().with_context(where_)?;
+                anyhow::ensure!(
+                    open <= MAX_OPEN_SECS,
+                    "{}: open time exceeds {MAX_OPEN_SECS} seconds",
+                    where_()
+                );
+                workspace.open_secs = open;
+            }
             None if key == "version" => anyhow::ensure!(
                 value == "1",
                 "{}: unsupported saved-workspace version {value}",
@@ -226,7 +257,7 @@ fn tab(fields: &collections::BTreeMap<&str, &str>) -> anyhow::Result<Tab> {
             .map(|history| history.parse())
             .transpose()
             .context("invalid history")?
-            .unwrap_or(200),
+            .unwrap_or(DEFAULT_HISTORY),
         interactive: flag("access", "interactive")?,
         reconnect: flag("reconnect", "yes")?,
     })
@@ -236,11 +267,16 @@ pub fn render(workspace: &Workspace) -> String {
     let mut out = String::from(
         "# Starcom saved connection tabs.\n\
          # Destinations and preferences only: no keys, passphrases, host-key\n\
-         # material, terminal contents, or tmux session names.\n\
+         # material, or terminal contents.\n\
          version 1\n",
     );
     out.push_str(&format!("active {}\n", workspace.active));
     out.push_str(&format!("fps {}\n", clamp_fps(workspace.fps)));
+    out.push_str(&format!("idle {}\n", workspace.idle.min(MAX_IDLE)));
+    out.push_str(&format!(
+        "open {}\n",
+        workspace.open_secs.min(MAX_OPEN_SECS)
+    ));
     for tab in workspace.tabs.iter().take(MAX_TABS) {
         out.push_str("\n[tab]\n");
         let mut put = |key: &str, value: &str| {
@@ -257,6 +293,7 @@ pub fn render(workspace: &Workspace) -> String {
         put("destination", &tab.destination);
         put("host", &tab.host);
         put("user", &tab.user);
+        put("session", &tab.session);
         put("port", &tab.port.to_string());
         put("identity", &tab.identity);
         put("known-hosts", &tab.known_hosts);
@@ -325,6 +362,8 @@ mod tests {
             ],
             active: 1,
             fps: DEFAULT_FPS,
+            idle: DEFAULT_IDLE,
+            open_secs: 0,
         }
     }
 
@@ -335,6 +374,24 @@ mod tests {
         assert_eq!(parse(&render(&workspace)).unwrap().fps, 12);
         assert_eq!(parse("fps 0\n").unwrap().fps, DEFAULT_FPS);
         assert!(parse("fps 99\n").is_err());
+    }
+
+    #[test]
+    fn idle_is_a_file_level_setting() {
+        let mut workspace = sample();
+        workspace.idle = 12;
+        assert_eq!(parse(&render(&workspace)).unwrap().idle, 12);
+        assert_eq!(parse("idle 0\n").unwrap().idle, 0);
+        assert!(parse(&format!("idle {}\n", MAX_IDLE + 1)).is_err());
+    }
+
+    #[test]
+    fn open_time_is_a_file_level_setting() {
+        let mut workspace = sample();
+        workspace.open_secs = 90;
+        assert_eq!(parse(&render(&workspace)).unwrap().open_secs, 90);
+        assert_eq!(parse("open 0\n").unwrap().open_secs, 0);
+        assert!(parse(&format!("open {}\n", MAX_OPEN_SECS + 1)).is_err());
     }
 
     #[test]
@@ -351,24 +408,21 @@ mod tests {
         assert!(parsed.tabs[0].interactive);
         assert!(parsed.tabs[0].reconnect);
         assert!(parsed.tabs[0].session.is_empty());
+        assert_eq!(parsed.idle, DEFAULT_IDLE);
     }
 
     #[test]
     fn tabs_survive_a_round_trip() {
         let workspace = sample();
         let text = render(&workspace);
-        assert!(
-            !text.lines().any(|line| line.starts_with("session ")),
-            "tmux session names are not persisted"
-        );
         assert_eq!(parse(&text).unwrap(), workspace);
     }
 
     #[test]
-    fn an_older_file_may_still_name_a_session() {
+    fn last_used_session_is_written() {
         let parsed = parse("version 1\n[tab]\ndestination dev\nsession work\n").unwrap();
         assert_eq!(parsed.tabs[0].session, "work");
-        assert!(!render(&parsed).contains("session work"));
+        assert!(render(&parsed).contains("session work"));
     }
 
     #[test]

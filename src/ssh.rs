@@ -213,7 +213,7 @@ pub struct Connection {
     authenticated: bool,
     fingerprint: String,
     handle: Option<sunset::ChanHandle>,
-    command: Option<String>,
+    session: Option<ClientSession>,
     started: bool,
     incoming: Vec<u8>,
     incoming_offset: usize,
@@ -260,7 +260,7 @@ impl Connection {
             authenticated: false,
             fingerprint: String::new(),
             handle: None,
-            command: None,
+            session: None,
             started: false,
             incoming: Vec::new(),
             incoming_offset: 0,
@@ -289,21 +289,47 @@ impl Connection {
 
     /// Execute a caller-quoted command without a PTY, environment requests,
     /// forwarded agent, shell wrapper, or repeated SSH invocation.
-    pub fn exec(mut self, command: &str) -> Result<Channel, Error> {
+    pub fn exec(self, command: &str) -> Result<Channel, Error> {
         if command.is_empty() || command.len() > 8192 || command.contains('\0') {
             return Err(Error::new(
                 Kind::Configuration,
                 "invalid remote exec command",
             ));
         }
+        self.open_session(ClientSession::Exec(command.to_owned()))
+    }
+
+    /// Start a named SSH subsystem on a session channel. Used for SFTP.
+    pub fn subsystem(self, name: &str) -> Result<Channel, Error> {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(Error::new(
+                Kind::Configuration,
+                "invalid SSH subsystem name",
+            ));
+        }
+        self.open_session(ClientSession::Subsystem(name.to_owned()))
+    }
+
+    fn open_session(mut self, session: ClientSession) -> Result<Channel, Error> {
+        let kind = match session {
+            ClientSession::Exec(_) => "exec",
+            ClientSession::Subsystem(_) => "subsystem",
+        };
         let deadline = time::Instant::now() + self.options.timeout;
-        self.command = Some(command.to_owned());
+        self.session = Some(session);
         self.handle = Some(self.runner.open_client_session().map_err(protocol)?);
         while !self.started {
             remaining(deadline)?;
             let progressed = self.drive(deadline)?;
             if self.closed {
-                return Err(transport("connection ended opening exec channel"));
+                return Err(transport(format!(
+                    "connection ended opening {kind} channel"
+                )));
             }
             if !progressed {
                 self.wait_ready(deadline)?;
@@ -474,14 +500,21 @@ impl Connection {
                             {
                                 return Err(transport("unexpected SSH channel"));
                             }
-                            let command = self
-                                .command
-                                .take()
-                                .ok_or_else(|| transport("unexpected exec notification"))?;
-                            opened.exec(command).map_err(protocol)?;
-                            // Sunset sends exec without requesting a reply.
-                            // Command readiness is established by tmux responses,
-                            // not by this flag (and denied execs end the channel).
+                            match self.session.take() {
+                                Some(ClientSession::Exec(command)) => {
+                                    opened.exec(command).map_err(protocol)?;
+                                }
+                                Some(ClientSession::Subsystem(name)) => {
+                                    opened.subsystem(name).map_err(protocol)?;
+                                }
+                                None => {
+                                    return Err(transport("unexpected session notification"));
+                                }
+                            }
+                            // Sunset sends exec/subsystem without requesting a
+                            // reply. Readiness is established by the peer's
+                            // data, not by this flag (and a refused request
+                            // ends the channel).
                             self.started = true;
                         }
                         sunset::CliEvent::SessionExit(_) | sunset::CliEvent::Banner(_) => {}
@@ -635,6 +668,11 @@ impl Drop for Connection {
         let _ = self.poller.delete(&self.socket);
         let _ = self.socket.shutdown(net::Shutdown::Both);
     }
+}
+
+enum ClientSession {
+    Exec(String),
+    Subsystem(String),
 }
 
 pub struct Channel {

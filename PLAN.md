@@ -1,6 +1,6 @@
 # Starcom plan and roadmap
 
-Updated: 2026-08-31.
+Updated: 2026-09-04.
 
 **Current status:** M0 through M3 are done for the tested configuration, and M4
 is half done. M2's gate is signed off; M3 is complete: transport loss is classified apart
@@ -25,7 +25,7 @@ normal repository root.
 
 Starcom is a small, fast, cross-platform GUI for persistent remote terminal
 sessions. It replaces tmux's terminal UI—not tmux itself—with normal tabs, mouse
-selection, scrolling, copying, paste confirmation, and draggable pane dividers.
+selection, scrolling, copying, and draggable pane dividers.
 
 The client targets Linux, macOS, and Windows. The remote side initially targets
 Linux with stock OpenSSH and stock tmux. A user must be able to close Starcom or
@@ -87,7 +87,7 @@ mode is the external frontend interface and works with the host's installed tmux
 | Automatic retry | Transport loss only. Authentication, trust, missing-session, server-exit, and detach always stop. |
 | Advanced SSH escape hatch | Optional system-SSH transport remains a future option, alongside the Sunset fork. |
 | Third-party patches | Forks pinned by revision on `main` (Blade, Sunset). Never vendored, never unpinned. |
-| Saved state | Destinations and preferences only. Restoring a tab never authenticates. An unreadable file is a system dialog: clear it, or exit and leave it. |
+| Saved state | Destinations, preferences, and last-used session name. Restoring a tab never authenticates. An unreadable file is a system dialog: clear it, or exit and leave it. |
 | Session creation | Only from an explicit action. No failure path may create a session or a server. |
 | Repository | One Rust 2024 package; normal root sources on `main`. |
 
@@ -106,8 +106,8 @@ The following are correctness rules, not optional polish:
 - A write with uncertain delivery is never retried automatically.
 - Only transport loss is retried automatically, and remote text may narrow a
   failure to non-retriable but never promote one to retriable.
-- Multiline paste requires explicit confirmation. Paste content is data, never
-  concatenated into tmux command syntax.
+- Paste is sent immediately. Paste content is data, never concatenated into tmux
+  command syntax.
 - Targeted input is blocked when `synchronize-panes` could broadcast it. Starcom
   does not change that user's tmux option.
 - Remote resizing is opt-in because it changes the shared tmux layout. The server's
@@ -156,7 +156,8 @@ terminal checkpoint.
 
 ### Desktop
 
-- Independent connection tabs; `+` opens a new connection form.
+- Independent connection tabs; `+` shows the connection form, and a tab is
+  registered on Connect.
 - Host-first connection: known `Host` aliases, automatic session listing, first
   session selected, Connect without a separate list step.
 - One Starcom tab is one tmux session and shows one window of that session.
@@ -165,7 +166,8 @@ terminal checkpoint.
   tmux cell counts match the painted pane; divider drags send `resize-pane`.
 - Local scrollback, selection, word/line selection, copying, and font sizing.
 - Interactive UTF-8/IME commits, conventional special keys, terminal Ctrl keys,
-  clipboard paste, and multiline-paste confirmation.
+  and clipboard paste. Unmodified clicks are forwarded when the pane asked for
+  mouse reports; drags stay local selection. File drops upload over SFTP.
 - Divider dragging that resizes tmux on release.
 - Event-driven redraw and a worker thread that does no network I/O under the UI
   model lock.
@@ -205,13 +207,13 @@ terminal checkpoint.
 - [x] SSH-config alias suggestions and fail-closed profile resolution.
 - [x] Local scrollback, selection, copy, and pane layouts.
 - [x] Wheel to the application when it reports mouse or is on the alternate screen;
-  pane split/zoom/kill chrome.
+  pane split/zoom/kill/move chrome.
 - [x] Guarded keyboard input and paste; no stale/offline replay.
 - [x] Remote divider resizing followed by server-authoritative resync.
 - [x] Native Linux/X11 render, clipboard, resize, and clean-close smoke test.
 - [x] Real localhost SSH/tmux test for input, paste-once, resize, and broadcast guard.
 - [ ] Native macOS and Windows GUI interaction/close tests.
-- [ ] Wayland, IME, high-DPI, application mouse, and real Codex acceptance.
+- [ ] Wayland, IME, high-DPI, application mouse drags, and real Codex acceptance.
 
 Gate: normal shell and Codex work should be comfortable without tmux keybindings,
 and closing/reopening the client must not affect jobs or misdirect input. Signed

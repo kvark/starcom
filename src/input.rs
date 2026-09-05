@@ -71,8 +71,7 @@ impl Key {
 
 /// Paste is text, not a second path for injecting escape sequences. Reject
 /// controls (including ESC and C1) instead of silently stripping or executing
-/// them. A GUI must confirm multiline paste before submitting this value.
-/// Deliberate control keys use Action::Bytes or Action::Key instead.
+/// them. Deliberate control keys use Action::Bytes or Action::Key instead.
 #[derive(Clone)]
 pub struct Paste(String);
 
@@ -124,6 +123,8 @@ pub enum Action {
     KillPane,
     ZoomPane,
     SelectPane,
+    /// Swap this pane with the neighbor `PaneId` in the same window.
+    SwapPane(tmuxctl::PaneId),
 }
 
 impl Action {
@@ -150,6 +151,7 @@ impl Action {
                 | Self::Split(_)
                 | Self::KillPane
                 | Self::ZoomPane
+                | Self::SwapPane(_)
         )
     }
 
@@ -167,7 +169,8 @@ impl Action {
             | Self::Split(_)
             | Self::KillPane
             | Self::ZoomPane
-            | Self::SelectPane => 32,
+            | Self::SelectPane
+            | Self::SwapPane(_) => 32,
         }
     }
 }
@@ -234,6 +237,23 @@ pub fn mouse_wheel_bytes(up: bool, column: usize, row: usize, sgr: bool) -> Vec<
     }
 }
 
+/// Left-button press or release at a 0-based pane cell. Drags stay local.
+///
+/// SGR names the button in both directions and uses `M`/`m` for press/release.
+/// X10 uses button 0 for press and button 3 for release.
+pub fn mouse_click_bytes(press: bool, column: usize, row: usize, sgr: bool) -> Vec<u8> {
+    let x = column.saturating_add(1);
+    let y = row.saturating_add(1);
+    if sgr {
+        let suffix = if press { 'M' } else { 'm' };
+        format!("\x1b[<0;{x};{y}{suffix}").into_bytes()
+    } else {
+        let encode = |n: usize| n.clamp(1, 223) as u8 + 32;
+        let button = if press { 0 } else { 3 };
+        vec![0x1b, b'[', b'M', button as u8 + 32, encode(x), encode(y)]
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match *self {
@@ -289,6 +309,20 @@ mod tests {
         assert_eq!(
             mouse_wheel_bytes(true, 0, 0, false),
             vec![0x1b, b'[', b'M', 96, 33, 33]
+        );
+    }
+
+    #[test]
+    fn mouse_clicks_report_sgr_press_release_and_x10() {
+        assert_eq!(mouse_click_bytes(true, 0, 0, true), b"\x1b[<0;1;1M");
+        assert_eq!(mouse_click_bytes(false, 3, 7, true), b"\x1b[<0;4;8m");
+        assert_eq!(
+            mouse_click_bytes(true, 0, 0, false),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        assert_eq!(
+            mouse_click_bytes(false, 0, 0, false),
+            vec![0x1b, b'[', b'M', 35, 33, 33]
         );
     }
 

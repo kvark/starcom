@@ -5,8 +5,8 @@ existing tmux session, reconstructs each pane into an Alacritty terminal model,
 and presents tmux windows and panes through Blade/egui.
 
 The implementation is usable enough for focused testing, but it is not yet a
-finished terminal: full application mouse (beyond wheel), broad TUI
-compatibility, and native macOS/Windows interaction acceptance remain open.
+finished terminal: application mouse drags, broad TUI compatibility, and native
+macOS/Windows interaction acceptance remain open.
 
 ## Start
 
@@ -21,17 +21,21 @@ attach to a tmux server.
 ## Connection tabs
 
 A Starcom tab owns one connection form, one SSH/tmux client, one terminal view,
-and its pending input tokens. Use **+** or Ctrl-Shift-T (Cmd-T on macOS) to create
-a connection tab. Drag a tab to reorder the strip. A new tab displays its
-connection form—not panes from another session and not a sidebar beside existing
-panes.
+and its pending input tokens. Use **+** or Ctrl-Shift-T (Cmd-T on macOS) to open
+the connection form on the plus chip itself. A registered tab is added only when
+you press **Connect**. Drag a tab to reorder the strip. **About** on the right of
+the strip opens a modal with the icon, version, GitHub URL, total time Starcom
+has been open, and the workspace `fps` / `idle` settings. The form is never a
+sidebar beside another session's panes.
 
 After a successful connection, the terminal workspace replaces the form in that
 tab. A failed first attach stays on the form and shows why. **Exit**, and typing
-`exit` in the last shell, return to the form in the same tab and name it New
-connection. Form fields stay so you can reconnect; restored tabs that have not
-been attached this session keep their destination labels. Tabs are green while
-connected, yellow while connecting or reconnecting, and red after a failure.
+`exit` in the last shell, return to the form in the same tab. An empty form is
+dropped instead of leaving a stuck New connection chip; a named destination
+keeps its label so you can reconnect. Restored tabs that have not been attached
+this session keep their destination labels. Tabs are green while connected,
+including while a pane layout is rebuilt. They turn yellow while connecting or
+reconnecting, and red after a failure.
 Ctrl-Shift-W/Cmd-W closes the tab and detaches that Starcom client; the tmux
 server and remote jobs continue running.
 
@@ -80,14 +84,16 @@ Open tabs are saved to `~/.config/starcom/workspace.conf` (`%APPDATA%\starcom\`
 on Windows, or `$XDG_CONFIG_HOME` where it is set) and reopened next time.
 
 What is saved is where a tab points and how it should connect: destination alias,
-host, user, port, tmux socket, history depth, whether it is interactive, whether
-it reconnects, an extra identity path if you typed one, and the global redraw
-cap (`fps`, default 5; see `etc/workspace.conf.example`). The live tmux session
-list is queried from the host, not written.
-Older files that named a `session` still parse. Nothing that would let a reader
-of that file connect is written: no keys, no passphrases, no host-key material,
-and no terminal contents. An identity entry is the path you already chose, never
-the key behind it.
+host, user, port, tmux socket, last-used session name, history depth, whether it
+is interactive, whether it reconnects, an extra identity path if you typed one,
+the global redraw cap (`fps`, default 5), and how long a quiet connected tab
+waits before its chip turns blue (`idle`, default 30 seconds, 0 off; see
+`etc/workspace.conf.example`). Both `fps` and `idle` are also on the **About**
+panel. The last-used session is a form hint: restoring a workspace still does
+not authenticate.
+Nothing that would let a reader of that file connect is written: no keys, no
+passphrases, no host-key material, and no terminal contents. An identity entry
+is the path you already chose, never the key behind it.
 
 Restored tabs open on their connection form with the fields filled in. Identity
 files, `IdentitiesOnly`, and unsupported-policy blockers are re-read from
@@ -104,8 +110,9 @@ The demo neither reads nor writes this file.
 
 Selecting a known host lists its sessions automatically. **Refresh** asks again.
 The query runs `tmux -N`, so it can never bring a tmux server into existence: a
-host with no tmux running says so. The first session is selected; choosing
-another only fills the field, and double-clicking attaches.
+host with no tmux running says so. The last session this tab attached to is selected when it is still on the host;
+otherwise the first name in the list. Choosing another only fills the field, and
+double-clicking attaches.
 
 Starcom also asks on its own when a connection fails because that session does
 not exist. You have already asked to connect and already authenticated, and the
@@ -114,10 +121,10 @@ authentication and host-key failures could not list anyway, and the others
 already say what happened.
 
 The **new session** field beside the list, then **Create**, makes that session on
-the host. This starts a tmux server if none is running. It is the only path in
-Starcom that may start one, and it leaves the new session detached — you still
-press **Connect** to attach. No failure anywhere else falls back to it: an attach
-that cannot find its session still fails, exactly as before.
+the host and attaches as soon as tmux confirms it. The typed name appears in the
+list immediately. This starts a tmux server if none is running. It is the only
+path in Starcom that may start one. No failure anywhere else falls back to it:
+an attach that cannot find its session still fails, exactly as before.
 
 Both run on the tab's worker over their own short-lived connection, so neither
 blocks the window or disturbs a live attachment.
@@ -147,11 +154,12 @@ Local clipboard shortcuts are:
 
 - Ctrl-Shift-C / Ctrl-Shift-V on Linux and Windows;
 - Cmd-C / Cmd-V on macOS;
-- the **Copy** and **Paste** buttons on the status bar;
-- right-click in a pane, which copies the selection or the whole pane.
+- the **Copy** button on the status bar, which copies the whole pane;
+- finishing a drag, double-click, or triple-click selection, which copies
+  immediately, clears the highlight, and shows **Copied!** on the status bar
+  for a second.
 
-Single-line clipboard data can be submitted immediately. Multiline paste opens a
-confirmation dialog with a bounded preview. Paste rejects escape/C1 and other
+Paste is sent as soon as it is requested. It still rejects escape/C1 and other
 control characters except tabs and line endings; deliberate control input must
 come from key handling, not clipboard text.
 
@@ -174,11 +182,20 @@ the wheel examines local terminal history. One tick is 40 points, one egui
 line; leftover smoothing after a notch is accumulated so it cannot add extra
 ticks.
 
-Drag to select, double-click for a word, and triple-click for a line. Selection
-anchors live in the terminal model, so they follow incoming scrolls. Copying
-handles wide cells, combining characters, and soft wraps, with a 1 MiB output
-limit. Full application mouse (clicks and drags forwarded to the program) is
-not implemented yet; local selection still wins those.
+Unmodified left clicks are forwarded the same way when the pane asked for mouse
+reports: a press and a release at the cell. Shift/Ctrl/Alt/Cmd clicks, drags,
+double-clicks, and triple-clicks stay local. Drag to select, double-click for a
+word, and triple-click for a line. Selection anchors live in the terminal
+model, so they follow incoming scrolls. Copying handles wide cells, combining
+characters, and soft wraps, with a 1 MiB output limit.
+
+Drop files onto a connected window to upload them over SFTP into the remote
+temp directory (`/tmp`), under unique `starcom-…` names. The remote paths are
+then pasted into the focused pane. A progress bar sits in the status bar while
+a large file is in flight. Directories and files larger than 32 MiB are
+skipped. The upload uses its own SSH connection, so it cannot stall the tmux
+control channel. On Wayland, Starcom binds `wl_data_device` itself because
+winit 0.30 does not; winit master already has this for 0.31.
 
 The renderer paints only visible history rows. Font-size controls change the
 cell metrics used both to paint and to tell tmux this client's size, so the
@@ -199,10 +216,12 @@ the idle cap.
 
 Each interactive pane has window-style buttons in its top-right corner:
 
-- **│** split right (`split-window -h`)
-- **─** split below (`split-window -v`)
-- **□** maximize / restore (`resize-pane -Z`)
-- **×** close the pane (`kill-pane`), hidden when it is the last pane in the
+- split right (`split-window -h`)
+- split below (`split-window -v`)
+- move left / right / up / down (`swap-pane` with the neighbor that shares
+  that edge). Hidden when there is no neighbor on that side.
+- maximize / restore (`resize-pane -Z`)
+- close the pane (`kill-pane`), hidden when it is the last pane in the
   window
 
 Maximize is tmux zoom. Zoomed tmux still lists every pane, overlapping; Starcom
@@ -227,10 +246,10 @@ block the resize transaction.
 
 ## Disconnect and exit behavior
 
-**Exit** returns to the connection form and names the tab New connection. The
-form fields stay so you can reconnect. Typing `exit` in the last pane of the
-session does the same. It is available in every connection phase, including
-**Connection failed**.
+**Exit** returns to the connection form. The form fields stay so you can
+reconnect. An empty form is closed instead of remaining as a New connection
+chip. Typing `exit` in the last pane of the session does the same. It is
+available in every connection phase, including **Connection failed**.
 
 **Reconnect automatically after connection loss** is on by default in the
 connection form. Only transport loss is retried. That includes a TCP drop, a

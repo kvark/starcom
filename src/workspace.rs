@@ -16,6 +16,8 @@ struct Tab {
     label: String,
     client: desktop::Client,
     ui: ui::DesktopUi,
+    last_seq: u64,
+    last_output: time::Instant,
 }
 
 pub(crate) enum Action {
@@ -34,6 +36,9 @@ pub(crate) enum Action {
 pub(crate) struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
+    /// The "+" form. Not a registered tab until Connect succeeds.
+    composer: Tab,
+    composer_open: bool,
     next: u64,
     wake: Wake,
     config: sync::Arc<ssh_config::Config>,
@@ -43,6 +48,12 @@ pub(crate) struct Workspace {
     /// happens with no home directory and in the demo.
     store: Option<path::PathBuf>,
     fps: u32,
+    idle: u32,
+    about: bool,
+    about_icon: Option<egui::TextureHandle>,
+    /// Seconds this install has been open across launches. Updated on persist.
+    open_secs: u64,
+    session_started: time::Instant,
     /// Remote frames run this fast after keys or wheel, so echo is not stuck
     /// on the idle fps cap. None when idle.
     echo_until: Option<time::Instant>,
@@ -84,6 +95,49 @@ fn drop_insert_at(
     })
 }
 
+fn format_open(secs: u64) -> String {
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    match (days, hours, minutes, secs) {
+        (0, 0, 0, s) => format!("{s}s"),
+        (0, 0, m, _) => format!("{m}m"),
+        (0, h, m, _) => format!("{h}h {m}m"),
+        (d, h, _, _) => format!("{d}d {h}h"),
+    }
+}
+
+fn about_icon() -> Option<egui::ColorImage> {
+    const PNG: &[u8] = include_bytes!("../etc/macos/icon_128.png");
+    let mut reader = png::Decoder::new(io::Cursor::new(PNG)).read_info().ok()?;
+    let mut pixels = vec![0_u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    pixels.truncate(info.buffer_size());
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [info.width as usize, info.height as usize],
+        &pixels,
+    ))
+}
+
+fn spawn_tab(
+    id: u64,
+    wake: Wake,
+    config: sync::Arc<ssh_config::Config>,
+    config_load_error: Option<String>,
+) -> anyhow::Result<Tab> {
+    Ok(Tab {
+        id,
+        label: NEW_CONNECTION.into(),
+        client: desktop::Client::new(wake)?,
+        ui: ui::DesktopUi::with_config(config, config_load_error),
+        last_seq: 0,
+        last_output: time::Instant::now(),
+    })
+}
+
 fn spin(time: f64) -> &'static str {
     ["|", "/", "-", "\\"][((time * 8.0) as usize) % 4]
 }
@@ -91,7 +145,7 @@ fn spin(time: f64) -> &'static str {
 fn busy_phase(phase: desktop::Phase) -> bool {
     matches!(
         phase,
-        desktop::Phase::Connecting | desktop::Phase::Reconnecting | desktop::Phase::Resynchronizing
+        desktop::Phase::Connecting | desktop::Phase::Reconnecting
     )
 }
 
@@ -103,13 +157,20 @@ fn lift(color: egui::Color32, by: u8) -> egui::Color32 {
     )
 }
 
-fn tab_color(phase: desktop::Phase, idle: egui::Color32) -> egui::Color32 {
+fn tab_color(phase: desktop::Phase, idle: egui::Color32, quiet: bool) -> egui::Color32 {
     match phase {
-        desktop::Phase::Watching | desktop::Phase::Demo => egui::Color32::from_rgb(38, 98, 58),
-        desktop::Phase::Connecting
-        | desktop::Phase::Reconnecting
-        | desktop::Phase::Resynchronizing => egui::Color32::from_rgb(140, 108, 28),
-        desktop::Phase::Failed => egui::Color32::from_rgb(128, 42, 42),
+        desktop::Phase::Watching | desktop::Phase::Demo | desktop::Phase::Resynchronizing
+            if quiet =>
+        {
+            egui::Color32::from_rgb(36, 88, 148)
+        }
+        desktop::Phase::Watching | desktop::Phase::Demo | desktop::Phase::Resynchronizing => {
+            egui::Color32::from_rgb(38, 98, 58)
+        }
+        desktop::Phase::Connecting | desktop::Phase::Reconnecting => {
+            egui::Color32::from_rgb(140, 108, 28)
+        }
+        desktop::Phase::Failed => egui::Color32::from_rgb(140, 108, 28),
         _ => idle,
     }
 }
@@ -156,10 +217,18 @@ impl Workspace {
         startup: desktop::Startup,
         on_broken: impl Fn(&path::Path, &anyhow::Error) -> dialog::BrokenStore,
     ) -> anyhow::Result<Option<Self>> {
+        let wake_composer = sync::Arc::clone(&wake);
         let mut workspace = Self {
             tabs: Vec::new(),
             active: 0,
-            next: 1,
+            composer: spawn_tab(
+                1,
+                wake_composer,
+                sync::Arc::new(ssh_config::Config::default()),
+                None,
+            )?,
+            composer_open: true,
+            next: 2,
             wake,
             config: sync::Arc::new(ssh_config::Config::default()),
             config_error: None,
@@ -170,6 +239,11 @@ impl Workspace {
                 .flatten()
                 .map(|home| store::path(&home)),
             fps: store::DEFAULT_FPS,
+            idle: store::DEFAULT_IDLE,
+            about: false,
+            about_icon: None,
+            open_secs: 0,
+            session_started: time::Instant::now(),
             echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
         };
@@ -179,13 +253,14 @@ impl Workspace {
                 return Ok(None);
             }
         }
-        if workspace.tabs.is_empty() {
-            workspace.new_tab()?;
-        }
         if startup == desktop::Startup::Demo {
+            workspace.push_idle_tab()?;
+            workspace.composer_open = false;
             workspace.tabs[0].client.demo()?;
             workspace.tabs[0].label = "Demo".into();
             workspace.tabs[0].ui.open_terminal();
+        } else {
+            workspace.composer_open = workspace.tabs.is_empty();
         }
         Ok(Some(workspace))
     }
@@ -223,7 +298,7 @@ impl Workspace {
             },
         };
         for tab in saved.tabs {
-            if self.new_tab().is_err() {
+            if self.push_idle_tab().is_err() {
                 break;
             }
             let index = self.tabs.len() - 1;
@@ -231,7 +306,10 @@ impl Workspace {
             self.tabs[index].ui.restore(tab);
         }
         self.active = saved.active.min(self.tabs.len().saturating_sub(1));
+        self.composer_open = self.tabs.is_empty();
         self.fps = store::clamp_fps(saved.fps);
+        self.idle = saved.idle.min(store::MAX_IDLE);
+        self.open_secs = saved.open_secs.min(store::MAX_OPEN_SECS);
         Ok(true)
     }
 
@@ -254,11 +332,109 @@ impl Workspace {
         }
     }
 
+    fn show_about(&mut self, ctx: &egui::Context) {
+        ctx.request_repaint_after(time::Duration::from_secs(1));
+        let mut fps = self.fps;
+        let mut idle = self.idle;
+        let mut close = false;
+        let open_for = format_open(self.open_secs_now());
+        if self.about_icon.is_none()
+            && let Some(icon) = about_icon()
+        {
+            self.about_icon =
+                Some(ctx.load_texture("starcom-about-icon", icon, egui::TextureOptions::LINEAR));
+        }
+        let icon = self.about_icon.clone();
+        let id = egui::Id::new("starcom-about");
+        // First-frame Area size is 0 unless we name one; that clips the
+        // contents and flashes egui's debug overflow (red) edges.
+        let response = egui::Modal::new(id)
+            .area(egui::Modal::default_area(id).default_size([380.0, 300.0]))
+            .show(ctx, |ui| {
+                ui.set_min_size(egui::vec2(360.0, 260.0));
+                ui.set_width(360.0);
+                ui.horizontal(|ui| {
+                    if let Some(ref icon) = icon {
+                        ui.add(egui::Image::new((icon.id(), egui::vec2(72.0, 72.0))));
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Starcom {}", env!("CARGO_PKG_VERSION")))
+                                .heading(),
+                        );
+                        ui.hyperlink_to(
+                            "github.com/navigato-rs/starcom",
+                            "https://github.com/navigato-rs/starcom",
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label("by");
+                            ui.label(egui::RichText::new("Dzmitry Malyshau").italics());
+                            ui.label("aka");
+                            ui.hyperlink_to("@kvark", "https://github.com/kvark");
+                        });
+                    });
+                });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label("Idle paint rate");
+                    ui.add(
+                        egui::DragValue::new(&mut fps)
+                            .range(1..=store::MAX_FPS)
+                            .suffix(" fps"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Turn a quiet tab blue after");
+                    ui.add(
+                        egui::DragValue::new(&mut idle)
+                            .range(0..=store::MAX_IDLE)
+                            .suffix(" seconds"),
+                    );
+                });
+                ui.weak("0 seconds keeps a connected tab green.");
+                ui.add_space(10.0);
+                ui.label(format!("Open for {open_for} in total"));
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close || response.should_close() {
+            self.about = false;
+        }
+        if store::clamp_fps(fps) != self.fps || idle.min(store::MAX_IDLE) != self.idle {
+            self.fps = store::clamp_fps(fps);
+            self.idle = idle.min(store::MAX_IDLE);
+            self.persist();
+        }
+    }
+
+    fn fold_open_time(&mut self) {
+        let elapsed = self.session_started.elapsed().as_secs();
+        self.open_secs = self
+            .open_secs
+            .saturating_add(elapsed)
+            .min(store::MAX_OPEN_SECS);
+        self.session_started = time::Instant::now();
+    }
+
+    fn open_secs_now(&self) -> u64 {
+        self.open_secs
+            .saturating_add(self.session_started.elapsed().as_secs())
+            .min(store::MAX_OPEN_SECS)
+    }
+
     /// Persist after a change to which tabs exist or where they point. Failure
     /// is reported once and then disables saving, rather than repeating on
     /// every action.
     fn persist(&mut self) {
-        let Some(ref file) = self.store else { return };
+        let Some(file) = self.store.clone() else {
+            return;
+        };
+        self.fold_open_time();
         let saved = store::Workspace {
             tabs: self
                 .tabs
@@ -268,8 +444,10 @@ impl Workspace {
                 .collect(),
             active: self.active,
             fps: store::clamp_fps(self.fps),
+            idle: self.idle.min(store::MAX_IDLE),
+            open_secs: self.open_secs.min(store::MAX_OPEN_SECS),
         };
-        if let Err(error) = store::save(file, &saved) {
+        if let Err(error) = store::save(&file, &saved) {
             self.notice = Some(format!("Could not save tabs: {error:#}"));
             self.store = None;
         }
@@ -296,25 +474,50 @@ impl Workspace {
         }
     }
 
-    fn new_tab(&mut self) -> anyhow::Result<()> {
+    fn open_composer(&mut self) {
+        self.cancel_transient();
+        self.composer_open = true;
+    }
+
+    fn push_idle_tab(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.tabs.len() < MAX_TABS,
             "at most {MAX_TABS} connection tabs may be open"
         );
-        self.cancel_transient();
-        let id = self.next;
-        self.next = self.next.checked_add(1).expect("tab identity exhausted");
-        self.tabs.push(Tab {
-            id,
-            label: NEW_CONNECTION.into(),
-            client: desktop::Client::new(sync::Arc::clone(&self.wake))?,
-            ui: ui::DesktopUi::with_config(
-                sync::Arc::clone(&self.config),
-                self.config_error.clone(),
-            ),
-        });
+        let tab = spawn_tab(
+            self.alloc_id(),
+            sync::Arc::clone(&self.wake),
+            sync::Arc::clone(&self.config),
+            self.config_error.clone(),
+        )?;
+        self.tabs.push(tab);
+        self.composer_open = false;
         self.active = self.tabs.len() - 1;
         Ok(())
+    }
+
+    fn promote_composer(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tabs.len() < MAX_TABS,
+            "at most {MAX_TABS} connection tabs may be open"
+        );
+        let replacement = spawn_tab(
+            self.alloc_id(),
+            sync::Arc::clone(&self.wake),
+            sync::Arc::clone(&self.config),
+            self.config_error.clone(),
+        )?;
+        let tab = std::mem::replace(&mut self.composer, replacement);
+        self.tabs.push(tab);
+        self.composer_open = false;
+        self.active = self.tabs.len() - 1;
+        Ok(())
+    }
+
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next;
+        self.next = self.next.checked_add(1).expect("tab identity exhausted");
+        id
     }
 
     fn reload_config(&mut self) {
@@ -330,7 +533,11 @@ impl Workspace {
                 self.config_error = Some(format!("Could not load SSH config: {error:#}"));
             }
         }
-        for tab in &mut self.tabs {
+        for tab in self
+            .tabs
+            .iter_mut()
+            .chain(std::iter::once(&mut self.composer))
+        {
             tab.ui.config = sync::Arc::clone(&self.config);
             tab.ui.config_load_error = self.config_error.clone();
             tab.ui.refresh_profile();
@@ -341,6 +548,7 @@ impl Workspace {
         for tab in &mut self.tabs {
             tab.ui.cancel_transient();
         }
+        self.composer.ui.cancel_transient();
     }
 
     pub fn terminal_focused(&self, ctx: &egui::Context) -> bool {
@@ -376,7 +584,7 @@ impl Workspace {
                     .fill(root.visuals().panel_fill),
             )
             .show_inside(root, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
                     ui.spacing_mut().interact_size.y = 28.0;
@@ -400,88 +608,170 @@ impl Workspace {
                         widgets.open.bg_stroke.width = stroke_width;
                     }
                     paint_tab_fills(ui, idle_fill, idle_hover);
-                    let hide_form_chip = self.tabs.len() == 1
-                        && self.tabs[0].ui.showing_form()
-                        && self.tabs[0].label == NEW_CONNECTION;
-                    for (index, tab) in self.tabs.iter().enumerate() {
-                        if hide_form_chip {
-                            continue;
-                        }
-                        ui.push_id(tab.id, |ui| {
-                            let phase = tab.client.phase();
-                            let mut title = tab.label.clone();
-                            if busy_phase(phase) {
-                                title = format!("{} {title}", spin(ui.ctx().time()));
-                                ui.ctx().request_repaint();
-                            }
-                            let selected = index == self.active;
-                            let text = egui::RichText::new(title).size(16.0).strong();
-                            let color = tab_color(phase, idle_fill);
-                            paint_tab_fills(ui, color, lift(color, 32));
-                            if selected {
-                                ui.visuals_mut().selection.bg_fill = lift(color, 50);
-                            }
-                            let button = egui::Button::new(text)
-                                .selected(selected)
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("About").size(14.0))
                                 .min_size(egui::vec2(0.0, 28.0))
-                                .corner_radius(5.0)
-                                .sense(egui::Sense::CLICK | egui::Sense::DRAG)
-                                .stroke(egui::Stroke::new(
-                                    2.0_f32,
-                                    if selected {
-                                        selection_stroke
-                                    } else {
-                                        egui::Color32::TRANSPARENT
-                                    },
-                                ));
-                            let response = ui
-                                .add(button)
-                                .on_hover_text("Click to switch · drag to reorder");
-                            response.dnd_set_drag_payload(tab.id);
-                            if response.dragged() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                                ui.ctx().request_repaint();
-                            }
-                            if let Some(insert_at) = drop_insert_at(
-                                &response,
-                                tab.id,
-                                index,
-                                ui.input(|i| i.pointer.interact_pos()),
-                            ) {
-                                paint_drop_marker(ui, response.rect, insert_at > index);
-                                if let Some(id) = response.dnd_release_payload::<u64>() {
-                                    reorder = Some((*id, insert_at));
-                                }
-                            }
-                            if response.clicked() {
-                                navigation = Action::Select(tab.id);
-                            }
-                        });
-                    }
-                    paint_tab_fills(ui, idle_fill, idle_hover);
-                    let add = ui
-                        .add_enabled(
-                            self.tabs.len() < MAX_TABS,
-                            egui::Button::new(egui::RichText::new("+").size(16.0).strong())
-                                .min_size(egui::vec2(28.0, 28.0))
                                 .corner_radius(5.0)
                                 .sense(egui::Sense::CLICK),
                         )
-                        .on_hover_text("New connection tab");
-                    if add.dnd_hover_payload::<u64>().is_some() {
-                        paint_drop_marker(ui, add.rect, false);
-                        if let Some(id) = add.dnd_release_payload::<u64>() {
-                            reorder = Some((*id, self.tabs.len()));
-                        }
+                        .clicked()
+                    {
+                        self.about = true;
                     }
-                    if add.clicked() {
-                        navigation = Action::New;
-                    }
-                    if let Some(ref notice) = self.notice {
-                        ui.colored_label(ui.visuals().error_fg_color, notice);
-                    }
+                    ui.with_layout(
+                        egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                        |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+                            paint_tab_fills(ui, idle_fill, idle_hover);
+                            let idle_after = time::Duration::from_secs(u64::from(self.idle));
+                            let now = time::Instant::now();
+                            for tab in &mut self.tabs {
+                                let seq = tab
+                                    .client
+                                    .lock()
+                                    .view
+                                    .as_ref()
+                                    .map(crate::snapshot::View::display_seq)
+                                    .unwrap_or(0);
+                                if seq != tab.last_seq {
+                                    tab.last_seq = seq;
+                                    tab.last_output = now;
+                                }
+                            }
+                            for (index, tab) in self.tabs.iter().enumerate() {
+                                ui.push_id(tab.id, |ui| {
+                                    let phase = tab.client.phase();
+                                    let mut title = tab.label.clone();
+                                    if busy_phase(phase) {
+                                        title = format!("{} {title}", spin(ui.ctx().time()));
+                                        ui.ctx().request_repaint();
+                                    }
+                                    let selected = !self.composer_open && index == self.active;
+                                    let quiet = self.idle > 0
+                                        && matches!(
+                                            phase,
+                                            desktop::Phase::Watching
+                                                | desktop::Phase::Demo
+                                                | desktop::Phase::Resynchronizing
+                                        )
+                                        && now.saturating_duration_since(tab.last_output)
+                                            >= idle_after;
+                                    if !quiet
+                                        && self.idle > 0
+                                        && matches!(
+                                            phase,
+                                            desktop::Phase::Watching
+                                                | desktop::Phase::Demo
+                                                | desktop::Phase::Resynchronizing
+                                        )
+                                    {
+                                        ui.ctx().request_repaint_after(idle_after.saturating_sub(
+                                            now.saturating_duration_since(tab.last_output),
+                                        ));
+                                    }
+                                    let color = tab_color(phase, idle_fill, quiet);
+                                    let mut text = egui::RichText::new(title).size(16.0).strong();
+                                    if phase == desktop::Phase::Failed {
+                                        text = text.color(egui::Color32::from_rgb(255, 196, 196));
+                                    }
+                                    paint_tab_fills(ui, color, lift(color, 32));
+                                    if selected {
+                                        ui.visuals_mut().selection.bg_fill = lift(color, 50);
+                                        ui.visuals_mut().selection.stroke.color =
+                                            egui::Color32::from_rgb(250, 250, 250);
+                                    }
+                                    let button = egui::Button::new(text)
+                                        .selected(selected)
+                                        .min_size(egui::vec2(0.0, 28.0))
+                                        .corner_radius(5.0)
+                                        .sense(egui::Sense::CLICK | egui::Sense::DRAG)
+                                        .stroke(egui::Stroke::new(
+                                            2.0_f32,
+                                            if selected {
+                                                selection_stroke
+                                            } else {
+                                                egui::Color32::TRANSPARENT
+                                            },
+                                        ));
+                                    let response = ui
+                                        .add(button)
+                                        .on_hover_text("Click to switch · drag to reorder");
+                                    response.dnd_set_drag_payload(tab.id);
+                                    if response.dragged() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                        ui.ctx().request_repaint();
+                                    }
+                                    if let Some(insert_at) = drop_insert_at(
+                                        &response,
+                                        tab.id,
+                                        index,
+                                        ui.input(|i| i.pointer.interact_pos()),
+                                    ) {
+                                        paint_drop_marker(ui, response.rect, insert_at > index);
+                                        if let Some(id) = response.dnd_release_payload::<u64>() {
+                                            reorder = Some((*id, insert_at));
+                                        }
+                                    }
+                                    if response.clicked() {
+                                        navigation = Action::Select(tab.id);
+                                    }
+                                });
+                            }
+                            paint_tab_fills(ui, idle_fill, idle_hover);
+                            if self.composer_open {
+                                ui.visuals_mut().selection.bg_fill = lift(idle_fill, 50);
+                                ui.visuals_mut().selection.stroke.color =
+                                    egui::Color32::from_rgb(250, 250, 250);
+                            }
+                            let add = ui
+                                .add_enabled(
+                                    self.tabs.len() < MAX_TABS || self.composer_open,
+                                    egui::Button::new(egui::RichText::new("+").size(16.0).strong())
+                                        .selected(self.composer_open)
+                                        .min_size(egui::vec2(28.0, 28.0))
+                                        .corner_radius(5.0)
+                                        .sense(egui::Sense::CLICK)
+                                        .stroke(egui::Stroke::new(
+                                            2.0_f32,
+                                            if self.composer_open {
+                                                selection_stroke
+                                            } else {
+                                                egui::Color32::TRANSPARENT
+                                            },
+                                        )),
+                                )
+                                .on_hover_text("New connection");
+                            if add.dnd_hover_payload::<u64>().is_some() {
+                                paint_drop_marker(ui, add.rect, false);
+                                if let Some(id) = add.dnd_release_payload::<u64>() {
+                                    reorder = Some((*id, self.tabs.len()));
+                                }
+                            }
+                            if add.clicked() {
+                                navigation = Action::New;
+                            }
+                            if let Some(ref notice) = self.notice {
+                                ui.colored_label(ui.visuals().error_fg_color, notice);
+                            }
+                        },
+                    );
                 });
             });
+        if self.about {
+            self.show_about(root.ctx());
+        }
+        if root.input(|input| !input.raw.hovered_files.is_empty()) {
+            root.ctx().set_cursor_icon(egui::CursorIcon::Copy);
+        }
+        if self.composer_open {
+            self.composer
+                .ui
+                .take_dropped_files(root.ctx(), &self.composer.client.lock());
+        } else if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.ui.take_dropped_files(root.ctx(), &tab.client.lock());
+        }
         if let Some((id, insert_at)) = reorder {
             navigation = Action::Reorder { id, insert_at };
         }
@@ -493,19 +783,30 @@ impl Workspace {
             // clipboard events collected for the old tab cannot hit the new one.
             return navigation;
         }
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return Action::New;
+        let (id, action) = if self.composer_open || self.tabs.is_empty() {
+            self.composer_open = true;
+            let action = root
+                .push_id(self.composer.id, |root| {
+                    self.composer
+                        .ui
+                        .show(root, &mut self.composer.client.lock())
+                })
+                .inner;
+            (self.composer.id, action)
+        } else {
+            let tab = &mut self.tabs[self.active];
+            let action = root
+                .push_id(tab.id, |root| tab.ui.show(root, &mut tab.client.lock()))
+                .inner;
+            (tab.id, action)
         };
-        let action = root
-            .push_id(tab.id, |root| tab.ui.show(root, &mut tab.client.lock()))
-            .inner;
         if !matches!(navigation, Action::None) {
             // Reorder keeps this tab painted so the focused pane stays in
             // egui's used_ids. Skipping a frame would drop keyboard focus
             // while the white border still claimed the pane was selected.
             return navigation;
         }
-        Action::Tab(tab.id, Box::new(action))
+        Action::Tab(id, Box::new(action))
     }
 
     /// Apply once, after egui finished its potentially repeated layout passes.
@@ -522,12 +823,12 @@ impl Workspace {
             match action {
                 Action::None => {}
                 Action::New => {
-                    self.new_tab()?;
-                    self.persist();
+                    self.open_composer();
                 }
                 Action::Select(id) => {
                     if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
                         self.cancel_transient();
+                        self.composer_open = false;
                         self.active = index;
                         self.tabs[index].ui.arm_focus_restore();
                         self.persist();
@@ -544,9 +845,11 @@ impl Workspace {
                         if index < self.active {
                             self.active -= 1;
                         }
-                        self.active = self.active.min(self.tabs.len().saturating_sub(1));
                         if self.tabs.is_empty() {
-                            self.new_tab()?;
+                            self.active = 0;
+                            self.composer_open = true;
+                        } else {
+                            self.active = self.active.min(self.tabs.len() - 1);
                         }
                         self.persist();
                     }
@@ -555,11 +858,22 @@ impl Workspace {
                     let mut save = false;
                     let mut follow_input = false;
                     let mut close_after_exit = None;
-                    let several_tabs = self.tabs.len() > 1;
                     {
-                        let Some(tab) = self.tabs.get_mut(self.active).filter(|tab| tab.id == id)
-                        else {
-                            return Ok(());
+                        if self.composer_open
+                            && id == self.composer.id
+                            && matches!(*action, ui::Action::Connect(_))
+                        {
+                            self.promote_composer()?;
+                        }
+                        let tab = if self.composer_open && id == self.composer.id {
+                            &mut self.composer
+                        } else {
+                            let Some(tab) =
+                                self.tabs.get_mut(self.active).filter(|tab| tab.id == id)
+                            else {
+                                return Ok(());
+                            };
+                            tab
                         };
                         let result = match *action {
                             ui::Action::None => Ok(()),
@@ -585,11 +899,10 @@ impl Workspace {
                             ui::Action::Disconnect => {
                                 tab.client.disconnect();
                                 tab.ui.return_to_form();
-                                tab.label = NEW_CONNECTION.to_owned();
-                                // A leftover "New connection" chip next to + is
-                                // just another empty form. Close it when another
-                                // tab remains; the last tab keeps the form.
-                                if several_tabs {
+                                tab.label = label(&tab.ui.saved());
+                                // An empty form is the composer. Don't leave it
+                                // as a chip next to +.
+                                if tab.label == NEW_CONNECTION {
                                     close_after_exit = Some(id);
                                 }
                                 Ok(())
@@ -648,7 +961,12 @@ impl Workspace {
                         if index < self.active {
                             self.active -= 1;
                         }
-                        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+                        if self.tabs.is_empty() {
+                            self.active = 0;
+                            self.composer_open = true;
+                        } else {
+                            self.active = self.active.min(self.tabs.len() - 1);
+                        }
                         self.persist();
                     }
                 }
@@ -685,11 +1003,59 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn exit_closes_the_tab_when_another_connection_remains() {
+    fn a_quiet_connected_tab_turns_blue() {
+        let idle = egui::Color32::from_rgb(40, 40, 40);
+        let live = tab_color(desktop::Phase::Watching, idle, false);
+        let quiet = tab_color(desktop::Phase::Watching, idle, true);
+        assert_ne!(live, quiet);
+        assert_eq!(
+            tab_color(desktop::Phase::Failed, idle, false),
+            tab_color(desktop::Phase::Reconnecting, idle, false),
+            "failed uses the same chip fill as reconnecting"
+        );
+        assert_eq!(
+            tab_color(desktop::Phase::Resynchronizing, idle, false),
+            live,
+            "a layout rebuild is not a yellow reconnect"
+        );
+        assert!(!busy_phase(desktop::Phase::Resynchronizing));
+    }
+
+    #[test]
+    fn open_time_formats_compactly() {
+        assert_eq!(format_open(8), "8s");
+        assert_eq!(format_open(90), "1m");
+        assert_eq!(format_open(3720), "1h 2m");
+        assert_eq!(format_open(86_400 * 2 + 3_600), "2d 1h");
+    }
+    #[test]
+    fn plus_opens_the_composer_without_a_new_tab() {
         let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
+        assert_eq!(workspace.tabs.len(), 1);
         workspace.apply(Action::New, || None);
+        assert_eq!(workspace.tabs.len(), 1);
+        assert!(workspace.composer_open);
+        assert!(workspace.composer.ui.showing_form());
+    }
+
+    #[test]
+    fn connecting_from_the_composer_registers_a_tab() {
+        let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
+        workspace.open_composer();
+        let composer = workspace.composer.id;
+        workspace.promote_composer().unwrap();
         assert_eq!(workspace.tabs.len(), 2);
+        assert!(!workspace.composer_open);
+        assert_eq!(workspace.tabs[1].id, composer);
+        assert_ne!(workspace.composer.id, composer);
+    }
+
+    #[test]
+    fn exit_closes_an_empty_form_and_keeps_a_named_one() {
+        let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
+        workspace.push_idle_tab().unwrap();
         let first = workspace.tabs[0].id;
         workspace.apply(Action::Select(first), || None);
         workspace.apply(Action::Tab(first, Box::new(ui::Action::Disconnect)), || {
@@ -697,20 +1063,6 @@ mod tests {
         });
         assert_eq!(workspace.tabs.len(), 1);
         assert_ne!(workspace.tabs[0].id, first);
-    }
-
-    #[test]
-    fn exit_names_the_tab_a_new_connection() {
-        let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
-        assert_eq!(workspace.tabs[0].label, "Demo");
-        let id = workspace.tabs[0].id;
-        workspace.apply(Action::Tab(id, Box::new(ui::Action::Disconnect)), || None);
-        assert_eq!(
-            workspace.tabs[0].client.phase(),
-            desktop::Phase::Disconnected
-        );
-        assert!(workspace.tabs[0].ui.showing_form());
-        assert_eq!(workspace.tabs[0].label, NEW_CONNECTION);
 
         workspace.tabs[0].ui.restore(store::Tab {
             destination: "dev".into(),
@@ -719,27 +1071,11 @@ mod tests {
             ..store::Tab::default()
         });
         workspace.tabs[0].label = label(&workspace.tabs[0].ui.saved());
-        assert_eq!(workspace.tabs[0].label, "dev / work");
+        let id = workspace.tabs[0].id;
         workspace.apply(Action::Tab(id, Box::new(ui::Action::Disconnect)), || None);
-        assert_eq!(workspace.tabs[0].label, NEW_CONNECTION);
-        let ctx = egui::Context::default();
-        crate::window::configure(&ctx);
-        let _ = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1280.0, 760.0),
-                )),
-                ..Default::default()
-            },
-            |root| {
-                workspace.show(root);
-            },
-        );
-        assert_eq!(
-            workspace.tabs[0].label, NEW_CONNECTION,
-            "painting the form must not put the destination back on the tab"
-        );
+        assert_eq!(workspace.tabs.len(), 1);
+        assert_eq!(workspace.tabs[0].label, "dev / work");
+        assert!(workspace.tabs[0].ui.showing_form());
     }
 
     #[test]
@@ -767,7 +1103,7 @@ mod tests {
     fn reordering_tabs_keeps_the_active_tab() {
         let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
         let first = workspace.tabs[0].id;
-        workspace.new_tab().unwrap();
+        workspace.push_idle_tab().unwrap();
         let second = workspace.tabs[1].id;
         assert_eq!(workspace.active, 1);
         workspace.apply(
@@ -794,7 +1130,7 @@ mod tests {
     fn new_tab_preserves_existing_session_and_close_only_detaches_its_client() {
         let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
         let original = workspace.tabs[0].id;
-        workspace.new_tab().unwrap();
+        workspace.push_idle_tab().unwrap();
         assert_eq!(workspace.tabs.len(), 2);
         assert_eq!(workspace.tabs[0].client.phase(), desktop::Phase::Demo);
         assert_eq!(workspace.tabs[1].client.phase(), desktop::Phase::Idle);
@@ -810,7 +1146,7 @@ mod tests {
     fn stale_tab_actions_do_not_modify_the_current_tab() {
         let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
         let original = workspace.tabs[0].id;
-        workspace.new_tab().unwrap();
+        workspace.push_idle_tab().unwrap();
         workspace.apply(
             Action::Tab(original, Box::new(ui::Action::Disconnect)),
             || None,
@@ -862,23 +1198,13 @@ mod tests {
                 ],
                 active: 1,
                 fps: store::DEFAULT_FPS,
+                idle: store::DEFAULT_IDLE,
+                open_secs: 0,
             },
         )
         .unwrap();
 
-        let mut workspace = Workspace {
-            tabs: Vec::new(),
-            active: 0,
-            next: 1,
-            wake: sync::Arc::new(|| {}),
-            config: sync::Arc::new(ssh_config::Config::default()),
-            config_error: None,
-            notice: None,
-            store: Some(file.clone()),
-            fps: store::DEFAULT_FPS,
-            echo_until: None,
-            suspend_clock: reconnect::AliveClock::now(),
-        };
+        let mut workspace = idle_workspace(Some(file.clone()));
         assert!(workspace.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
         assert_eq!(workspace.tabs.len(), 2);
         assert_eq!(workspace.active, 1);
@@ -891,31 +1217,50 @@ mod tests {
             );
             assert!(tab.client.retry().is_none());
         }
-        assert_eq!(workspace.tabs[0].label, "dev");
-        assert_eq!(workspace.tabs[1].label, "build.example.test");
+        assert_eq!(workspace.tabs[0].label, "dev / work");
+        assert_eq!(workspace.tabs[1].label, "build.example.test / ci");
         workspace.persist();
         let reloaded = store::load(&file).unwrap().unwrap();
         assert_eq!(reloaded.tabs.len(), 2);
         assert_eq!(reloaded.tabs[0].host, "10.0.0.2");
         assert_eq!(reloaded.tabs[0].port, 2222);
-        assert!(reloaded.tabs[1].session.is_empty());
+        assert_eq!(reloaded.tabs[0].session, "work");
+        assert_eq!(reloaded.tabs[1].session, "ci");
         assert_eq!(reloaded.active, 1);
     }
 
-    fn broken_workspace(file: path::PathBuf) -> Workspace {
+    fn idle_workspace(store: Option<path::PathBuf>) -> Workspace {
+        let wake: Wake = sync::Arc::new(|| {});
         Workspace {
             tabs: Vec::new(),
             active: 0,
-            next: 1,
-            wake: sync::Arc::new(|| {}),
+            composer: spawn_tab(
+                1,
+                sync::Arc::clone(&wake),
+                sync::Arc::new(ssh_config::Config::default()),
+                None,
+            )
+            .unwrap(),
+            composer_open: true,
+            next: 2,
+            wake,
             config: sync::Arc::new(ssh_config::Config::default()),
             config_error: None,
             notice: None,
-            store: Some(file),
+            store,
             fps: store::DEFAULT_FPS,
+            idle: store::DEFAULT_IDLE,
+            about: false,
+            about_icon: None,
+            open_secs: 0,
+            session_started: time::Instant::now(),
             echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
         }
+    }
+
+    fn broken_workspace(file: path::PathBuf) -> Workspace {
+        idle_workspace(Some(file))
     }
 
     #[test]
@@ -942,7 +1287,7 @@ mod tests {
         let mut workspace = broken_workspace(file.clone());
         assert!(!workspace.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
         assert!(workspace.tabs.is_empty());
-        workspace.new_tab().unwrap();
+        workspace.open_composer();
         workspace.persist();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
     }
@@ -975,7 +1320,7 @@ mod tests {
         );
         assert!(workspace.tabs.is_empty());
         assert!(!file.exists(), "Clear must delete the unreadable file");
-        workspace.new_tab().unwrap();
+        workspace.push_idle_tab().unwrap();
         workspace.persist();
         assert!(store::load(&file).unwrap().is_some());
     }
@@ -984,9 +1329,9 @@ mod tests {
     fn connections_and_tabs_are_bounded() {
         let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
         for _ in 1..MAX_TABS {
-            workspace.new_tab().unwrap();
+            workspace.push_idle_tab().unwrap();
         }
-        assert!(workspace.new_tab().is_err());
+        assert!(workspace.push_idle_tab().is_err());
     }
     #[test]
     fn native_smoke_geometry() {

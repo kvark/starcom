@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.2.0
+
+Tabs, mouse, paste, session create, SFTP drops, and an About panel after
+`v0.1.2`.
+
+- **Quiet tabs.** A healthy connected tab with no view change for `idle`
+  seconds (default 30, 0 off) turns blue. Failed tabs keep the yellow
+  reconnecting chip and use light-red title text.
+- **Copy.** Finishing a drag, double-click, or triple-click copies immediately,
+  clears the highlight, and shows **Copied!** on the status bar for a second.
+  The Copy button copies the whole pane. Right-click does not copy.
+- **Paste.** Clipboard paste is sent as soon as it is requested. Control
+  characters other than tabs and line endings are still rejected.
+- **Create.** The typed session name appears in the list at once, and Starcom
+  attaches when the host confirms it. The last-used session is saved as a form
+  hint; restoring a workspace still does not authenticate.
+- **Mouse.** Unmodified left clicks are forwarded when the pane asked for mouse
+  reports. Drags, modified clicks, and double/triple clicks stay local
+  selection. The wheel already went to the application in that case.
+- **File drop.** Files dropped on a connected pane upload over SFTP into the
+  remote temp directory, then the remote paths are pasted. A status-bar
+  progress bar tracks large files. Directories and files larger than 32 MiB
+  are skipped. The upload is a separate SSH connection, so it cannot stall
+  the tmux control channel. Wayland binds `wl_data_device` itself so the
+  compositor accepts the drop.
+- **About.** The tab strip has an About button on the right. It opens a modal
+  with the icon, version, GitHub URL, author, total time Starcom has been
+  open, and the workspace `fps` / `idle` settings.
+- **Composer.** **+** shows the connection form on the plus chip. A tab is
+  registered when you press Connect, so an unused New connection chip cannot
+  stick in the strip.
+- **Move pane.** Arrow buttons swap the focused pane with its neighbor.
+- **History.** The default local history depth is 1000 lines, matching the
+  snapshot cap.
+- **Sunset.** Pinned to `navigato-rs/sunset` `c245252`, which includes the
+  sans-io SFTP client used for drops.
+
+Prebuilt Linux, macOS, and Windows artifacts are attached below. Linux and
+Windows builds are unsigned; macOS builds are ad-hoc codesigned, not notarized.
+
+Known limitations: MFA, host and user certificates, `ProxyJump`, `ProxyCommand`,
+`sk-ecdsa` and file-based SK keys, and reusing one SSH connection across tabs
+are not supported. Remote hosts are Linux with stock OpenSSH and tmux. No
+performance baselines are published yet.
+
 ## v0.1.2
 
 Terminal viewport and tab chrome after `v0.1.1`.

@@ -1,19 +1,22 @@
 # Starcom saved connection tabs.
 # Copy to ~/.config/starcom/workspace.conf (or %APPDATA%\starcom\ on Windows)
 # and edit. Destinations and preferences only: no keys, passphrases, host-key
-# material, terminal contents, or tmux session names.
+# material, or terminal contents. A last-used session name is a form hint.
 version 1
 active 0
 # Idle remote paint rate, 1..=60. 0 means the default (5). Pointer and key
 # events still paint immediately. After keys or wheel, echo runs at up to
 # 20 fps for a short time.
 fps 5
+# Seconds a connected tab may sit without a screen change before its chip
+# turns blue. 0 disables the hint.
+idle 30
 
 [tab]
 destination example
 host example.test
 user alice
 port 22
-history 200
+history 1000
 access interactive
 reconnect yes

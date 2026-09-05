@@ -15,6 +15,8 @@ pub mod replay;
 pub mod session;
 #[cfg(feature = "ssh")]
 pub mod sessions;
+#[cfg(feature = "ssh")]
+pub mod sftp;
 pub mod snapshot;
 #[cfg(feature = "ssh")]
 pub mod ssh;
@@ -30,6 +32,8 @@ pub mod desktop;
 mod dialog;
 #[cfg(feature = "gui")]
 mod ui;
+#[cfg(all(feature = "gui", target_os = "linux"))]
+mod wayland_drop;
 #[cfg(feature = "gui")]
 mod window;
 #[cfg(feature = "gui")]

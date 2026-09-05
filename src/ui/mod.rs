@@ -4,7 +4,7 @@ pub(crate) mod input;
 mod layout;
 mod terminal;
 
-use std::{collections, path, sync, time};
+use std::{collections, path, sync, thread, time};
 
 use crate::{
     core, desktop, input as terminal_input, reconnect, session, snapshot, ssh, ssh_config, store,
@@ -14,6 +14,12 @@ use crate::{
 enum Screen {
     Connection,
     Terminal,
+}
+
+enum UploadEvent {
+    Progress { name: String, done: u64, total: u64 },
+    Done(Vec<String>),
+    Failed(String),
 }
 
 pub struct Form {
@@ -51,7 +57,7 @@ impl Default for Form {
                 .map(|path| path.join(".ssh/known_hosts").to_string_lossy().into_owned())
                 .unwrap_or_default(),
             socket: String::new(),
-            history: 200,
+            history: store::DEFAULT_HISTORY,
             interactive: true,
             reconnect: true,
             unsupported: Vec::new(),
@@ -262,7 +268,6 @@ pub struct DesktopUi {
     window: Option<tmuxctl::WindowId>,
     focused: Option<tmuxctl::PaneId>,
     pane_ui: collections::BTreeMap<tmuxctl::PaneId, terminal::PaneUi>,
-    pending_paste: Option<(desktop::Target, terminal_input::Paste)>,
     notice: Option<String>,
     notice_until: Option<time::Instant>,
     /// Restore keyboard focus the next time this tab's panes are painted.
@@ -270,6 +275,13 @@ pub struct DesktopUi {
     /// Name for an as-yet-uncreated session, kept apart from the selected one
     /// so typing it cannot be overwritten by the live listing.
     create_name: String,
+    /// Session we just asked to create; shown in the list and attached as soon
+    /// as the host confirms it.
+    creating: Option<String>,
+    /// In-flight SFTP upload from a file drop. The control worker is not
+    /// involved; progress and completion are polled on the next frames.
+    upload: Option<sync::mpsc::Receiver<UploadEvent>>,
+    upload_progress: Option<(String, u64, u64)>,
     /// Whether a local SSH agent looked reachable, and when that was last
     /// asked. A hint for the form only; the connection still authenticates as
     /// configured. Rechecked while the form is open so that starting an agent
@@ -310,11 +322,13 @@ impl DesktopUi {
             window: None,
             focused: None,
             pane_ui: collections::BTreeMap::new(),
-            pending_paste: None,
             notice: None,
             notice_until: None,
             restore_focus: false,
             create_name: String::new(),
+            creating: None,
+            upload: None,
+            upload_progress: None,
             agent_available: ssh::agent_available(),
             agent_checked: time::Instant::now(),
             listed_destination: String::new(),
@@ -363,9 +377,9 @@ impl DesktopUi {
 
     pub fn open_terminal(&mut self) {
         self.screen = Screen::Terminal;
-        self.pending_paste = None;
     }
 
+    #[cfg(test)]
     pub(crate) fn showing_form(&self) -> bool {
         self.screen == Screen::Connection
     }
@@ -382,7 +396,9 @@ impl DesktopUi {
     }
 
     pub fn cancel_transient(&mut self) {
-        self.pending_paste = None;
+        self.creating = None;
+        self.upload = None;
+        self.upload_progress = None;
     }
 
     pub(crate) fn arm_focus_restore(&mut self) {
@@ -419,9 +435,9 @@ impl DesktopUi {
             })
     }
 
-    /// Resolve one clipboard read into an ordered action, or arm the multiline
-    /// confirmation. Returning None never means "silently dropped": every path
-    /// that declines to send leaves a notice for the user.
+    /// Resolve one clipboard read into an ordered action. Returning None never
+    /// means "silently dropped": every path that declines to send leaves a
+    /// notice for the user.
     pub(crate) fn clipboard_paste(
         &mut self,
         state: &desktop::State,
@@ -433,10 +449,6 @@ impl DesktopUi {
             return None;
         }
         match terminal_input::Paste::new(text) {
-            Ok(paste) if paste.is_multiline() => {
-                self.pending_paste = Some((target, paste));
-                None
-            }
             Ok(paste) => Some(terminal_input::Action::Paste(paste)),
             Err(error) => {
                 self.notice = Some(error.to_string());
@@ -630,24 +642,45 @@ impl DesktopUi {
                                 ui.weak("Asking the host…");
                             }
                             Some(desktop::Discovery::Failed(ref detail)) if listing_here => {
+                                self.creating = None;
                                 ui.colored_label(ui.visuals().error_fg_color, detail);
                             }
                             Some(desktop::Discovery::Created(ref name)) if listing_here => {
                                 chosen = Some(name.clone());
-                                ui.colored_label(
-                                    ui.visuals().warn_fg_color,
-                                    format!("Created {name}. Connect to attach."),
-                                );
+                                if self.creating.as_deref() == Some(name.as_str()) {
+                                    self.creating = None;
+                                    self.create_name.clear();
+                                    self.form.session.clone_from(name);
+                                    match self.form.connection() {
+                                        Ok(connection) => {
+                                            self.notice = None;
+                                            action = Action::Connect(connection);
+                                        }
+                                        Err(error) => self.notice = Some(error.to_string()),
+                                    }
+                                }
                             }
                             Some(desktop::Discovery::Sessions(ref found)) if listing_here => {
-                                if found.is_empty() {
+                                let pending = self.creating.as_ref().filter(|name| {
+                                    !found.iter().any(|summary| summary.name == **name)
+                                });
+                                if found.is_empty() && pending.is_none() {
                                     ui.weak("The host is running tmux with no sessions.");
                                 } else {
                                     if !found
                                         .iter()
                                         .any(|summary| summary.name == self.form.session)
+                                        && pending.is_none()
                                     {
                                         chosen = Some(found[0].name.clone());
+                                    }
+                                    if let Some(name) = pending {
+                                        let selected = self.form.session == *name;
+                                        ui.add(
+                                            egui::Button::new(name)
+                                                .selected(selected)
+                                                .sense(egui::Sense::CLICK),
+                                        );
                                     }
                                     for summary in found {
                                         let selected = self.form.session == summary.name;
@@ -706,6 +739,9 @@ impl DesktopUi {
                                 match self.form.connection_named(self.create_name.trim()) {
                                     Ok(connection) => {
                                         self.notice = None;
+                                        self.creating =
+                                            Some(self.create_name.trim().to_owned());
+                                        self.form.session = self.create_name.trim().to_owned();
                                         action = Action::CreateSession(connection);
                                     }
                                     Err(error) => self.notice = Some(error.to_string()),
@@ -919,6 +955,23 @@ impl DesktopUi {
         let mut action = Action::None;
         let mut steps: Vec<Step> = Vec::new();
         let connection_epoch = state.epoch();
+        if let Some(paths) = self.poll_upload(root.ctx()) {
+            let n = paths.len();
+            let label = if n == 1 { "file" } else { "files" };
+            self.notice = Some(format!("Uploaded {n} {label}."));
+            self.notice_until = Some(time::Instant::now() + time::Duration::from_secs(3));
+            if let Some(text) = paste_remote_paths(&paths)
+                && state.input_ready()
+                && let Some(target) = self.focused.and_then(|pane| state.target(pane))
+            {
+                match terminal_input::Paste::new(&text) {
+                    Ok(paste) => {
+                        steps.push(Step::Send(target, terminal_input::Action::Paste(paste)))
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
+        }
 
         // egui remembers last frame's panel rect with no max. A single wrap
         // to a tall status bar then never shrinks, which is the "status ate
@@ -928,7 +981,13 @@ impl DesktopUi {
             .exact_size(36.0_f32)
             .show_inside(root, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if click_button(ui, "Exit")
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("Exit").size(14.0))
+                            .min_size(egui::vec2(0.0, 28.0))
+                            .corner_radius(5.0)
+                            .sense(egui::Sense::CLICK),
+                    )
                     .on_hover_text(
                         "Drop this attachment and return to the connection form. \
                          Remote jobs keep running.",
@@ -988,12 +1047,10 @@ impl DesktopUi {
                             self.reset_client_size();
                         }
                         if click_button(ui, "Copy")
-                            .on_hover_text(
-                                "Copy the selection, or the whole pane if nothing is selected",
-                            )
+                            .on_hover_text("Copy the whole pane")
                             .clicked()
                         {
-                            self.copy_pane(ui.ctx(), state);
+                            self.copy_pane(ui.ctx(), state, true);
                         }
                         if ui
                             .add_enabled(
@@ -1006,15 +1063,36 @@ impl DesktopUi {
                             steps.push(Step::RequestPaste(target));
                         }
                         ui.separator();
-                        ui.small(if let Some(ref notice) = self.notice {
-                            notice.as_str()
-                        } else if state.phase == desktop::Phase::Demo {
-                            "Local demo — no SSH connection"
-                        } else if state.input_ready() {
-                            "Click a pane to type · Wheel to scroll · Drag to select · Right-click to copy"
+                        if let Some((ref name, done, total)) = self.upload_progress {
+                            let frac = if total == 0 {
+                                1.0
+                            } else {
+                                done as f32 / total as f32
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                                    .desired_width(240.0)
+                                    .desired_height(16.0)
+                                    .text(upload_label(name, done, total)),
+                            );
+                        } else if self.notice.as_deref() == Some("Copied!") {
+                            ui.label(
+                                egui::RichText::new("Copied!")
+                                    .size(22.0)
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            );
                         } else {
-                            "Wheel to scroll · Drag to select · Right-click to copy"
-                        });
+                            ui.small(if let Some(ref notice) = self.notice {
+                                notice.as_str()
+                            } else if state.phase == desktop::Phase::Demo {
+                                "Local demo — no SSH connection"
+                            } else if state.input_ready() {
+                                "Click a pane to type · Drag to select · Drop files to upload"
+                            } else {
+                                "Wheel to scroll · Drag to select"
+                            });
+                        }
                         if let Some(retry) = state.retry {
                             // The countdown is the only thing on screen that changes on
                             // its own, so ask for exactly the frames it needs.
@@ -1152,6 +1230,12 @@ impl DesktopUi {
                         row_height,
                         &mut resizes,
                         &mut |ui, rect, pane_id| {
+                            let neighbors = layout::Neighbors::of(
+                                view.panes()
+                                    .values()
+                                    .map(|pane| layout::PaneRect::from_state(&pane.state)),
+                                pane_id,
+                            );
                             if let Some(pane) = view.panes_mut().get_mut(&pane_id) {
                                 let events = pane_ui.entry(pane_id).or_default().show(
                                     ui,
@@ -1164,6 +1248,7 @@ impl DesktopUi {
                                     notice_until,
                                     controls,
                                     can_kill,
+                                    neighbors,
                                     !matches!(
                                         state.phase,
                                         desktop::Phase::Watching | desktop::Phase::Demo
@@ -1198,14 +1283,9 @@ impl DesktopUi {
                                 actions.into_iter().map(|action| Step::Send(target, action)),
                             );
                         }
-                        Ok(Some(input::Event::Copy)) => self.copy_pane(root.ctx(), state),
+                        Ok(Some(input::Event::Copy)) => self.copy_pane(root.ctx(), state, false),
                         Ok(Some(input::Event::Paste(paste))) => {
-                            if paste.is_multiline() {
-                                self.pending_paste = Some((target, paste));
-                            } else {
-                                steps
-                                    .push(Step::Send(target, terminal_input::Action::Paste(paste)));
-                            }
+                            steps.push(Step::Send(target, terminal_input::Action::Paste(paste)));
                         }
                         // Keeps its place in the frame; the clipboard read that
                         // resolves it happens outside this closure.
@@ -1216,42 +1296,6 @@ impl DesktopUi {
                         Err(error) => self.notice = Some(error.to_string()),
                     }
                 }
-            }
-        }
-
-        if let Some((target, paste)) = self.pending_paste.clone() {
-            let mut send = false;
-            let mut cancel = false;
-            egui::Window::new("Confirm multiline paste")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(root.ctx(), |ui| {
-                    ui.label(format!(
-                        "Send {} bytes across {} lines?",
-                        paste.as_str().len(),
-                        paste.as_str().lines().count()
-                    ));
-                    let mut preview: String = paste.as_str().chars().take(320).collect();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut preview)
-                            .desired_rows(6)
-                            .interactive(false),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                        if ui.button("Send paste").clicked() {
-                            send = true;
-                        }
-                    });
-                });
-            if cancel {
-                self.pending_paste = None;
-            } else if send {
-                self.pending_paste = None;
-                steps.push(Step::Send(target, terminal_input::Action::Paste(paste)));
             }
         }
 
@@ -1270,34 +1314,135 @@ impl DesktopUi {
         }
     }
 
-    fn copy_pane(&mut self, ctx: &egui::Context, state: &desktop::State) {
+    pub(crate) fn take_dropped_files(&mut self, ctx: &egui::Context, state: &desktop::State) {
+        let files: Vec<path::PathBuf> = ctx.input_mut(|input| {
+            std::mem::take(&mut input.raw.dropped_files)
+                .into_iter()
+                .filter_map(|file| file.path)
+                .collect()
+        });
+        if files.is_empty() {
+            return;
+        }
+        if state.phase == desktop::Phase::Demo {
+            self.notice = Some("The demo has no remote host to upload to.".to_owned());
+            self.notice_until = None;
+            return;
+        }
+        if !matches!(
+            state.phase,
+            desktop::Phase::Watching | desktop::Phase::Resynchronizing
+        ) {
+            self.notice = Some("Connect before dropping files.".to_owned());
+            self.notice_until = None;
+            return;
+        }
+        if self.upload.is_some() {
+            self.notice = Some("Already uploading.".to_owned());
+            self.notice_until = None;
+            return;
+        }
+        let options = match self.form.connection() {
+            Ok(connection) => connection.options,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                self.notice_until = None;
+                return;
+            }
+        };
+        let (tx, rx) = sync::mpsc::channel();
+        self.upload = Some(rx);
+        self.upload_progress = Some(("…".to_owned(), 0, 0));
+        self.notice = None;
+        self.notice_until = None;
+        let _ = thread::Builder::new()
+            .name("starcom-sftp".to_owned())
+            .spawn(move || {
+                let progress = tx.clone();
+                let result = crate::sftp::put_files(&options, &files, |update| {
+                    let _ = progress.send(UploadEvent::Progress {
+                        name: update.name.to_owned(),
+                        done: update.done,
+                        total: update.total,
+                    });
+                });
+                let _ = tx.send(match result {
+                    Ok(paths) => UploadEvent::Done(paths),
+                    Err(error) => {
+                        UploadEvent::Failed(format!("{error:#}").chars().take(1024).collect())
+                    }
+                });
+            });
+    }
+
+    fn poll_upload(&mut self, ctx: &egui::Context) -> Option<Vec<String>> {
+        let rx = self.upload.as_ref()?;
+        let mut last_progress = None;
+        loop {
+            match rx.try_recv() {
+                Ok(UploadEvent::Progress { name, done, total }) => {
+                    last_progress = Some((name, done, total));
+                }
+                Ok(UploadEvent::Done(paths)) => {
+                    self.upload = None;
+                    self.upload_progress = None;
+                    return Some(paths);
+                }
+                Ok(UploadEvent::Failed(error)) => {
+                    self.upload = None;
+                    self.upload_progress = None;
+                    self.notice = Some(error);
+                    self.notice_until = None;
+                    return None;
+                }
+                Err(sync::mpsc::TryRecvError::Empty) => break,
+                Err(sync::mpsc::TryRecvError::Disconnected) => {
+                    self.upload = None;
+                    self.upload_progress = None;
+                    self.notice = Some("Upload ended without a result.".to_owned());
+                    self.notice_until = None;
+                    return None;
+                }
+            }
+        }
+        if let Some(progress) = last_progress {
+            self.upload_progress = Some(progress);
+        }
+        ctx.request_repaint_after(time::Duration::from_millis(50));
+        None
+    }
+
+    /// `whole` is the status-bar Copy button: always the visible pane.
+    /// Keyboard copy still prefers a live selection.
+    fn copy_pane(&mut self, ctx: &egui::Context, state: &mut desktop::State, whole: bool) {
         let Some(id) = self.focused else {
             self.notice = Some("Click a pane first.".to_owned());
             self.notice_until = None;
             return;
         };
-        let Some(pane) = state.view.as_ref().and_then(|view| view.panes().get(&id)) else {
+        let Some(pane) = state
+            .view
+            .as_mut()
+            .and_then(|view| view.panes_mut().get_mut(&id))
+        else {
             self.notice = Some("Click a pane first.".to_owned());
             self.notice_until = None;
             return;
         };
-        if let Some(text) = pane.terminal.selected_text() {
-            terminal::copy(
-                ctx,
-                text,
-                &mut self.notice,
-                &mut self.notice_until,
-                "selection copied",
-            );
+        let text = if !whole {
+            pane.terminal.selected_text()
         } else {
-            terminal::copy(
-                ctx,
-                pane.terminal.screen_lines().join("\n"),
-                &mut self.notice,
-                &mut self.notice_until,
-                "full pane copied",
-            );
+            None
         }
+        .unwrap_or_else(|| pane.terminal.screen_lines().join("\n"));
+        terminal::copy(
+            ctx,
+            text,
+            &mut self.notice,
+            &mut self.notice_until,
+            "Copied!",
+        );
+        pane.terminal.clear_selection();
     }
 
     #[cfg(test)]
@@ -1317,6 +1462,35 @@ impl DesktopUi {
         let end = start + egui::vec2(width * 6.8, 0.0);
         (start, end)
     }
+}
+
+fn upload_label(name: &str, done: u64, total: u64) -> String {
+    let short = if name.len() > 24 {
+        format!("…{}", &name[name.len() - 23..])
+    } else {
+        name.to_owned()
+    };
+    if total >= 1024 * 1024 {
+        format!(
+            "{short}  {:.1}/{:.1} MiB",
+            done as f32 / (1024.0 * 1024.0),
+            total as f32 / (1024.0 * 1024.0)
+        )
+    } else {
+        format!(
+            "{short}  {:.0}/{:.0} KiB",
+            done as f32 / 1024.0,
+            total as f32 / 1024.0
+        )
+    }
+}
+
+fn paste_remote_paths(paths: &[String]) -> Option<String> {
+    let quoted: anyhow::Result<Vec<_>> = paths
+        .iter()
+        .map(|path| crate::command::shell_quote(path))
+        .collect();
+    quoted.ok().map(|paths| paths.join(" "))
 }
 
 /// Click-only: arrows, Tab, and Escape must stay with the focused pane.
@@ -1561,6 +1735,44 @@ mod tests {
         ]));
         paint(&mut ui, &mut state);
         assert_eq!(ui.form.session, "0");
+    }
+
+    #[test]
+    fn a_listed_last_used_session_stays_selected() {
+        let mut ui = DesktopUi::default();
+        ui.form.destination = "zork".to_owned();
+        ui.form.session = "work".to_owned();
+        ui.listed_destination = "zork".to_owned();
+        let mut state = desktop::State::default();
+        state.discovery = Some(desktop::Discovery::Sessions(vec![
+            crate::sessions::Summary {
+                name: "0".into(),
+                windows: 1,
+                attached: 0,
+            },
+            crate::sessions::Summary {
+                name: "work".into(),
+                windows: 2,
+                attached: 1,
+            },
+        ]));
+        paint(&mut ui, &mut state);
+        assert_eq!(ui.form.session, "work");
+    }
+
+    #[test]
+    fn creating_a_session_connects_once_the_host_confirms() {
+        let mut ui = DesktopUi::default();
+        ui.form.destination = "zork".to_owned();
+        ui.form.host = "10.0.0.2".to_owned();
+        ui.listed_destination = "zork".to_owned();
+        ui.creating = Some("fresh".to_owned());
+        ui.form.session = "fresh".to_owned();
+        let mut state = desktop::State::default();
+        state.discovery = Some(desktop::Discovery::Created("fresh".into()));
+        assert!(matches!(paint(&mut ui, &mut state), Action::Connect(_)));
+        assert!(ui.creating.is_none());
+        assert_eq!(ui.form.session, "fresh");
     }
 
     #[test]
