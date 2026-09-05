@@ -342,10 +342,11 @@ substitute for native interaction testing on platforms where that test is absent
 
 ## Non-goals for the first useful release
 
-SFTP/file management, Git UI, agent orchestration, plugins, collaboration,
-terminal graphics protocols, a custom multiplexer, and a custom remote daemon are
-out of scope. A full-screen program's conversation history is not necessarily
-terminal scrollback, and Starcom cannot reconstruct output tmux has discarded.
+File management beyond bounded drop uploads, Git UI, agent orchestration,
+plugins, collaboration, terminal graphics protocols, a custom multiplexer, and
+a custom remote daemon are out of scope. A full-screen program's conversation
+history is not necessarily terminal scrollback, and Starcom cannot reconstruct
+output tmux has discarded.
 
 ## References
 

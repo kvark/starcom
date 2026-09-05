@@ -228,16 +228,25 @@ fn tab(fields: &collections::BTreeMap<&str, &str>) -> anyhow::Result<Tab> {
         );
     }
     let text = |key: &str| fields.get(key).copied().unwrap_or_default().to_owned();
-    let flag = |key: &str, on: &str| -> anyhow::Result<bool> {
+    let flag = |key: &str, on: &str, off: &str| -> anyhow::Result<bool> {
         match fields.get(key) {
             None => Ok(false),
             Some(value) if *value == on => Ok(true),
-            Some(value) => {
-                anyhow::ensure!(!value.is_empty(), "empty {key}");
-                Ok(false)
-            }
+            Some(value) if *value == off => Ok(false),
+            Some(value) => anyhow::bail!("invalid {key} value {value:?}"),
         }
     };
+    let history = fields
+        .get("history")
+        .map(|history| history.parse())
+        .transpose()
+        .context("invalid history")?
+        .unwrap_or(DEFAULT_HISTORY);
+    anyhow::ensure!(
+        history <= crate::snapshot::MAX_HISTORY_LINES,
+        "history exceeds {} lines",
+        crate::snapshot::MAX_HISTORY_LINES
+    );
     Ok(Tab {
         destination: text("destination"),
         host: text("host"),
@@ -252,14 +261,9 @@ fn tab(fields: &collections::BTreeMap<&str, &str>) -> anyhow::Result<Tab> {
         identity: text("identity"),
         known_hosts: text("known-hosts"),
         socket: text("socket"),
-        history: fields
-            .get("history")
-            .map(|history| history.parse())
-            .transpose()
-            .context("invalid history")?
-            .unwrap_or(DEFAULT_HISTORY),
-        interactive: flag("access", "interactive")?,
-        reconnect: flag("reconnect", "yes")?,
+        history,
+        interactive: flag("access", "interactive", "read-only")?,
+        reconnect: flag("reconnect", "yes", "no")?,
     })
 }
 
@@ -482,6 +486,15 @@ mod tests {
         assert!(parse(&format!("[tab]\nhost {}\n", "x".repeat(MAX_VALUE))).is_ok());
         assert!(parse("[tab]\nhost a\u{1b}b\n").is_err(), "control byte");
         assert!(parse("[tab]\nhost a\n[tab]\nhost b\n").is_ok());
+        assert!(
+            parse(&format!(
+                "[tab]\nhistory {}\n",
+                crate::snapshot::MAX_HISTORY_LINES + 1
+            ))
+            .is_err()
+        );
+        assert!(parse("[tab]\naccess maybe\n").is_err());
+        assert!(parse("[tab]\nreconnect maybe\n").is_err());
         let many = "[tab]\nhost a\n".repeat(MAX_TABS + 1);
         assert!(parse(&many).is_err(), "tab count must be bounded");
         assert!(parse("[tab]\nhost a\nhost b\n").is_err(), "duplicate key");

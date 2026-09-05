@@ -8,6 +8,8 @@ use crate::{desktop, ui, workspace};
 use anyhow::Context;
 
 const INITIAL_SIZE: (u32, u32) = (1280, 760);
+#[cfg(target_os = "linux")]
+type LocalWake = sync::Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Debug)]
 enum Event {
@@ -39,6 +41,7 @@ impl Runtime {
     fn new(
         event_loop: &winit::event_loop::ActiveEventLoop,
         ctx: &egui::Context,
+        #[cfg(target_os = "linux")] local_wake: LocalWake,
     ) -> anyhow::Result<Self> {
         #[allow(unused_mut)]
         let mut attributes = winit::window::Window::default_attributes()
@@ -65,7 +68,7 @@ impl Runtime {
             .create_window(attributes)
             .context("create Starcom window")?;
         #[cfg(target_os = "linux")]
-        let wayland_drop = crate::wayland_drop::WaylandDrop::attach(&window);
+        let wayland_drop = crate::wayland_drop::WaylandDrop::attach(&window, local_wake);
         // SAFETY: the returned graphics context and surface are confined to this
         // event-loop thread; the window outlives the explicitly destroyed surface.
         let context = unsafe {
@@ -229,6 +232,8 @@ struct App {
     last_paint: Option<time::Instant>,
     input_redraw: bool,
     error: Option<anyhow::Error>,
+    #[cfg(target_os = "linux")]
+    local_wake: LocalWake,
 }
 
 impl App {
@@ -267,6 +272,11 @@ impl App {
         };
         let pump = dropper.pump();
         let mut redraw = false;
+        if let Some(error) = pump.error {
+            self.workspace
+                .set_notice(format!("Could not accept file drop: {error}"));
+            redraw = true;
+        }
         if pump.hovering {
             let files = &mut runtime.input.egui_input_mut().hovered_files;
             if files.is_empty() {
@@ -298,7 +308,12 @@ impl winit::application::ApplicationHandler<Event> for App {
             self.workspace.notice_suspend();
             return;
         }
-        match Runtime::new(event_loop, &self.ctx) {
+        match Runtime::new(
+            event_loop,
+            &self.ctx,
+            #[cfg(target_os = "linux")]
+            sync::Arc::clone(&self.local_wake),
+        ) {
             Ok(runtime) => {
                 log::info!("Starcom desktop initialized");
                 runtime.window.request_redraw();
@@ -507,6 +522,13 @@ pub fn run(startup: desktop::Startup) -> anyhow::Result<()> {
         last_paint: None,
         input_redraw: false,
         error: None,
+        #[cfg(target_os = "linux")]
+        local_wake: {
+            let proxy = proxy.clone();
+            sync::Arc::new(move || {
+                let _ = proxy.send_event(Event::Repaint(time::Instant::now()));
+            })
+        },
     };
     let result = event_loop.run_app(&mut app);
     // Idempotent fallback for event-loop initialization failures; normally the

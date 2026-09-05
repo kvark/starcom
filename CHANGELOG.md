@@ -19,12 +19,13 @@ Tabs, mouse, paste, session create, SFTP drops, and an About panel after
 - **Mouse.** Unmodified left clicks are forwarded when the pane asked for mouse
   reports. Drags, modified clicks, and double/triple clicks stay local
   selection. The wheel already went to the application in that case.
-- **File drop.** Files dropped on a connected pane upload over SFTP into the
-  remote temp directory, then the remote paths are pasted. A status-bar
-  progress bar tracks large files. Directories and files larger than 32 MiB
-  are skipped. The upload is a separate SSH connection, so it cannot stall
-  the tmux control channel. Wayland binds `wl_data_device` itself so the
-  compositor accepts the drop.
+- **File drop.** Up to eight files dropped with a connected pane focused upload
+  over SFTP into the remote temp directory, then the remote paths are pasted. A
+  status-bar progress bar tracks large files. Non-regular files and files larger
+  than 32 MiB are rejected. The upload is a separate, cancellable SSH connection,
+  so it cannot stall the tmux control channel. Delayed completion remains bound
+  to the original pane generation. Wayland binds `wl_data_device` itself and
+  reads bounded URI data off the event thread so the compositor stays responsive.
 - **About.** The tab strip has an About button on the right. It opens a modal
   with the icon, version, GitHub URL, author, total time Starcom has been
   open, and the workspace `fps` / `idle` settings.

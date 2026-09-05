@@ -22,6 +22,20 @@ enum UploadEvent {
     Failed(String),
 }
 
+struct Upload {
+    events: sync::mpsc::Receiver<UploadEvent>,
+    /// The exact pane generation on which the files were dropped. Completion
+    /// must never mint a fresh target after a reconnect or layout change.
+    target: desktop::Target,
+    cancel: sync::Arc<sync::atomic::AtomicBool>,
+}
+
+impl Drop for Upload {
+    fn drop(&mut self) {
+        self.cancel.store(true, sync::atomic::Ordering::Release);
+    }
+}
+
 pub struct Form {
     destination: String,
     host: String,
@@ -281,7 +295,7 @@ pub struct DesktopUi {
     creating: Option<String>,
     /// In-flight SFTP upload from a file drop. The control worker is not
     /// involved; progress and completion are polled on the next frames.
-    upload: Option<sync::mpsc::Receiver<UploadEvent>>,
+    upload: Option<Upload>,
     upload_progress: Option<(String, u64, u64)>,
     /// Whether a local SSH agent looked reachable, and when that was last
     /// asked. A hint for the form only; the connection still authenticates as
@@ -972,21 +986,25 @@ impl DesktopUi {
         let mut action = Action::None;
         let mut steps: Vec<Step> = Vec::new();
         let connection_epoch = state.epoch();
-        if let Some(paths) = self.poll_upload(root.ctx()) {
+        if let Some((target, paths)) = self.poll_upload(root.ctx()) {
             let n = paths.len();
             let label = if n == 1 { "file" } else { "files" };
-            self.notice = Some(format!("Uploaded {n} {label}."));
-            self.notice_until = Some(time::Instant::now() + time::Duration::from_secs(3));
-            if let Some(text) = paste_remote_paths(&paths)
-                && state.input_ready()
-                && let Some(target) = self.focused.and_then(|pane| state.target(pane))
-            {
-                match terminal_input::Paste::new(&text) {
+            if state.target(target.pane()) == Some(target) {
+                self.notice = Some(format!("Uploaded {n} {label}."));
+                self.notice_until = Some(time::Instant::now() + time::Duration::from_secs(3));
+                match paste_remote_paths(&paths)
+                    .and_then(|text| terminal_input::Paste::new(&text).map_err(anyhow::Error::from))
+                {
                     Ok(paste) => {
                         steps.push(Step::Send(target, terminal_input::Action::Paste(paste)))
                     }
                     Err(error) => self.notice = Some(error.to_string()),
                 }
+            } else {
+                self.notice = Some(format!(
+                    "Uploaded {n} {label}, but the original pane changed; paths were not pasted."
+                ));
+                self.notice_until = Some(time::Instant::now() + time::Duration::from_secs(5));
             }
         }
 
@@ -1040,7 +1058,8 @@ impl DesktopUi {
                                 | desktop::Phase::Reconnecting
                                 | desktop::Phase::Resynchronizing
                         ) {
-                            ui.ctx().request_repaint();
+                            ui.ctx()
+                                .request_repaint_after(time::Duration::from_millis(50));
                         }
                         if let Some(rtt) = state.last_rtt {
                             ui.separator();
@@ -1364,6 +1383,11 @@ impl DesktopUi {
             self.notice_until = None;
             return;
         }
+        let Some(target) = self.focused.and_then(|pane| state.target(pane)) else {
+            self.notice = Some("Click a live pane before dropping files.".to_owned());
+            self.notice_until = None;
+            return;
+        };
         let options = match self.form.connection() {
             Ok(connection) => connection.options,
             Err(error) => {
@@ -1372,22 +1396,25 @@ impl DesktopUi {
                 return;
             }
         };
-        let (tx, rx) = sync::mpsc::channel();
-        self.upload = Some(rx);
-        self.upload_progress = Some(("…".to_owned(), 0, 0));
-        self.notice = None;
-        self.notice_until = None;
-        let _ = thread::Builder::new()
+        let (tx, rx) = sync::mpsc::sync_channel(4);
+        let cancel = sync::Arc::new(sync::atomic::AtomicBool::new(false));
+        let worker_cancel = sync::Arc::clone(&cancel);
+        let worker = thread::Builder::new()
             .name("starcom-sftp".to_owned())
             .spawn(move || {
                 let progress = tx.clone();
-                let result = crate::sftp::put_files(&options, &files, |update| {
-                    let _ = progress.send(UploadEvent::Progress {
-                        name: update.name.to_owned(),
-                        done: update.done,
-                        total: update.total,
-                    });
-                });
+                let result = crate::sftp::put_files_while(
+                    &options,
+                    &files,
+                    || !worker_cancel.load(sync::atomic::Ordering::Acquire),
+                    |update| {
+                        let _ = progress.try_send(UploadEvent::Progress {
+                            name: update.name.to_owned(),
+                            done: update.done,
+                            total: update.total,
+                        });
+                    },
+                );
                 let _ = tx.send(match result {
                     Ok(paths) => UploadEvent::Done(paths),
                     Err(error) => {
@@ -1395,20 +1422,37 @@ impl DesktopUi {
                     }
                 });
             });
+        match worker {
+            Ok(_) => {
+                self.upload = Some(Upload {
+                    events: rx,
+                    target,
+                    cancel,
+                });
+                self.upload_progress = Some(("…".to_owned(), 0, 0));
+                self.notice = None;
+                self.notice_until = None;
+            }
+            Err(error) => {
+                self.notice = Some(format!("Could not start file upload: {error}"));
+                self.notice_until = None;
+            }
+        }
     }
 
-    fn poll_upload(&mut self, ctx: &egui::Context) -> Option<Vec<String>> {
-        let rx = self.upload.as_ref()?;
+    fn poll_upload(&mut self, ctx: &egui::Context) -> Option<(desktop::Target, Vec<String>)> {
+        let upload = self.upload.as_ref()?;
+        let target = upload.target;
         let mut last_progress = None;
         loop {
-            match rx.try_recv() {
+            match upload.events.try_recv() {
                 Ok(UploadEvent::Progress { name, done, total }) => {
                     last_progress = Some((name, done, total));
                 }
                 Ok(UploadEvent::Done(paths)) => {
                     self.upload = None;
                     self.upload_progress = None;
-                    return Some(paths);
+                    return Some((target, paths));
                 }
                 Ok(UploadEvent::Failed(error)) => {
                     self.upload = None;
@@ -1507,12 +1551,12 @@ fn upload_label(name: &str, done: u64, total: u64) -> String {
     }
 }
 
-fn paste_remote_paths(paths: &[String]) -> Option<String> {
+fn paste_remote_paths(paths: &[String]) -> anyhow::Result<String> {
     let quoted: anyhow::Result<Vec<_>> = paths
         .iter()
         .map(|path| crate::command::shell_quote(path))
         .collect();
-    quoted.ok().map(|paths| paths.join(" "))
+    quoted.map(|paths| paths.join(" "))
 }
 
 /// Click-only: arrows, Tab, and Escape must stay with the focused pane.
