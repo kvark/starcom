@@ -557,6 +557,10 @@ impl Workspace {
                 .is_some_and(|tab| tab.ui.terminal_focused(ctx))
     }
 
+    pub(crate) fn set_notice(&mut self, notice: String) {
+        self.notice = Some(notice);
+    }
+
     fn close_shortcut_action(&self) -> Action {
         let Some(tab) = self.tabs.get(self.active) else {
             return Action::None;

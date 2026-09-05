@@ -11,8 +11,9 @@
 //! closing #1881). egui-winit 0.34 still pins winit ^0.30.13, so we keep the
 //! guest bind until that bump. Do not extract this into navigato-rs.
 
-use std::{io, os::fd::AsFd, path};
+use std::{io, os::fd::AsFd, path, sync, thread, time};
 
+use anyhow::Context;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use wayland_backend::sys::client::Backend;
 use wayland_client::{
@@ -28,10 +29,15 @@ use wayland_client::{
 };
 
 const URI_LIST: &str = "text/uri-list";
+const MAX_URI_LIST_BYTES: usize = 64 * 1024;
+const MAX_DROPPED_FILES: usize = 8;
+const DROP_READ_TIMEOUT: time::Duration = time::Duration::from_secs(5);
+type Wake = sync::Arc<dyn Fn() + Send + Sync>;
 
 pub struct Pump {
     pub hovering: bool,
     pub dropped: Vec<path::PathBuf>,
+    pub error: Option<String>,
 }
 
 pub struct WaylandDrop {
@@ -53,10 +59,13 @@ struct State {
     uri_list: bool,
     hovering: bool,
     dropped: Vec<path::PathBuf>,
+    pending: Option<sync::mpsc::Receiver<Result<Vec<path::PathBuf>, String>>>,
+    error: Option<String>,
+    wake: Wake,
 }
 
 impl WaylandDrop {
-    pub fn attach(window: &winit::window::Window) -> Option<Self> {
+    pub fn attach(window: &winit::window::Window, wake: Wake) -> Option<Self> {
         let display = window.display_handle().ok()?;
         let RawDisplayHandle::Wayland(display) = display.as_raw() else {
             return None;
@@ -89,6 +98,9 @@ impl WaylandDrop {
             uri_list: false,
             hovering: false,
             dropped: Vec::new(),
+            pending: None,
+            error: None,
+            wake,
         };
         if let Err(error) = queue.roundtrip(&mut state) {
             log::warn!("Wayland file-drop registry: {error}");
@@ -105,9 +117,11 @@ impl WaylandDrop {
     pub fn pump(&mut self) -> Pump {
         let _ = self.conn.flush();
         let _ = self.queue.dispatch_pending(&mut self.state);
+        self.state.finish_pending();
         Pump {
             hovering: self.state.hovering,
             dropped: std::mem::take(&mut self.state.dropped),
+            error: self.state.error.take(),
         }
     }
 }
@@ -147,6 +161,7 @@ impl State {
             return;
         };
         let Ok((mut reader, writer)) = io::pipe() else {
+            self.error = Some("could not create the file-drop pipe".to_owned());
             return;
         };
         offer.receive(URI_LIST.to_owned(), writer.as_fd());
@@ -155,17 +170,92 @@ impl State {
             offer.finish();
         }
         let _ = conn.flush();
-        let mut text = String::new();
-        if io::Read::read_to_string(&mut reader, &mut text).is_err() {
-            return;
-        }
-        self.dropped = parse_uri_list(&text);
         self.hovering = false;
         self.uri_list = false;
+        if self.pending.is_some() {
+            self.error = Some("another Wayland file drop is still being read".to_owned());
+            return;
+        }
+        let (tx, rx) = sync::mpsc::sync_channel(1);
+        let wake = sync::Arc::clone(&self.wake);
+        match thread::Builder::new()
+            .name("starcom-wayland-drop".to_owned())
+            .spawn(move || {
+                let result = read_uri_list(&mut reader).map_err(|error| error.to_string());
+                let _ = tx.send(result);
+                wake();
+            }) {
+            Ok(_) => self.pending = Some(rx),
+            Err(error) => self.error = Some(format!("could not read the file drop: {error}")),
+        }
+    }
+
+    fn finish_pending(&mut self) {
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        match pending.try_recv() {
+            Ok(Ok(files)) => {
+                self.dropped = files;
+                self.pending = None;
+            }
+            Ok(Err(error)) => {
+                self.error = Some(error.chars().take(512).collect());
+                self.pending = None;
+            }
+            Err(sync::mpsc::TryRecvError::Empty) => {}
+            Err(sync::mpsc::TryRecvError::Disconnected) => {
+                self.error = Some("Wayland file drop ended without a result".to_owned());
+                self.pending = None;
+            }
+        }
     }
 }
 
-fn parse_uri_list(text: &str) -> Vec<path::PathBuf> {
+fn read_uri_list(reader: &mut io::PipeReader) -> anyhow::Result<Vec<path::PathBuf>> {
+    let poller = polling::Poller::new()?;
+    // SAFETY: this function owns the reader and deregisters it below before
+    // either the poller or reader can be dropped.
+    unsafe { poller.add(&*reader, polling::Event::readable(0)) }?;
+    let result = (|| {
+        let deadline = time::Instant::now() + DROP_READ_TIMEOUT;
+        let mut events = polling::Events::new();
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let remaining = deadline
+                .checked_duration_since(time::Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| anyhow::anyhow!("Wayland file drop timed out"))?;
+            poller.modify(&*reader, polling::Event::readable(0))?;
+            events.clear();
+            match poller.wait(&mut events, Some(remaining)) {
+                Ok(0) => anyhow::bail!("Wayland file drop timed out"),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+            match io::Read::read(reader, &mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    anyhow::ensure!(
+                        bytes.len() + count <= MAX_URI_LIST_BYTES,
+                        "Wayland file drop exceeds {MAX_URI_LIST_BYTES} bytes"
+                    );
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let text = String::from_utf8(bytes).context("Wayland file drop is not UTF-8")?;
+        parse_uri_list(&text)
+    })();
+    let _ = poller.delete(&*reader);
+    result
+}
+
+fn parse_uri_list(text: &str) -> anyhow::Result<Vec<path::PathBuf>> {
     let mut files = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -173,26 +263,37 @@ fn parse_uri_list(text: &str) -> Vec<path::PathBuf> {
             continue;
         }
         if let Some(path) = decode_file_uri(line) {
+            anyhow::ensure!(
+                files.len() < MAX_DROPPED_FILES,
+                "drop at most {MAX_DROPPED_FILES} files at a time"
+            );
             files.push(path);
         }
     }
-    files
+    anyhow::ensure!(!files.is_empty(), "file drop contains no local files");
+    Ok(files)
 }
 
 fn decode_file_uri(uri: &str) -> Option<path::PathBuf> {
     let rest = uri.strip_prefix("file://")?;
-    let path = if let Some(tail) = rest.strip_prefix("localhost") {
-        tail
-    } else if rest.starts_with('/') {
+    let path = if rest.starts_with('/') {
         rest
     } else {
-        rest.find('/').map(|index| &rest[index..])?
+        let slash = rest.find('/')?;
+        let authority = &rest[..slash];
+        if !authority.eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+        &rest[slash..]
     };
     let mut bytes = Vec::with_capacity(path.len());
     let raw = path.as_bytes();
     let mut index = 0;
     while index < raw.len() {
-        if raw[index] == b'%' && index + 2 < raw.len() {
+        if raw[index] == b'%' {
+            if index + 2 >= raw.len() {
+                return None;
+            }
             let hex = std::str::from_utf8(&raw[index + 1..index + 3]).ok()?;
             bytes.push(u8::from_str_radix(hex, 16).ok()?);
             index += 3;
@@ -203,7 +304,7 @@ fn decode_file_uri(uri: &str) -> Option<path::PathBuf> {
     }
     String::from_utf8(bytes)
         .ok()
-        .filter(|path| path.starts_with('/'))
+        .filter(|path| path.starts_with('/') && !path.contains('\0'))
         .map(path::PathBuf::from)
 }
 
@@ -346,10 +447,30 @@ mod tests {
             decode_file_uri("file://localhost/tmp/a%20b.png").unwrap(),
             path::PathBuf::from("/tmp/a b.png")
         );
+        assert!(decode_file_uri("file://other-host/tmp/private").is_none());
+        assert!(decode_file_uri("file:///tmp/bad%").is_none());
         assert!(decode_file_uri("https://example.test/x").is_none());
+        assert!(parse_uri_list("https://example.test/x\n").is_err());
         assert_eq!(
-            parse_uri_list("# comment\nfile:///tmp/a\n\nfile:///tmp/b\n").len(),
+            parse_uri_list("# comment\nfile:///tmp/a\n\nfile:///tmp/b\n")
+                .unwrap()
+                .len(),
             2
         );
+        let too_many = "file:///tmp/a\n".repeat(MAX_DROPPED_FILES + 1);
+        assert!(parse_uri_list(&too_many).is_err());
+    }
+
+    #[test]
+    fn uri_list_pipe_is_read_to_eof() {
+        let (mut reader, mut writer) = io::pipe().unwrap();
+        let sender = thread::spawn(move || {
+            io::Write::write_all(&mut writer, b"file:///tmp/a%20b\n").unwrap();
+        });
+        assert_eq!(
+            read_uri_list(&mut reader).unwrap(),
+            vec![path::PathBuf::from("/tmp/a b")]
+        );
+        sender.join().unwrap();
     }
 }

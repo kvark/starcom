@@ -35,7 +35,7 @@ dropped instead of leaving a stuck New connection chip; a named destination
 keeps its label so you can reconnect. Restored tabs that have not been attached
 this session keep their destination labels. Tabs are green while connected,
 including while a pane layout is rebuilt. They turn yellow while connecting or
-reconnecting, and red after a failure.
+reconnecting, and use a yellow background with a light-red title after a failure.
 Ctrl-Shift-W/Cmd-W closes the tab and detaches that Starcom client; the tmux
 server and remote jobs continue running.
 
@@ -192,13 +192,16 @@ word, and triple-click for a line. Selection anchors live in the terminal
 model, so they follow incoming scrolls. Copying handles wide cells, combining
 characters, and soft wraps, with a 1 MiB output limit.
 
-Drop files onto a connected window to upload them over SFTP into the remote
-temp directory (`/tmp`), under unique `starcom-…` names. The remote paths are
-then pasted into the focused pane. A progress bar sits in the status bar while
-a large file is in flight. Directories and files larger than 32 MiB are
-skipped. The upload uses its own SSH connection, so it cannot stall the tmux
-control channel. On Wayland, Starcom binds `wl_data_device` itself because
-winit 0.30 does not; winit master already has this for 0.31.
+Focus a connected pane, then drop up to eight files onto the window to upload
+them over SFTP into the remote temp directory (`/tmp`), under unique
+`starcom-…` names. The remote paths are then pasted into the focused pane. A
+progress bar sits in the status bar while a large file is in flight. Non-regular
+files and files larger than 32 MiB are rejected. Switching tabs or closing the
+form cancels the upload; delayed completion never pastes into a replacement pane
+after a reconnect or layout change. The upload uses its own SSH connection, so
+it cannot stall the tmux control channel. On Wayland, Starcom binds
+`wl_data_device` itself because winit 0.30 does not; the bounded URI-list read
+runs off the event thread.
 
 The renderer paints only visible history rows. Font-size controls change the
 cell metrics used both to paint and to tell tmux this client's size, so the

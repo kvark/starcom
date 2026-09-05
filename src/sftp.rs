@@ -28,6 +28,17 @@ pub struct Progress<'a> {
 pub fn put_files(
     options: &ssh::Options,
     files: &[path::PathBuf],
+    on_progress: impl FnMut(Progress<'_>),
+) -> anyhow::Result<Vec<String>> {
+    put_files_while(options, files, || true, on_progress)
+}
+
+/// Cancellable form used by the desktop. `keep_going` is checked before any
+/// connection and between bounded SFTP writes.
+pub(crate) fn put_files_while(
+    options: &ssh::Options,
+    files: &[path::PathBuf],
+    mut keep_going: impl FnMut() -> bool,
     mut on_progress: impl FnMut(Progress<'_>),
 ) -> anyhow::Result<Vec<String>> {
     anyhow::ensure!(!files.is_empty(), "no files to upload");
@@ -41,10 +52,14 @@ pub fn put_files(
         .unwrap_or(0);
     let mut prepared = Vec::new();
     for (index, file) in files.iter().enumerate() {
+        ensure_running(&mut keep_going)?;
         let name = remote_file_name(file).with_context(|| format!("{}", file.display()))?;
         let remote_name = unique_remote_name(&name, stamp, index)?;
         let meta = fs::metadata(file).with_context(|| format!("stat {}", file.display()))?;
-        anyhow::ensure!(!meta.is_dir(), "{} is a directory; drop files only", name);
+        anyhow::ensure!(
+            meta.is_file(),
+            "{name} is not a regular file; drop files only"
+        );
         anyhow::ensure!(
             meta.len() <= MAX_FILE_BYTES,
             "{name} is larger than {} MiB",
@@ -56,6 +71,7 @@ pub fn put_files(
     let mut options = options.clone();
     options.timeout = options.timeout.max(time::Duration::from_secs(30));
     let deadline = time::Instant::now() + time::Duration::from_secs(300);
+    ensure_running(&mut keep_going)?;
     let channel = ssh::Connection::connect(&options)?.subsystem("sftp")?;
     let mut session = Session::new(channel, deadline);
 
@@ -76,32 +92,49 @@ pub fn put_files(
     session.send(&[])?;
     let dir = session.realpath()?;
     anyhow::ensure!(
-        !dir.is_empty() && dir.len() <= 1024 && !dir.contains('\0'),
+        dir.starts_with('/') && dir.len() <= 1024 && !dir.chars().any(char::is_control),
         "SFTP temp path is unusable"
     );
 
     let mut remote = Vec::new();
-    for (file, dest_name, name, total) in prepared {
-        let dest = join_remote(&dir, &dest_name);
-        anyhow::ensure!(
-            dest.len() <= 1024,
-            "{name}: remote path exceeds SFTP path limit"
-        );
-        on_progress(Progress {
-            name: &name,
-            done: 0,
-            total,
-        });
-        session.put(&file, &dest, |done| {
+    let upload = (|| -> anyhow::Result<()> {
+        for (file, dest_name, name, total) in prepared {
+            ensure_running(&mut keep_going)?;
+            let dest = join_remote(&dir, &dest_name);
+            anyhow::ensure!(
+                dest.len() <= 1024,
+                "{name}: remote path exceeds SFTP path limit"
+            );
             on_progress(Progress {
                 name: &name,
-                done,
+                done: 0,
                 total,
             });
-        })?;
-        remote.push(dest);
+            session.put(&file, &dest, total, &mut keep_going, |done| {
+                on_progress(Progress {
+                    name: &name,
+                    done,
+                    total,
+                });
+            })?;
+            remote.push(dest);
+        }
+        Ok(())
+    })();
+    if let Err(error) = upload {
+        // The UI pastes an entire batch or none of it. Best-effort removal
+        // avoids leaving earlier files behind when a later file fails.
+        for path in remote.iter().rev() {
+            let _ = session.remove(path);
+        }
+        return Err(error);
     }
     Ok(remote)
+}
+
+fn ensure_running(keep_going: &mut impl FnMut() -> bool) -> anyhow::Result<()> {
+    anyhow::ensure!(keep_going(), "SFTP upload cancelled");
+    Ok(())
 }
 
 /// File name used on the host. Rejects path separators so a drop cannot
@@ -336,6 +369,8 @@ impl Session {
         &mut self,
         local: &path::Path,
         remote: &str,
+        expected: u64,
+        keep_going: &mut impl FnMut() -> bool,
         mut on_progress: impl FnMut(u64),
     ) -> anyhow::Result<()> {
         use sunset_sftp::client::pflags;
@@ -344,7 +379,9 @@ impl Session {
         self.sftp
             .open(
                 remote,
-                pflags::WRITE | pflags::CREAT | pflags::TRUNC,
+                // EXCL makes the timestamped name fail safely in the unlikely
+                // event of a collision instead of overwriting a remote file.
+                pflags::WRITE | pflags::CREAT | pflags::EXCL,
                 &Attrs::default(),
             )
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -355,37 +392,66 @@ impl Session {
             other => anyhow::bail!("SFTP open {remote}: unexpected {other}"),
         };
 
-        let mut file =
-            fs::File::open(local).with_context(|| format!("open {}", local.display()))?;
-        let mut buffer = vec![0; sunset_sftp::client::MAX_WRITE_LEN as usize];
-        let mut offset = 0u64;
-        loop {
-            let count = io::Read::read(&mut file, &mut buffer)
-                .with_context(|| format!("read {}", local.display()))?;
-            if count == 0 {
-                break;
+        let result = (|| {
+            let mut file =
+                fs::File::open(local).with_context(|| format!("open {}", local.display()))?;
+            let mut buffer = vec![0; sunset_sftp::client::MAX_WRITE_LEN as usize];
+            let mut offset = 0u64;
+            loop {
+                ensure_running(keep_going)?;
+                let count = io::Read::read(&mut file, &mut buffer)
+                    .with_context(|| format!("read {}", local.display()))?;
+                if count == 0 {
+                    break;
+                }
+                anyhow::ensure!(
+                    offset.saturating_add(count as u64) <= expected
+                        && offset.saturating_add(count as u64) <= MAX_FILE_BYTES,
+                    "{} changed size while it was being uploaded",
+                    local.display()
+                );
+                self.sftp
+                    .write(&handle, offset, count)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                self.send(&buffer[..count])?;
+                match self.event()? {
+                    Event::Status(sunset_sftp::protocol::StatusCode::SSH_FX_OK) => {}
+                    Event::Status(code) => anyhow::bail!("SFTP write {remote}: {code}"),
+                    other => anyhow::bail!("SFTP write {remote}: unexpected {other}"),
+                }
+                offset += count as u64;
+                on_progress(offset);
             }
+            anyhow::ensure!(
+                offset == expected,
+                "{} changed size while it was being uploaded",
+                local.display()
+            );
             self.sftp
-                .write(&handle, offset, count)
+                .close(&handle)
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
-            self.send(&buffer[..count])?;
+            self.send(&[])?;
             match self.event()? {
-                Event::Status(sunset_sftp::protocol::StatusCode::SSH_FX_OK) => {}
-                Event::Status(code) => anyhow::bail!("SFTP write {remote}: {code}"),
-                other => anyhow::bail!("SFTP write {remote}: unexpected {other}"),
+                Event::Status(sunset_sftp::protocol::StatusCode::SSH_FX_OK) => Ok(()),
+                Event::Status(code) => anyhow::bail!("SFTP close {remote}: {code}"),
+                other => anyhow::bail!("SFTP close {remote}: unexpected {other}"),
             }
-            offset += count as u64;
-            on_progress(offset);
+        })();
+        if result.is_err() {
+            let _ = self.remove(remote);
         }
+        result
+    }
 
+    fn remove(&mut self, remote: &str) -> anyhow::Result<()> {
         self.sftp
-            .close(&handle)
+            .remove(remote)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         self.send(&[])?;
         match self.event()? {
             Event::Status(sunset_sftp::protocol::StatusCode::SSH_FX_OK) => Ok(()),
-            Event::Status(code) => anyhow::bail!("SFTP close {remote}: {code}"),
-            other => anyhow::bail!("SFTP close {remote}: unexpected {other}"),
+            Event::Status(code) => anyhow::bail!("SFTP remove {remote}: {code}"),
+            other => anyhow::bail!("SFTP remove {remote}: unexpected {other}"),
         }
     }
 }
