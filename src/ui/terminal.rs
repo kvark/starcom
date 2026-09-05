@@ -150,6 +150,7 @@ impl PaneUi {
         controls: bool,
         can_kill: bool,
         neighbors: layout::Neighbors,
+        zoomed: bool,
         frozen: bool,
     ) -> Vec<input::Action> {
         self.rect = rect;
@@ -659,11 +660,12 @@ impl PaneUi {
                                             {
                                                 events.push(input::Action::KillPane);
                                             }
-                                            if chrome_button(
-                                                ui,
-                                                ChromeIcon::Zoom,
-                                                "Maximize / restore this pane",
-                                            ) {
+                                            let (zoom_icon, zoom_tip) = if zoomed {
+                                                (ChromeIcon::Restore, "Restore pane layout")
+                                            } else {
+                                                (ChromeIcon::Zoom, "Maximize this pane")
+                                            };
+                                            if chrome_button(ui, zoom_icon, zoom_tip) {
                                                 events.push(input::Action::ZoomPane);
                                                 ui.ctx()
                                                     .memory_mut(|memory| memory.request_focus(id));
@@ -728,6 +730,7 @@ enum ChromeIcon {
     MoveUp,
     MoveDown,
     Zoom,
+    Restore,
     Close,
 }
 
@@ -787,6 +790,19 @@ fn paint_chrome_icon(
         }
         ChromeIcon::Zoom => {
             painter.rect_stroke(rect.shrink(0.5), 1.5, stroke, egui::StrokeKind::Outside);
+        }
+        ChromeIcon::Restore => {
+            let back = egui::Rect::from_min_max(
+                rect.min + egui::vec2(2.0, 0.0),
+                rect.max - egui::vec2(0.0, 2.0),
+            );
+            let front = egui::Rect::from_min_max(
+                rect.min + egui::vec2(0.0, 2.0),
+                rect.max - egui::vec2(2.0, 0.0),
+            );
+            painter.rect_stroke(back, 1.0, stroke, egui::StrokeKind::Outside);
+            painter.rect_filled(front, 1.0, BACKGROUND);
+            painter.rect_stroke(front, 1.0, stroke, egui::StrokeKind::Outside);
         }
         ChromeIcon::Close => {
             let r = rect.shrink(1.0);

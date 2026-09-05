@@ -265,6 +265,7 @@ pub struct DesktopUi {
     font_size: f32,
     generation: u64,
     windows: collections::BTreeMap<tmuxctl::WindowId, layout::Node>,
+    zoomed_windows: collections::BTreeSet<tmuxctl::WindowId>,
     window: Option<tmuxctl::WindowId>,
     focused: Option<tmuxctl::PaneId>,
     pane_ui: collections::BTreeMap<tmuxctl::PaneId, terminal::PaneUi>,
@@ -319,6 +320,7 @@ impl DesktopUi {
             font_size: 14.0,
             generation: u64::MAX,
             windows: collections::BTreeMap::new(),
+            zoomed_windows: collections::BTreeSet::new(),
             window: None,
             focused: None,
             pane_ui: collections::BTreeMap::new(),
@@ -756,12 +758,13 @@ impl DesktopUi {
                         let can_connect =
                             host_ready && !self.form.session.trim().is_empty() && idle && !connecting;
                         let connect_label = if connecting {
-                            format!("{} Connecting…", spinner(ui.ctx()))
+                            "   Connecting…"
                         } else {
-                            "Connect".to_owned()
+                            "Connect"
                         };
                         if connecting {
-                            ui.ctx().request_repaint();
+                            ui.ctx()
+                                .request_repaint_after(time::Duration::from_millis(50));
                         }
                         let connect = ui.add_enabled(
                             can_connect || connecting,
@@ -770,6 +773,16 @@ impl DesktopUi {
                                 .min_size(egui::vec2(112.0, 28.0))
                                 .sense(egui::Sense::CLICK),
                         );
+                        if connecting {
+                            let indicator = egui::Rect::from_center_size(
+                                egui::pos2(
+                                    connect.rect.left() + 14.0,
+                                    connect.rect.center().y,
+                                ),
+                                egui::vec2(14.0, 14.0),
+                            );
+                            paint_activity_indicator(ui, indicator, ui.ctx().time());
+                        }
                         if connect.clicked() && !connecting {
                             match self.form.connection() {
                                 Ok(connection) => {
@@ -894,6 +907,7 @@ impl DesktopUi {
         }
         let previous_focus = self.focused;
         self.windows.clear();
+        self.zoomed_windows.clear();
         self.pane_ui.clear();
         self.focused = None;
         if let Some(ref view) = state.view {
@@ -911,6 +925,9 @@ impl DesktopUi {
                 && let Some(panes) = grouped.get(&id)
             {
                 if let Some(node) = layout::Node::from_panes_or_zoom(panes) {
+                    if layout::Node::is_zoomed(panes) {
+                        self.zoomed_windows.insert(id);
+                    }
                     let visible = node.pane_ids();
                     self.focused = previous_focus
                         .filter(|pane| visible.contains(pane))
@@ -1006,13 +1023,16 @@ impl DesktopUi {
                 ui.with_layout(
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        let spin = spinner(ui.ctx());
                         egui::Frame::NONE
                             .fill(ui.visuals().code_bg_color)
                             .corner_radius(4.0)
                             .inner_margin(egui::Margin::symmetric(6, 2))
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(spin).monospace());
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(14.0, 14.0),
+                                    egui::Sense::hover(),
+                                );
+                                paint_activity_indicator(ui, rect, ui.ctx().time());
                             });
                         if matches!(
                             state.phase,
@@ -1210,6 +1230,7 @@ impl DesktopUi {
                     let generation = self.generation;
                     let font_size = self.font_size;
                     let pane_ui = &mut self.pane_ui;
+                    let zoomed = self.zoomed_windows.contains(&id);
                     let focused = &mut self.focused;
                     let notice = &mut self.notice;
                     let notice_until = &mut self.notice_until;
@@ -1249,6 +1270,7 @@ impl DesktopUi {
                                     controls,
                                     can_kill,
                                     neighbors,
+                                    zoomed,
                                     !matches!(
                                         state.phase,
                                         desktop::Phase::Watching | desktop::Phase::Demo
@@ -1498,8 +1520,20 @@ fn click_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::R
     ui.add(egui::Button::new(text).sense(egui::Sense::CLICK))
 }
 
-fn spinner(ctx: &egui::Context) -> &'static str {
-    ["|", "/", "-", "\\"][((ctx.time() * 8.0) as usize) % 4]
+/// A fixed-size activity mark. The orbit moves, while its outline and occupied
+/// space stay constant, so tab and button labels do not pulse in width or size.
+pub(crate) fn paint_activity_indicator(ui: &egui::Ui, rect: egui::Rect, time: f64) {
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.34;
+    let color = ui.visuals().strong_text_color();
+    ui.painter().circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(1.0, color.gamma_multiply(0.35)),
+    );
+    let angle = (time as f32 * std::f32::consts::TAU * 1.4) - std::f32::consts::FRAC_PI_2;
+    let dot = center + egui::vec2(angle.cos(), angle.sin()) * radius;
+    ui.painter().circle_filled(dot, 1.8, color);
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
