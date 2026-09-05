@@ -23,6 +23,8 @@ struct Tab {
 
 pub(crate) enum Action {
     None,
+    ReopenSaved,
+    StartFresh,
     New,
     Select(u64),
     Close(u64),
@@ -40,6 +42,10 @@ pub(crate) struct Workspace {
     /// The "+" form. Not a registered tab until Connect succeeds.
     composer: Tab,
     composer_open: bool,
+    /// A saved workspace needs an explicit, atomic startup decision. Until the
+    /// user chooses, its tabs exist only as disconnected forms behind this
+    /// prompt and cannot be mixed with a new composer tab.
+    restore_choice: Option<usize>,
     next: u64,
     wake: Wake,
     config: sync::Arc<ssh_config::Config>,
@@ -61,6 +67,9 @@ pub(crate) struct Workspace {
     /// GUI-side copy of the last event-loop clock, used to notice a machine
     /// sleep while the SSH worker is blocked in poll.
     suspend_clock: reconnect::AliveClock,
+    /// The winit lifecycle can ask us to shut down through more than one path.
+    /// Only the first call may persist and clear the tab list.
+    shut_down: bool,
 }
 
 /// A restored tab is labelled by where it points, not by a live connection.
@@ -226,6 +235,7 @@ impl Workspace {
                 None,
             )?,
             composer_open: true,
+            restore_choice: None,
             next: 2,
             wake,
             config: sync::Arc::new(ssh_config::Config::default()),
@@ -244,6 +254,7 @@ impl Workspace {
             session_started: time::Instant::now(),
             echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
+            shut_down: false,
         };
         if startup != desktop::Startup::Demo {
             workspace.reload_config();
@@ -305,6 +316,7 @@ impl Workspace {
         }
         self.active = saved.active.min(self.tabs.len().saturating_sub(1));
         self.composer_open = self.tabs.is_empty();
+        self.restore_choice = (!self.tabs.is_empty()).then_some(self.tabs.len());
         self.fps = store::clamp_fps(saved.fps);
         self.idle = saved.idle.min(store::MAX_IDLE);
         self.open_secs = saved.open_secs.min(store::MAX_OPEN_SECS);
@@ -573,7 +585,45 @@ impl Workspace {
         }
     }
 
+    fn show_restore_choice(root: &mut egui::Ui, count: usize) -> Action {
+        let mut action = Action::None;
+        egui::CentralPanel::default().show_inside(root, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.heading("Continue where you left off?");
+                ui.add_space(10.0);
+                let tabs = if count == 1 { "tab" } else { "tabs" };
+                ui.label(format!("Starcom found {count} saved connection {tabs}."));
+                ui.weak(
+                    "Reopen every saved tab together, or discard them and begin with an empty workspace.",
+                );
+                ui.weak("Reopening fills the connection forms; nothing connects automatically.");
+                ui.add_space(18.0);
+                ui.horizontal_centered(|ui| {
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("Reopen saved tabs").strong(),
+                        ).min_size(egui::vec2(160.0, 36.0)))
+                        .clicked()
+                    {
+                        action = Action::ReopenSaved;
+                    }
+                    if ui
+                        .add(egui::Button::new("Start fresh").min_size(egui::vec2(110.0, 36.0)))
+                        .clicked()
+                    {
+                        action = Action::StartFresh;
+                    }
+                });
+            });
+        });
+        action
+    }
+
     pub fn show(&mut self, root: &mut egui::Ui) -> Action {
+        if let Some(count) = self.restore_choice {
+            return Self::show_restore_choice(root, count);
+        }
         let mut navigation = Action::None;
         let mut reorder: Option<(u64, usize)> = None;
         let new = egui::KeyboardShortcut::new(
@@ -854,6 +904,21 @@ impl Workspace {
         let result = (|| -> anyhow::Result<()> {
             match action {
                 Action::None => {}
+                Action::ReopenSaved => {
+                    self.restore_choice = None;
+                    self.composer_open = self.tabs.is_empty();
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.ui.arm_focus_restore();
+                    }
+                }
+                Action::StartFresh => {
+                    self.cancel_transient();
+                    self.tabs.clear();
+                    self.active = 0;
+                    self.composer_open = true;
+                    self.restore_choice = None;
+                    self.persist();
+                }
                 Action::New => {
                     self.open_composer();
                 }
@@ -1025,6 +1090,10 @@ impl Workspace {
     }
 
     pub fn shutdown(&mut self) {
+        if self.shut_down {
+            return;
+        }
+        self.shut_down = true;
         self.cancel_transient();
         // Save before dropping the tabs: the forms are the thing being saved.
         self.persist();
@@ -1203,7 +1272,7 @@ mod tests {
         assert_eq!(workspace.tabs[1].client.phase(), desktop::Phase::Idle);
     }
     #[test]
-    fn saved_tabs_reopen_on_their_form_without_connecting() {
+    fn saved_tabs_have_an_atomic_reopen_or_fresh_choice() {
         let directory = std::env::temp_dir().join(format!(
             "starcom-workspace-{}-{:?}",
             std::process::id(),
@@ -1254,6 +1323,7 @@ mod tests {
 
         let mut workspace = idle_workspace(Some(file.clone()));
         assert!(workspace.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
+        assert_eq!(workspace.restore_choice, Some(2));
         assert_eq!(workspace.tabs.len(), 2);
         assert_eq!(workspace.active, 1);
         // The whole point: no tab may be connecting or connected at startup.
@@ -1267,6 +1337,9 @@ mod tests {
         }
         assert_eq!(workspace.tabs[0].label, "dev / work");
         assert_eq!(workspace.tabs[1].label, "build.example.test / ci");
+        workspace.apply(Action::ReopenSaved, || None);
+        assert_eq!(workspace.restore_choice, None);
+        assert!(!workspace.composer_open);
         workspace.persist();
         let reloaded = store::load(&file).unwrap().unwrap();
         assert_eq!(reloaded.tabs.len(), 2);
@@ -1275,6 +1348,22 @@ mod tests {
         assert_eq!(reloaded.tabs[0].session, "work");
         assert_eq!(reloaded.tabs[1].session, "ci");
         assert_eq!(reloaded.active, 1);
+
+        // The native lifecycle can request shutdown more than once. A later
+        // call must not replace the first call's saved tabs with the cleared
+        // in-memory list.
+        workspace.shutdown();
+        workspace.shutdown();
+        assert_eq!(store::load(&file).unwrap().unwrap().tabs.len(), 2);
+
+        let mut fresh = idle_workspace(Some(file.clone()));
+        assert!(fresh.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
+        assert_eq!(fresh.restore_choice, Some(2));
+        fresh.apply(Action::StartFresh, || None);
+        assert_eq!(fresh.restore_choice, None);
+        assert!(fresh.tabs.is_empty());
+        assert!(fresh.composer_open);
+        assert!(store::load(&file).unwrap().unwrap().tabs.is_empty());
     }
 
     fn idle_workspace(store: Option<path::PathBuf>) -> Workspace {
@@ -1290,6 +1379,7 @@ mod tests {
             )
             .unwrap(),
             composer_open: true,
+            restore_choice: None,
             next: 2,
             wake,
             config: sync::Arc::new(ssh_config::Config::default()),
@@ -1304,6 +1394,7 @@ mod tests {
             session_started: time::Instant::now(),
             echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
+            shut_down: false,
         }
     }
 

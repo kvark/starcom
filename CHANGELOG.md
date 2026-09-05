@@ -32,6 +32,10 @@ Tabs, mouse, paste, session create, SFTP drops, and an About panel after
 - **Composer.** **+** shows the connection form on the plus chip. A tab is
   registered when you press Connect, so an unused New connection chip cannot
   stick in the strip.
+- **Startup workspace.** Saved tabs are now an explicit choice: reopen all of
+  their disconnected forms together, or start fresh and discard them. Repeated
+  native shutdown callbacks no longer overwrite the saved workspace with the
+  already-cleared in-memory tab list.
 - **Move pane.** Arrow buttons swap the focused pane with its neighbor.
 - **Terminal polish.** Zoomed panes show a distinct restore icon. Activity uses
   a fixed-size orbit instead of shape-shifting text glyphs. Shift-Enter falls
