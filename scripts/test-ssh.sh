@@ -50,6 +50,23 @@ PrintMotd no
 LogLevel ERROR
 AllowTcpForwarding yes
 EOF
+sftp_server=""
+for candidate in \
+    /usr/lib/openssh/sftp-server \
+    /usr/libexec/openssh/sftp-server \
+    /usr/libexec/sftp-server \
+    /usr/lib/ssh/sftp-server
+do
+    if [[ -x $candidate ]]; then
+        sftp_server=$candidate
+        break
+    fi
+done
+if [[ -z $sftp_server ]]; then
+    echo 'OpenSSH sftp-server not found; install openssh-sftp-server' >&2
+    exit 1
+fi
+printf 'Subsystem sftp %s\n' "$sftp_server" >> "$work/sshd_config"
 # A second server that forbids forwarding, so the refusal path is exercised
 # against a real sshd rather than assumed. Bastions commonly disable it.
 python3 - "$work/port.noforward" <<'PY'
@@ -135,7 +152,7 @@ run_fixture() {
 }
 
 cargo_args=(--locked)
-integration_tests=23
+integration_tests=24
 
 # Build first, untimed. The per-run timeouts below bound how long a test may
 # take to RUN; letting them also cover compilation makes a cold tree look like

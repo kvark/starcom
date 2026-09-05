@@ -468,6 +468,7 @@ impl Inspector {
                         | "split-window"
                         | "kill-pane"
                         | "select-pane"
+                        | "swap-pane"
                         | "if-shell"
                         | "display-message"
                 ),
@@ -513,6 +514,7 @@ impl Inspector {
                         | "after-split-window"
                         | "after-kill-pane"
                         | "after-select-pane"
+                        | "after-swap-pane"
                         | "after-if-shell"
                         | "after-display-message"
                 ) {
@@ -611,6 +613,14 @@ impl Inspector {
                         "select-pane must be a separate transaction"
                     );
                     commands.push(command::Command::select_pane(target.pane));
+                }
+                input::Action::SwapPane(other) => {
+                    anyhow::ensure!(
+                        actions.len() == 1,
+                        "swap-pane must be a separate transaction"
+                    );
+                    anyhow::ensure!(other != target.pane, "cannot swap a pane with itself");
+                    commands.push(command::Command::swap_pane(target.pane, other));
                 }
                 input::Action::ClientSize(_) => {
                     anyhow::bail!("client size is not a pane transaction")

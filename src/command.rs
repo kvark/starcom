@@ -70,6 +70,10 @@ impl Command {
         Self(format!("select-pane -t {pane}\n"))
     }
 
+    pub fn swap_pane(src: tmuxctl::PaneId, dst: tmuxctl::PaneId) -> Self {
+        Self(format!("swap-pane -s {src} -t {dst}\n"))
+    }
+
     /// One axis only. The window's total size comes from `client_size`.
     pub fn resize_axis(pane: tmuxctl::PaneId, resize: input::Resize) -> Result<Self, input::Error> {
         input::Action::Resize(resize).validate()?;
@@ -171,6 +175,10 @@ mod tests {
         assert_eq!(
             Command::select_pane(tmuxctl::PaneId(3)).as_str(),
             "select-pane -t %3\n"
+        );
+        assert_eq!(
+            Command::swap_pane(tmuxctl::PaneId(3), tmuxctl::PaneId(5)).as_str(),
+            "swap-pane -s %3 -t %5\n"
         );
         assert_eq!(
             command.as_bytes().iter().filter(|&&b| b == b'\n').count(),

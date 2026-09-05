@@ -195,8 +195,11 @@ impl Node {
                         b.min.y = divider.max.y;
                     }
                 }
+                // Divider id must not be `id.with(0)`: egui tooltips use
+                // `widget_id.with(0)`, and the first child used to be that,
+                // which panics (Tooltip vs Background) on a nested split.
                 let response = ui
-                    .interact(divider, id, egui::Sense::drag())
+                    .interact(divider, id.with("div"), egui::Sense::drag())
                     .on_hover_cursor(match axis {
                         Axis::Horizontal => egui::CursorIcon::ResizeHorizontal,
                         Axis::Vertical => egui::CursorIcon::ResizeVertical,
@@ -239,7 +242,7 @@ impl Node {
                 first.draw(
                     ui,
                     a,
-                    id.with(0),
+                    id.with("a"),
                     remote_resize,
                     cell_width,
                     row_height,
@@ -249,7 +252,7 @@ impl Node {
                 second.draw(
                     ui,
                     b,
-                    id.with(1),
+                    id.with("b"),
                     remote_resize,
                     cell_width,
                     row_height,
@@ -259,6 +262,93 @@ impl Node {
             }
         }
     }
+}
+
+/// Cell rectangle of one pane, used to find a swap neighbor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaneRect {
+    pub pane: tmuxctl::PaneId,
+    pub window: tmuxctl::WindowId,
+    pub left: usize,
+    pub top: usize,
+    pub columns: usize,
+    pub rows: usize,
+}
+
+impl PaneRect {
+    pub fn from_state(state: &snapshot::State) -> Self {
+        Self {
+            pane: state.pane,
+            window: state.window,
+            left: state.left,
+            top: state.top,
+            columns: state.size.columns(),
+            rows: state.size.rows(),
+        }
+    }
+}
+
+/// Adjacent pane in each direction, if one shares an edge in the same window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Neighbors {
+    pub left: Option<tmuxctl::PaneId>,
+    pub right: Option<tmuxctl::PaneId>,
+    pub up: Option<tmuxctl::PaneId>,
+    pub down: Option<tmuxctl::PaneId>,
+}
+
+impl Neighbors {
+    pub fn of(panes: impl IntoIterator<Item = PaneRect>, id: tmuxctl::PaneId) -> Self {
+        let panes: Vec<_> = panes.into_iter().collect();
+        let Some(me) = panes.iter().copied().find(|pane| pane.pane == id) else {
+            return Self::default();
+        };
+        let left = me.left;
+        let top = me.top;
+        let right = left + me.columns;
+        let bottom = top + me.rows;
+        let mut found = Self::default();
+        let mut best = [0_usize; 4];
+        for pane in panes {
+            if pane.pane == id || pane.window != me.window {
+                continue;
+            }
+            let p_left = pane.left;
+            let p_top = pane.top;
+            let p_right = p_left + pane.columns;
+            let p_bottom = p_top + pane.rows;
+            let overlap_y = overlap(top, bottom, p_top, p_bottom);
+            let overlap_x = overlap(left, right, p_left, p_right);
+            if p_right == left && overlap_y > best[0] {
+                best[0] = overlap_y;
+                found.left = Some(pane.pane);
+            }
+            if p_left == right && overlap_y > best[1] {
+                best[1] = overlap_y;
+                found.right = Some(pane.pane);
+            }
+            if p_bottom == top && overlap_x > best[2] {
+                best[2] = overlap_x;
+                found.up = Some(pane.pane);
+            }
+            if p_top == bottom && overlap_x > best[3] {
+                best[3] = overlap_x;
+                found.down = Some(pane.pane);
+            }
+        }
+        found
+    }
+
+    pub fn count(self) -> usize {
+        usize::from(self.left.is_some())
+            + usize::from(self.right.is_some())
+            + usize::from(self.up.is_some())
+            + usize::from(self.down.is_some())
+    }
+}
+
+fn overlap(a0: usize, a1: usize, b0: usize, b1: usize) -> usize {
+    a1.min(b1).saturating_sub(a0.max(b0))
 }
 
 #[cfg(test)]
@@ -339,5 +429,55 @@ mod tests {
             Some(Node::Pane(id)) => assert_eq!(id, tmuxctl::PaneId(0)),
             other => panic!("expected the larger pane, got {other:?}"),
         }
+        assert_eq!(
+            Neighbors::of(
+                panes.iter().map(|pane| PaneRect::from_state(&pane.state)),
+                tmuxctl::PaneId(0)
+            ),
+            Neighbors::default(),
+            "overlapping panes do not share an edge"
+        );
+    }
+
+    #[test]
+    fn a_side_by_side_split_has_left_and_right_neighbors() {
+        let left = pane(1, 0, 0, 40, 24);
+        let right = pane(2, 40, 0, 40, 24);
+        let rects = [
+            PaneRect::from_state(&left.state),
+            PaneRect::from_state(&right.state),
+        ];
+        assert_eq!(
+            Neighbors::of(rects, tmuxctl::PaneId(1)),
+            Neighbors {
+                right: Some(tmuxctl::PaneId(2)),
+                ..Neighbors::default()
+            }
+        );
+        assert_eq!(
+            Neighbors::of(rects, tmuxctl::PaneId(2)),
+            Neighbors {
+                left: Some(tmuxctl::PaneId(1)),
+                ..Neighbors::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_stacked_split_has_up_and_down_neighbors() {
+        let top = pane(1, 0, 0, 80, 10);
+        let bottom = pane(2, 0, 10, 80, 14);
+        let rects = [
+            PaneRect::from_state(&top.state),
+            PaneRect::from_state(&bottom.state),
+        ];
+        assert_eq!(
+            Neighbors::of(rects, tmuxctl::PaneId(1)).down,
+            Some(tmuxctl::PaneId(2))
+        );
+        assert_eq!(
+            Neighbors::of(rects, tmuxctl::PaneId(2)).up,
+            Some(tmuxctl::PaneId(1))
+        );
     }
 }

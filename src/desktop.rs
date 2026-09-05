@@ -394,7 +394,7 @@ impl Client {
     }
 
     /// Obtain a token only after restoration. Keep it with any delayed GUI
-    /// action (such as paste confirmation); never recreate a token on retry.
+    /// action; never recreate a token on retry.
     pub fn target(&self, pane: tmuxctl::PaneId) -> Option<Target> {
         self.lock().target(pane)
     }
@@ -1102,7 +1102,8 @@ pub(crate) fn demo_view() -> anyhow::Result<snapshot::View> {
             ] {
                 terminal.feed(format!("test {name:<28} ... \x1b[32mok\x1b[0m\r\n").as_bytes());
             }
-            terminal.feed(b"\r\n\x1b[36mDrag to select. Right-click to copy.\x1b[0m\r\n\r\n");
+            terminal
+                .feed(b"\r\n\x1b[36mDrag to select. Selection copies on release.\x1b[0m\r\n\r\n");
             terminal.feed(b"The window is a client; tmux owns your jobs.\r\n\r\n");
             terminal.feed(b"\x1b[32mdemo@workstation\x1b[0m:~/starcom$ ");
         } else {

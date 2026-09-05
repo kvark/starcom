@@ -5,6 +5,8 @@ use alacritty_terminal::{grid::Dimensions, index, selection, term, vte::ansi};
 
 use crate::{input, snapshot};
 
+use super::layout;
+
 const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(18, 21, 26);
 const FOREGROUND: egui::Color32 = egui::Color32::from_rgb(214, 220, 229);
 
@@ -108,6 +110,23 @@ fn history_viewport(
     }
 }
 
+fn screen_cell(
+    position: egui::Pos2,
+    content: egui::Rect,
+    cell_width: f32,
+    row_height: f32,
+    columns: usize,
+    rows: usize,
+) -> (usize, usize) {
+    let column = ((position.x - content.left()) / cell_width)
+        .floor()
+        .clamp(0.0, columns.saturating_sub(1) as f32) as usize;
+    let row = ((position.y - content.top()) / row_height)
+        .floor()
+        .clamp(0.0, rows.saturating_sub(1) as f32) as usize;
+    (column, row)
+}
+
 fn wheel_ticks(remainder: &mut f32, delta: f32) -> i32 {
     *remainder += delta;
     let ticks = (*remainder / WHEEL_LINE) as i32;
@@ -130,6 +149,7 @@ impl PaneUi {
         notice_until: &mut Option<std::time::Instant>,
         controls: bool,
         can_kill: bool,
+        neighbors: layout::Neighbors,
         frozen: bool,
     ) -> Vec<input::Action> {
         self.rect = rect;
@@ -266,19 +286,6 @@ impl PaneUi {
                     if response.clicked() {
                         events.push(input::Action::SelectPane);
                     }
-                    if response.secondary_clicked() {
-                        if let Some(text) = pane.terminal.selected_text() {
-                            copy(ui.ctx(), text, notice, notice_until, "selection copied");
-                        } else {
-                            copy(
-                                ui.ctx(),
-                                pane.terminal.screen_lines().join("\n"),
-                                notice,
-                                notice_until,
-                                "full pane copied",
-                            );
-                        }
-                    }
                     let pointer_in_pane = ui.rect_contains_pointer(rect);
                     if wants_wheel && pointer_in_pane {
                         let dy = ui.input(|input| input.smooth_scroll_delta.y);
@@ -290,15 +297,14 @@ impl PaneUi {
                                 let (column, row) = response
                                     .hover_pos()
                                     .map(|position| {
-                                        let x = ((position.x - content.left()) / cell_width)
-                                            .floor()
-                                            .clamp(0.0, columns.saturating_sub(1) as f32)
-                                            as usize;
-                                        let y = ((position.y - content.top()) / row_height)
-                                            .floor()
-                                            .clamp(0.0, screen_rows.saturating_sub(1) as f32)
-                                            as usize;
-                                        (x, y)
+                                        screen_cell(
+                                            position,
+                                            content,
+                                            cell_width,
+                                            row_height,
+                                            columns,
+                                            screen_rows,
+                                        )
                                     })
                                     .unwrap_or((0, 0));
                                 for _ in 0..n {
@@ -334,18 +340,58 @@ impl PaneUi {
                     }
                     if let Some(position) = response.interact_pointer_pos() {
                         let (point, side) = point_at(position);
-                        if response.triple_clicked() {
+                        let unmodified = ui.input(|input| {
+                            let modifiers = input.modifiers;
+                            !modifiers.shift
+                                && !modifiers.ctrl
+                                && !modifiers.alt
+                                && !modifiers.command
+                        });
+                        // Unmodified single clicks belong to the application
+                        // when it asked for them. Drags, modified clicks, and
+                        // double/triple clicks stay local selection.
+                        let forward_click = !frozen
+                            && mouse
+                            && unmodified
+                            && response.clicked()
+                            && !response.double_clicked()
+                            && !response.triple_clicked();
+                        if forward_click {
+                            let (column, row) = screen_cell(
+                                position,
+                                content,
+                                cell_width,
+                                row_height,
+                                columns,
+                                screen_rows,
+                            );
+                            events.push(input::Action::Bytes(input::mouse_click_bytes(
+                                true, column, row, sgr_mouse,
+                            )));
+                            events.push(input::Action::Bytes(input::mouse_click_bytes(
+                                false, column, row, sgr_mouse,
+                            )));
+                            pane.terminal.clear_selection();
+                        } else if response.triple_clicked() {
                             pane.terminal.begin_selection(
                                 point,
                                 side,
                                 selection::SelectionType::Lines,
                             );
+                            if let Some(text) = pane.terminal.selected_text() {
+                                copy(ui.ctx(), text, notice, notice_until, "Copied!");
+                                pane.terminal.clear_selection();
+                            }
                         } else if response.double_clicked() {
                             pane.terminal.begin_selection(
                                 point,
                                 side,
                                 selection::SelectionType::Semantic,
                             );
+                            if let Some(text) = pane.terminal.selected_text() {
+                                copy(ui.ctx(), text, notice, notice_until, "Copied!");
+                                pane.terminal.clear_selection();
+                            }
                         } else if response.clicked() {
                             pane.terminal.clear_selection();
                         } else if response.drag_started() {
@@ -376,15 +422,11 @@ impl PaneUi {
                             }
                         }
                     }
-                    let copying = response.has_focus()
-                        && ui.input(|input| {
-                            input
-                                .events
-                                .iter()
-                                .any(|event| matches!(event, egui::Event::Copy))
-                        });
-                    if copying && let Some(text) = pane.terminal.selected_text() {
-                        copy(ui.ctx(), text, notice, notice_until, "selection copied");
+                    if response.drag_stopped()
+                        && let Some(text) = pane.terminal.selected_text()
+                    {
+                        copy(ui.ctx(), text, notice, notice_until, "Copied!");
+                        pane.terminal.clear_selection();
                     }
                     let model = pane.terminal.model();
                     let selection_range = pane.terminal.selection_range();
@@ -587,9 +629,11 @@ impl PaneUi {
                 self.scroll_frac = viewport.frac;
                 pane.terminal.scroll_history(viewport.offset);
                 if controls && *focused == Some(pane_id) {
+                    let buttons = 3 + usize::from(can_kill) + neighbors.count();
+                    let width = 8.0 + buttons as f32 * 24.0;
                     let bar = egui::Rect::from_min_max(
-                        egui::pos2(rect.max.x - 118.0, rect.min.y + 4.0),
-                        egui::pos2(rect.max.x - 4.0, rect.min.y + 26.0),
+                        egui::pos2(rect.max.x - width - 4.0, rect.min.y + 4.0),
+                        egui::pos2(rect.max.x - 4.0, rect.min.y + 28.0),
                     )
                     .intersect(rect);
                     egui::Area::new(id.with("chrome"))
@@ -598,34 +642,66 @@ impl PaneUi {
                         .show(ui.ctx(), |ui| {
                             ui.set_max_size(bar.size());
                             egui::Frame::NONE
-                                .fill(egui::Color32::from_rgba_unmultiplied(18, 21, 26, 210))
-                                .corner_radius(3.0)
-                                .inner_margin(egui::Margin::symmetric(2, 1))
+                                .fill(egui::Color32::from_rgba_unmultiplied(16, 18, 22, 220))
+                                .corner_radius(5.0)
+                                .inner_margin(egui::Margin::symmetric(4, 2))
                                 .show(ui, |ui| {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             ui.spacing_mut().item_spacing.x = 2.0;
-                                            if can_kill && chrome_button(ui, "x", "Close this pane")
+                                            if can_kill
+                                                && chrome_button(
+                                                    ui,
+                                                    ChromeIcon::Close,
+                                                    "Close this pane",
+                                                )
                                             {
                                                 events.push(input::Action::KillPane);
                                             }
                                             if chrome_button(
                                                 ui,
-                                                "Z",
+                                                ChromeIcon::Zoom,
                                                 "Maximize / restore this pane",
                                             ) {
                                                 events.push(input::Action::ZoomPane);
                                                 ui.ctx()
                                                     .memory_mut(|memory| memory.request_focus(id));
                                             }
-                                            if chrome_button(ui, "-", "Split below") {
+                                            for (icon, tip, other) in [
+                                                (ChromeIcon::MoveDown, "Move down", neighbors.down),
+                                                (ChromeIcon::MoveUp, "Move up", neighbors.up),
+                                                (
+                                                    ChromeIcon::MoveRight,
+                                                    "Move right",
+                                                    neighbors.right,
+                                                ),
+                                                (ChromeIcon::MoveLeft, "Move left", neighbors.left),
+                                            ] {
+                                                if let Some(other) = other
+                                                    && chrome_button(ui, icon, tip)
+                                                {
+                                                    events.push(input::Action::SwapPane(other));
+                                                    ui.ctx().memory_mut(|memory| {
+                                                        memory.request_focus(id)
+                                                    });
+                                                }
+                                            }
+                                            if chrome_button(
+                                                ui,
+                                                ChromeIcon::SplitBelow,
+                                                "Split below",
+                                            ) {
                                                 events
                                                     .push(input::Action::Split(input::Axis::Rows));
                                                 ui.ctx()
                                                     .memory_mut(|memory| memory.request_focus(id));
                                             }
-                                            if chrome_button(ui, "|", "Split right") {
+                                            if chrome_button(
+                                                ui,
+                                                ChromeIcon::SplitRight,
+                                                "Split right",
+                                            ) {
                                                 events.push(input::Action::Split(
                                                     input::Axis::Columns,
                                                 ));
@@ -643,14 +719,125 @@ impl PaneUi {
     }
 }
 
-fn chrome_button(ui: &mut egui::Ui, glyph: &str, tip: &str) -> bool {
-    ui.add(
-        egui::Button::new(egui::RichText::new(glyph).monospace())
-            .small()
-            .sense(egui::Sense::CLICK),
-    )
-    .on_hover_text(tip)
-    .clicked()
+#[derive(Clone, Copy)]
+enum ChromeIcon {
+    SplitRight,
+    SplitBelow,
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    Zoom,
+    Close,
+}
+
+fn chrome_button(ui: &mut egui::Ui, icon: ChromeIcon, tip: &str) -> bool {
+    let id = ui.id().with(tip);
+    let (_, rect) = ui.allocate_space(egui::vec2(22.0, 20.0));
+    let response = ui.interact(rect, id, egui::Sense::CLICK);
+    let hovered = response.hovered();
+    let fill = if hovered {
+        match icon {
+            ChromeIcon::Close => egui::Color32::from_rgb(168, 52, 52),
+            _ => egui::Color32::from_white_alpha(28),
+        }
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    if fill.a() > 0 {
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+    let color = if hovered {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_gray(168)
+    };
+    paint_chrome_icon(
+        ui.painter(),
+        rect.shrink2(egui::vec2(5.0, 4.5)),
+        icon,
+        color,
+    );
+    response.on_hover_text(tip).clicked()
+}
+
+fn paint_chrome_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: ChromeIcon,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.4, color);
+    match icon {
+        ChromeIcon::SplitRight => {
+            painter.rect_stroke(rect, 1.5, stroke, egui::StrokeKind::Outside);
+            let x = rect.center().x;
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                stroke,
+            );
+        }
+        ChromeIcon::SplitBelow => {
+            painter.rect_stroke(rect, 1.5, stroke, egui::StrokeKind::Outside);
+            let y = rect.center().y;
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                stroke,
+            );
+        }
+        ChromeIcon::Zoom => {
+            painter.rect_stroke(rect.shrink(0.5), 1.5, stroke, egui::StrokeKind::Outside);
+        }
+        ChromeIcon::Close => {
+            let r = rect.shrink(1.0);
+            painter.line_segment([r.left_top(), r.right_bottom()], stroke);
+            painter.line_segment([r.right_top(), r.left_bottom()], stroke);
+        }
+        ChromeIcon::MoveLeft => {
+            let c = rect.center();
+            painter.line_segment(
+                [egui::pos2(c.x + 3.0, c.y - 4.5), egui::pos2(c.x - 3.0, c.y)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x - 3.0, c.y), egui::pos2(c.x + 3.0, c.y + 4.5)],
+                stroke,
+            );
+        }
+        ChromeIcon::MoveRight => {
+            let c = rect.center();
+            painter.line_segment(
+                [egui::pos2(c.x - 3.0, c.y - 4.5), egui::pos2(c.x + 3.0, c.y)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x + 3.0, c.y), egui::pos2(c.x - 3.0, c.y + 4.5)],
+                stroke,
+            );
+        }
+        ChromeIcon::MoveUp => {
+            let c = rect.center();
+            painter.line_segment(
+                [egui::pos2(c.x - 4.5, c.y + 3.0), egui::pos2(c.x, c.y - 3.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x, c.y - 3.0), egui::pos2(c.x + 4.5, c.y + 3.0)],
+                stroke,
+            );
+        }
+        ChromeIcon::MoveDown => {
+            let c = rect.center();
+            painter.line_segment(
+                [egui::pos2(c.x - 4.5, c.y - 3.0), egui::pos2(c.x, c.y + 3.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x, c.y + 3.0), egui::pos2(c.x + 4.5, c.y - 3.0)],
+                stroke,
+            );
+        }
+    }
 }
 
 pub fn copy(

@@ -27,6 +27,8 @@ struct Runtime {
     painter: be::GuiPainter,
     input: egui_winit::State,
     size: winit::dpi::PhysicalSize<u32>,
+    #[cfg(target_os = "linux")]
+    wayland_drop: Option<crate::wayland_drop::WaylandDrop>,
     // These owners are dropped LAST, after every resource referring to them.
     // Native window and display handles must survive surface teardown.
     window: winit::window::Window,
@@ -52,9 +54,18 @@ impl Runtime {
             attributes = WindowAttributesExtWayland::with_name(attributes, "starcom", "starcom");
             attributes = WindowAttributesExtX11::with_name(attributes, "starcom", "starcom");
         }
+        #[cfg(windows)]
+        {
+            // winit 0.30 already implements OLE file drops. macOS registers
+            // NSDraggingDestination. Wayland is the gap: see wayland_drop.
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes = attributes.with_drag_and_drop(true);
+        }
         let window = event_loop
             .create_window(attributes)
             .context("create Starcom window")?;
+        #[cfg(target_os = "linux")]
+        let wayland_drop = crate::wayland_drop::WaylandDrop::attach(&window);
         // SAFETY: the returned graphics context and surface are confined to this
         // event-loop thread; the window outlives the explicitly destroyed surface.
         let context = unsafe {
@@ -104,6 +115,8 @@ impl Runtime {
             painter,
             input,
             size,
+            #[cfg(target_os = "linux")]
+            wayland_drop,
         })
     }
 
@@ -243,6 +256,40 @@ impl App {
         self.input_redraw = true;
         runtime.window.request_redraw();
     }
+
+    #[cfg(target_os = "linux")]
+    fn pump_wayland_drop(&mut self) {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        let Some(dropper) = runtime.wayland_drop.as_mut() else {
+            return;
+        };
+        let pump = dropper.pump();
+        let mut redraw = false;
+        if pump.hovering {
+            let files = &mut runtime.input.egui_input_mut().hovered_files;
+            if files.is_empty() {
+                files.push(egui::HoveredFile::default());
+            }
+            redraw = true;
+        }
+        if !pump.dropped.is_empty() {
+            let input = runtime.input.egui_input_mut();
+            input.hovered_files.clear();
+            for path in pump.dropped {
+                input.dropped_files.push(egui::DroppedFile {
+                    path: Some(path),
+                    ..Default::default()
+                });
+            }
+            redraw = true;
+        }
+        if redraw {
+            runtime.window.request_redraw();
+            self.input_redraw = true;
+        }
+    }
 }
 
 impl winit::application::ApplicationHandler<Event> for App {
@@ -305,6 +352,8 @@ impl winit::application::ApplicationHandler<Event> for App {
                 self.request_redraw();
             }
         }
+        #[cfg(target_os = "linux")]
+        self.pump_wayland_drop();
         match event {
             winit::event::WindowEvent::CloseRequested => {
                 self.shutdown();
@@ -384,6 +433,8 @@ impl winit::application::ApplicationHandler<Event> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        #[cfg(target_os = "linux")]
+        self.pump_wayland_drop();
         self.workspace.notice_suspend();
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
         if let Some(wake) = self.next_repaint {

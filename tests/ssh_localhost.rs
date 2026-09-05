@@ -1,6 +1,6 @@
 #![cfg(all(feature = "ssh", target_os = "linux"))]
 //! Only scripts/test-ssh.sh supplies this disposable, loopback-only fixture.
-use starcom::{core, inspect, ssh};
+use starcom::{core, inspect, sftp, ssh};
 use std::{env, fs, io, path, process, thread, time};
 
 fn root() -> path::PathBuf {
@@ -622,6 +622,74 @@ fn discovery_never_starts_a_server_and_creation_is_explicit() {
         .arg(&absent)
         .arg("kill-server")
         .status();
+}
+
+/// SFTP upload writes a file the shell can read. The fixture sshd must offer
+/// the sftp subsystem; scripts/test-ssh.sh adds it when sftp-server exists.
+#[test]
+#[ignore = "requires the isolated SSH/tmux fixture"]
+fn sftp_put_writes_a_file_the_shell_can_read() {
+    let name = format!("starcom-sftp-{}.txt", process::id());
+    let src = env::temp_dir().join(&name);
+    fs::write(&src, b"starcom-sftp-payload\n").unwrap();
+    struct Cleanup(path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(src.clone());
+
+    let mut opts = options();
+    opts.timeout = time::Duration::from_secs(15);
+    let paths = sftp::put_files(&opts, std::slice::from_ref(&src), |_| {}).unwrap();
+    assert_eq!(paths.len(), 1);
+    let remote = &paths[0];
+    assert!(
+        remote.contains("/starcom-") && remote.ends_with(&format!("-{name}")),
+        "uploaded path should be a unique temp name: {remote}"
+    );
+    assert!(
+        remote
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b)),
+        "uploaded path is not safe to exec: {remote}"
+    );
+
+    let mut channel = ssh::Connection::connect(&opts)
+        .unwrap()
+        .exec(&format!("exec cat {remote}"))
+        .unwrap();
+    let deadline = time::Instant::now() + time::Duration::from_secs(10);
+    let mut got = Vec::new();
+    let mut buffer = [0; 256];
+    while !channel.eof() {
+        assert!(time::Instant::now() < deadline, "cat stalled");
+        match io::Read::read(&mut channel, &mut buffer) {
+            Ok(0) => break,
+            Ok(count) => got.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                channel.wait(deadline).unwrap()
+            }
+            Err(error) => panic!("cat: {error}"),
+        }
+    }
+    assert_eq!(got, b"starcom-sftp-payload\n");
+
+    let mut rm = ssh::Connection::connect(&opts)
+        .unwrap()
+        .exec(&format!("exec rm -f {remote}"))
+        .unwrap();
+    let deadline = time::Instant::now() + time::Duration::from_secs(10);
+    while !rm.eof() {
+        assert!(time::Instant::now() < deadline, "rm stalled");
+        match io::Read::read(&mut rm, &mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => rm.wait(deadline).unwrap(),
+            Err(error) => panic!("rm: {error}"),
+        }
+    }
 }
 
 /// Sunset can open a `direct-tcpip` channel, and a real OpenSSH server carries

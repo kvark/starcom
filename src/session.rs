@@ -187,6 +187,17 @@ pub(crate) fn validate_action(
             input::Axis::Rows => core::Size::new(size.columns(), resize.cells)?,
         };
     }
+    if let input::Action::SwapPane(other) = *action {
+        anyhow::ensure!(other != pane.state.pane, "cannot swap a pane with itself");
+        let dest = view
+            .panes()
+            .get(&other)
+            .ok_or_else(|| anyhow::anyhow!("swap target is no longer in this session"))?;
+        anyhow::ensure!(
+            dest.state.window == pane.state.window,
+            "swap is within one window"
+        );
+    }
     Ok(())
 }
 

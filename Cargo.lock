@@ -2382,6 +2382,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
 name = "pem-rfc7468"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3200,7 +3206,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "starcom"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -3214,11 +3220,15 @@ dependencies = [
  "log",
  "png",
  "polling",
+ "raw-window-handle",
  "sha1",
  "signature",
  "ssh-key",
  "sunset",
+ "sunset-sftp",
  "tmuxctl",
+ "wayland-backend",
+ "wayland-client",
  "windows-sys 0.61.2",
  "winit",
  "winresource",
@@ -3240,7 +3250,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sunset"
 version = "0.6.0"
-source = "git+https://github.com/navigato-rs/sunset?rev=e059a65#e059a657274c3cd34faf75f650aec2c830dbe7cd"
+source = "git+https://github.com/navigato-rs/sunset?rev=c245252#c245252510336572c0d3ab5fce29850996e53c22"
 dependencies = [
  "aes",
  "ascii",
@@ -3269,9 +3279,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sunset-sftp"
+version = "0.2.0"
+source = "git+https://github.com/navigato-rs/sunset?rev=c245252#c245252510336572c0d3ab5fce29850996e53c22"
+dependencies = [
+ "log",
+ "num_enum",
+ "paste",
+ "sunset",
+ "sunset-sshwire-derive",
+]
+
+[[package]]
 name = "sunset-sshwire-derive"
 version = "0.3.0"
-source = "git+https://github.com/navigato-rs/sunset?rev=e059a65#e059a657274c3cd34faf75f650aec2c830dbe7cd"
+source = "git+https://github.com/navigato-rs/sunset?rev=c245252#c245252510336572c0d3ab5fce29850996e53c22"
 dependencies = [
  "virtue",
 ]
