@@ -2,9 +2,9 @@
 //!
 //! This file records where to connect and how, never anything that would let a
 //! reader connect: no keys, no passphrases, no agent handles, no host-key
-//! material, or terminal contents. A last-used session name is a form hint
-//! only. Restoring a tab reopens its form with the fields filled in; it never
-//! authenticates on its own.
+//! material, or terminal contents. A last-used session name is a resume target
+//! only. Resuming a tab reconnects to that saved destination and existing tmux
+//! session using the current SSH configuration.
 //!
 //! The format is a few bounded lines rather than a serialization dependency,
 //! for the same reason the SSH-config reader is: reading it must not be able to
@@ -48,8 +48,7 @@ pub struct Tab {
     pub destination: String,
     pub host: String,
     pub user: String,
-    /// Last session this tab attached to. Restoring a workspace fills the form
-    /// with it; it never authenticates on its own.
+    /// Last session this tab attached to, used as the startup resume target.
     pub session: String,
     pub port: u16,
     pub identity: String,

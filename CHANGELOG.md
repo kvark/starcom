@@ -15,7 +15,7 @@ Tabs, mouse, paste, session create, SFTP drops, and an About panel after
   characters other than tabs and line endings are still rejected.
 - **Create.** The typed session name appears in the list at once, and Starcom
   attaches when the host confirms it. The last-used session is saved as a form
-  hint; restoring a workspace still does not authenticate.
+  target so startup can resume it.
 - **Mouse.** Unmodified left clicks are forwarded when the pane asked for mouse
   reports. Drags, modified clicks, and double/triple clicks stay local
   selection. The wheel already went to the application in that case.
@@ -32,10 +32,10 @@ Tabs, mouse, paste, session create, SFTP drops, and an About panel after
 - **Composer.** **+** shows the connection form on the plus chip. A tab is
   registered when you press Connect, so an unused New connection chip cannot
   stick in the strip.
-- **Startup workspace.** Saved tabs reopen automatically on their disconnected
-  forms by default; **About** has an opt-out for starting fresh. Repeated native
-  shutdown callbacks no longer overwrite the saved workspace with the
-  already-cleared in-memory tab list.
+- **Startup workspace.** Saved tabs reconnect to their previous hosts and tmux
+  sessions automatically by default; **About** has an opt-out for starting
+  fresh. Repeated native shutdown callbacks no longer overwrite the saved
+  workspace with the already-cleared in-memory tab list.
 - **Move pane.** Arrow buttons swap the focused pane with its neighbor.
 - **Terminal polish.** Zoomed panes show a distinct restore icon. Activity uses
   a fixed-size orbit instead of shape-shifting text glyphs. Shift-Enter falls

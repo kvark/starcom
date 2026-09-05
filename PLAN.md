@@ -1,6 +1,6 @@
 # Starcom plan and roadmap
 
-Updated: 2026-09-04.
+Updated: 2026-09-05.
 
 **Current status:** M0 through M3 are done for the tested configuration, and M4
 is half done. M2's gate is signed off; M3 is complete: transport loss is classified apart
@@ -11,8 +11,8 @@ reported. Alternate-screen panes and a History setting below tmux's buffer are
 not treated as lost output. Loss during output, input, paste, and a remote layout
 change, plus a restarted tmux server, are covered by fixture tests.
 
-M4 now persists non-secret tabs, restores them by default without authenticating
-with an opt-out setting, and adds explicit session discovery and creation. Its
+M4 now persists non-secret tabs, resumes their saved sessions by default with an
+opt-out setting, and adds explicit session discovery and creation. Its
 other three items — connection reuse, ProxyJump, and certificate/MFA workflows —
 are blocked on Sunset 0.6 and are recorded below with what specifically blocks
 each. M5 is next.
@@ -88,7 +88,7 @@ mode is the external frontend interface and works with the host's installed tmux
 | Automatic retry | Transport loss only. Authentication, trust, missing-session, server-exit, and detach always stop. |
 | Advanced SSH escape hatch | Optional system-SSH transport remains a future option, alongside the Sunset fork. |
 | Third-party patches | Forks pinned by revision on `main` (Blade, Sunset). Never vendored, never unpinned. |
-| Saved state | Destinations, preferences, and last-used session name. Restoring a tab never authenticates. An unreadable file is a system dialog: clear it, or exit and leave it. |
+| Saved state | Destinations, preferences, and last-used session name. Startup reconnects saved tabs using current SSH policy unless disabled. An unreadable file is a system dialog: clear it, or exit and leave it. |
 | Session creation | Only from an explicit action. No failure path may create a session or a server. |
 | Repository | One Rust 2024 package; normal root sources on `main`. |
 
@@ -176,8 +176,9 @@ terminal checkpoint.
   jittered backoff, a visible attempt/countdown with a stop control, a fresh
   epoch and rebuilt models per attempt, and reports when the reattached session
   or its scrollback is not continuous with what was on screen.
-- Saved connection tabs restored automatically onto their forms by default,
-  never authenticated on start, with an opt-out setting in About.
+- Saved connection tabs reattach to their previous host/session automatically by
+  default, using normal host-key and authentication policy, with an opt-out
+  setting in About.
 - Explicit session listing (`tmux -N`, which cannot start a server) and confirmed
   session creation, which is the one path allowed to start one.
 - Ordered shutdown and a native Linux/X11 close-path test.
@@ -251,8 +252,8 @@ verified to fail when automatic retry is disabled.
 
 ### M4 — Multiple-machine operational fit: two items done, three blocked on the SSH backend
 
-- [x] Persist non-secret tabs/profiles and restore them by default, with an
-  opt-out setting and no auto-authentication.
+- [x] Persist non-secret tabs/profiles and resume their saved sessions by
+  default, with an opt-out setting.
 - [x] Add explicit session discovery/creation UI without changing attach semantics.
   Listing is also offered on its own after an attach fails because the session is
   missing: the user has already authenticated and the list is the answer. No

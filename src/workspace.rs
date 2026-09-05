@@ -269,12 +269,20 @@ impl Workspace {
         Ok(Some(workspace))
     }
 
-    /// Reopen saved tabs on their connection forms. Restoring never connects and
-    /// never authenticates: the user presses Connect, exactly as on a cold start.
+    /// Reopen saved tabs and reconnect each complete saved host/session. A tab
+    /// with invalid or incomplete saved settings stays on its connection form.
     /// `Ok(false)` means the user chose to exit and the file was left alone.
     fn restore(
         &mut self,
         on_broken: impl Fn(&path::Path, &anyhow::Error) -> dialog::BrokenStore,
+    ) -> anyhow::Result<bool> {
+        self.restore_with(on_broken, |client, connection| client.connect(connection))
+    }
+
+    fn restore_with(
+        &mut self,
+        on_broken: impl Fn(&path::Path, &anyhow::Error) -> dialog::BrokenStore,
+        mut resume: impl FnMut(&desktop::Client, desktop::Connection) -> anyhow::Result<()>,
     ) -> anyhow::Result<bool> {
         let Some(file) = self.store.clone() else {
             return Ok(true);
@@ -308,8 +316,22 @@ impl Workspace {
                     break;
                 }
                 let index = self.tabs.len() - 1;
-                self.tabs[index].label = label(&tab);
-                self.tabs[index].ui.restore(tab);
+                let restored = &mut self.tabs[index];
+                restored.label = label(&tab);
+                restored.ui.restore(tab);
+                match restored.ui.resume() {
+                    Ok(connection) => {
+                        if let Err(error) = resume(&restored.client, connection) {
+                            restored.ui.return_to_form();
+                            restored.client.lock().error =
+                                Some(format!("Could not resume this tab: {error}"));
+                        }
+                    }
+                    Err(error) => {
+                        restored.client.lock().error =
+                            Some(format!("Could not resume this tab: {error}"));
+                    }
+                }
             }
         }
         self.active = saved.active.min(self.tabs.len().saturating_sub(1));
@@ -402,10 +424,8 @@ impl Workspace {
                 });
                 ui.weak("0 seconds keeps a connected tab green.");
                 ui.add_space(6.0);
-                ui.checkbox(&mut restore_tabs, "Restore open tabs on startup");
-                ui.weak(
-                    "Restored tabs open as disconnected forms and never authenticate by themselves.",
-                );
+                ui.checkbox(&mut restore_tabs, "Resume open tabs on startup");
+                ui.weak("Reconnects each saved host and tmux session automatically.");
                 ui.add_space(10.0);
                 ui.label(format!("Open for {open_for} in total"));
                 ui.add_space(8.0);
@@ -1227,7 +1247,7 @@ mod tests {
         assert_eq!(workspace.tabs[1].client.phase(), desktop::Phase::Idle);
     }
     #[test]
-    fn saved_tabs_reopen_automatically_without_connecting() {
+    fn saved_tabs_resume_their_saved_host_and_session_automatically() {
         let directory = std::env::temp_dir().join(format!(
             "starcom-workspace-{}-{:?}",
             std::process::id(),
@@ -1254,6 +1274,7 @@ mod tests {
                         user: "alice".into(),
                         session: "work".into(),
                         port: 2222,
+                        known_hosts: "/tmp/known_hosts".into(),
                         history: 300,
                         interactive: true,
                         reconnect: true,
@@ -1264,6 +1285,7 @@ mod tests {
                         user: "bob".into(),
                         session: "ci".into(),
                         port: 22,
+                        known_hosts: "/tmp/known_hosts".into(),
                         history: 200,
                         ..store::Tab::default()
                     },
@@ -1278,18 +1300,36 @@ mod tests {
         .unwrap();
 
         let mut workspace = idle_workspace(Some(file.clone()));
-        assert!(workspace.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
+        let mut resumed = Vec::new();
+        assert!(
+            workspace
+                .restore_with(
+                    |_, _| dialog::BrokenStore::Exit,
+                    |_, connection| {
+                        resumed.push((
+                            connection.options.host,
+                            connection.session.as_str().to_owned(),
+                        ));
+                        Ok(())
+                    },
+                )
+                .unwrap()
+        );
         assert!(workspace.restore_tabs);
         assert_eq!(workspace.tabs.len(), 2);
         assert_eq!(workspace.active, 1);
-        // The whole point: no tab may be connecting or connected at startup.
+        assert_eq!(
+            resumed,
+            [
+                ("10.0.0.2".into(), "work".into()),
+                ("build.example.test".into(), "ci".into())
+            ]
+        );
+        // The injected connector keeps this test off the network. Opening the
+        // terminal here proves production startup will show connection progress
+        // and then the restored tmux view, not the server chooser.
         for tab in &workspace.tabs {
-            assert_eq!(
-                tab.client.phase(),
-                desktop::Phase::Idle,
-                "restoring a workspace must not authenticate"
-            );
-            assert!(tab.client.retry().is_none());
+            assert!(!tab.ui.showing_form());
         }
         assert_eq!(workspace.tabs[0].label, "dev / work");
         assert_eq!(workspace.tabs[1].label, "build.example.test / ci");
@@ -1311,8 +1351,20 @@ mod tests {
         assert_eq!(store::load(&file).unwrap().unwrap().tabs.len(), 2);
 
         let mut reopened = idle_workspace(Some(file));
-        assert!(reopened.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
+        let mut resumed_again = 0;
+        assert!(
+            reopened
+                .restore_with(
+                    |_, _| dialog::BrokenStore::Exit,
+                    |_, _| {
+                        resumed_again += 1;
+                        Ok(())
+                    },
+                )
+                .unwrap()
+        );
         assert_eq!(reopened.tabs.len(), 2);
+        assert_eq!(resumed_again, 2);
         assert_eq!(reopened.active, 1);
         assert!(!reopened.composer_open);
     }
@@ -1344,6 +1396,7 @@ mod tests {
             user: "alice".into(),
             session: "work".into(),
             port: 22,
+            known_hosts: "/tmp/known_hosts".into(),
             history: store::DEFAULT_HISTORY,
             interactive: true,
             reconnect: true,
@@ -1360,10 +1413,81 @@ mod tests {
         assert_eq!(on_disk.tabs[0].destination, "dev");
 
         let mut started = idle_workspace(Some(file));
-        assert!(started.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
+        let mut resumed = None;
+        assert!(
+            started
+                .restore_with(
+                    |_, _| dialog::BrokenStore::Exit,
+                    |_, connection| {
+                        resumed = Some((
+                            connection.options.host,
+                            connection.session.as_str().to_owned(),
+                        ));
+                        Ok(())
+                    },
+                )
+                .unwrap()
+        );
         assert_eq!(started.tabs.len(), 1);
         assert_eq!(started.tabs[0].label, "dev / work");
+        assert_eq!(resumed, Some(("dev.example.test".into(), "work".into())));
+        assert!(!started.tabs[0].ui.showing_form());
         assert!(!started.composer_open);
+    }
+
+    #[test]
+    fn an_incomplete_saved_tab_stays_on_its_form_with_an_error() {
+        let directory = std::env::temp_dir().join(format!(
+            "starcom-workspace-incomplete-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let file = directory.join("workspace.conf");
+        store::save(
+            &file,
+            &store::Workspace {
+                tabs: vec![store::Tab {
+                    destination: "dev".into(),
+                    host: "dev.example.test".into(),
+                    known_hosts: "/tmp/known_hosts".into(),
+                    ..store::Tab::default()
+                }],
+                ..store::Workspace::default()
+            },
+        )
+        .unwrap();
+
+        let mut workspace = idle_workspace(Some(file));
+        let mut attempts = 0;
+        assert!(
+            workspace
+                .restore_with(
+                    |_, _| dialog::BrokenStore::Exit,
+                    |_, _| {
+                        attempts += 1;
+                        Ok(())
+                    },
+                )
+                .unwrap()
+        );
+        assert_eq!(attempts, 0);
+        assert!(workspace.tabs[0].ui.showing_form());
+        assert!(
+            workspace.tabs[0]
+                .client
+                .error()
+                .is_some_and(|error| error.contains("choose a tmux session"))
+        );
     }
 
     #[test]
