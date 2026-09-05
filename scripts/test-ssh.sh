@@ -16,6 +16,11 @@ cleanup() {
     rm -rf "$work"
 }
 trap cleanup EXIT
+sshd_bin=$(command -v sshd || true)
+if [[ -z $sshd_bin ]]; then
+    echo 'OpenSSH sshd not found; install openssh-server' >&2
+    exit 1
+fi
 ssh-keygen -q -t ed25519 -N '' -f "$work/host_key"
 ssh-keygen -q -t ed25519 -N '' -f "$work/id_ed25519"
 ssh-keygen -q -t rsa -b 2048 -N '' -f "$work/id_rsa"
@@ -51,7 +56,9 @@ LogLevel ERROR
 AllowTcpForwarding yes
 EOF
 sftp_server=""
+sshd_root=$(dirname "$(dirname "$(readlink -f "$sshd_bin")")")
 for candidate in \
+    "$sshd_root/libexec/sftp-server" \
     /usr/lib/openssh/sftp-server \
     /usr/libexec/openssh/sftp-server \
     /usr/libexec/sftp-server \
@@ -82,9 +89,13 @@ sed -e "s/^Port .*/Port $noforward_port/" \
     -e "s|^PidFile .*|PidFile $work/sshd.noforward.pid|" \
     "$work/sshd_config" > "$work/sshd_config.noforward"
 sudo mkdir -p /run/sshd
-sudo /usr/sbin/sshd -D -e -f "$work/sshd_config" > "$work/sshd.log" 2>&1 &
+# The logs are in this user's private temporary directory; only sshd itself
+# needs elevation. shellcheck's redirect warning does not apply here.
+# shellcheck disable=SC2024
+sudo "$sshd_bin" -D -e -f "$work/sshd_config" > "$work/sshd.log" 2>&1 &
 sshd_pid=$!
-sudo /usr/sbin/sshd -D -e -f "$work/sshd_config.noforward" > "$work/sshd.noforward.log" 2>&1 &
+# shellcheck disable=SC2024
+sudo "$sshd_bin" -D -e -f "$work/sshd_config.noforward" > "$work/sshd.noforward.log" 2>&1 &
 noforward_pid=$!
 python3 - "$port" "$work/sshd.log" <<'PY'
 import socket, sys, time

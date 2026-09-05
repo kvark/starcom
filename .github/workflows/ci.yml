@@ -29,7 +29,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -72,13 +72,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp*.json' -print -quit)"
+          VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp*.json' -print -quit)"
+          export VK_ICD_FILENAMES
           test -n "$VK_ICD_FILENAMES"
           cargo run --locked -- --demo --snapshot target/test-artifacts/desktop.png
           xvfb-run -a -s '-screen 0 1400x900x24' /usr/bin/python3 scripts/test-desktop.py
       - name: Upload desktop validation images and logs
         if: always() && runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: desktop-validation
           path: target/test-artifacts
@@ -90,7 +91,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: Read rust-version from Cargo.toml
@@ -114,7 +115,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
