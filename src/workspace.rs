@@ -1033,6 +1033,9 @@ impl Workspace {
                                 for step in steps {
                                     match step {
                                         ui::Step::Send(target, action) => {
+                                            if matches!(action, crate::input::Action::SelectPane) {
+                                                save = true;
+                                            }
                                             actions.push((target, action))
                                         }
                                         ui::Step::RequestPaste(target) => {
@@ -1443,6 +1446,8 @@ mod tests {
             host: "dev.example.test".into(),
             user: "alice".into(),
             session: "work".into(),
+            window: Some(0),
+            pane: Some(1),
             port: 22,
             known_hosts: "/tmp/known_hosts".into(),
             history: store::DEFAULT_HISTORY,
@@ -1459,6 +1464,8 @@ mod tests {
         assert!(on_disk.restore_tabs);
         assert_eq!(on_disk.tabs.len(), 1);
         assert_eq!(on_disk.tabs[0].destination, "dev");
+        assert_eq!(on_disk.tabs[0].window, Some(0));
+        assert_eq!(on_disk.tabs[0].pane, Some(1));
 
         let mut started = idle_workspace(Some(file));
         let mut resumed = None;
@@ -1477,6 +1484,8 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(started.tabs.len(), 1);
+        assert_eq!(started.tabs[0].ui.saved().window, Some(0));
+        assert_eq!(started.tabs[0].ui.saved().pane, Some(1));
         assert_eq!(started.tabs[0].label, "dev / work");
         assert_eq!(resumed, Some(("dev.example.test".into(), "work".into())));
         assert!(!started.tabs[0].ui.showing_form());

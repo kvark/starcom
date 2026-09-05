@@ -93,6 +93,8 @@ impl Form {
             host: self.host.clone(),
             user: self.user.clone(),
             session: self.session.clone(),
+            window: None,
+            pane: None,
             port: self.port,
             identity: self.identity.clone(),
             known_hosts: self.known_hosts.clone(),
@@ -281,6 +283,9 @@ pub struct DesktopUi {
     windows: collections::BTreeMap<tmuxctl::WindowId, layout::Node>,
     zoomed_windows: collections::BTreeSet<tmuxctl::WindowId>,
     window: Option<tmuxctl::WindowId>,
+    /// Last pane the user selected, independent of transient keyboard focus.
+    /// It survives tab/window focus changes and is persisted as a resume hint.
+    selected: Option<tmuxctl::PaneId>,
     focused: Option<tmuxctl::PaneId>,
     pane_ui: collections::BTreeMap<tmuxctl::PaneId, terminal::PaneUi>,
     notice: Option<String>,
@@ -340,6 +345,7 @@ impl DesktopUi {
             windows: collections::BTreeMap::new(),
             zoomed_windows: collections::BTreeSet::new(),
             window: None,
+            selected: None,
             focused: None,
             pane_ui: collections::BTreeMap::new(),
             notice: None,
@@ -378,6 +384,9 @@ impl DesktopUi {
 
     /// Restore a saved tab into this UI's form using current SSH policy.
     pub(crate) fn restore(&mut self, saved: store::Tab) {
+        self.window = saved.window.map(tmuxctl::WindowId);
+        self.selected = saved.pane.map(tmuxctl::PaneId);
+        self.focused = None;
         self.form = Form::restore(saved);
         self.profile_source = self.form.destination().to_owned();
         // Restoring a tab must not contact the host. Pretend we already listed
@@ -403,7 +412,10 @@ impl DesktopUi {
     }
 
     pub(crate) fn saved(&self) -> store::Tab {
-        self.form.saved()
+        let mut saved = self.form.saved();
+        saved.window = self.window.map(|window| window.0);
+        saved.pane = self.focused.or(self.selected).map(|pane| pane.0);
+        saved
     }
 
     pub fn open_terminal(&mut self) {
@@ -934,7 +946,7 @@ impl DesktopUi {
         if self.generation == state.generation {
             return;
         }
-        let previous_focus = self.focused;
+        let preferred = self.focused.or(self.selected);
         self.windows.clear();
         self.zoomed_windows.clear();
         self.pane_ui.clear();
@@ -944,11 +956,19 @@ impl DesktopUi {
             for pane in view.panes().values() {
                 grouped.entry(pane.state.window).or_default().push(pane);
             }
-            // One Starcom tab shows one tmux window. Window selection is deferred;
-            // keep the current window if it still exists, otherwise the first.
-            let id = self
-                .window
-                .filter(|id| grouped.contains_key(id))
+            // Follow a saved pane if it moved to another window. If it no
+            // longer exists, keep its old window when possible and choose a
+            // real pane there; otherwise fall back to the first live window.
+            let preferred_window = preferred.and_then(|wanted| {
+                grouped.iter().find_map(|(window, panes)| {
+                    panes
+                        .iter()
+                        .any(|pane| pane.state.pane == wanted)
+                        .then_some(*window)
+                })
+            });
+            let id = preferred_window
+                .or_else(|| self.window.filter(|id| grouped.contains_key(id)))
                 .or_else(|| grouped.keys().next().copied());
             if let Some(id) = id
                 && let Some(panes) = grouped.get(&id)
@@ -958,20 +978,21 @@ impl DesktopUi {
                         self.zoomed_windows.insert(id);
                     }
                     let visible = node.pane_ids();
-                    self.focused = previous_focus
+                    self.focused = preferred
                         .filter(|pane| visible.contains(pane))
-                        .or_else(|| (visible.len() == 1).then_some(visible[0]));
+                        .or_else(|| visible.first().copied());
+                    self.selected = self.focused;
                     self.windows.insert(id, node);
                 } else {
+                    self.selected = None;
                     self.notice =
                         Some(format!("Cannot reconstruct the pane layout in window {id}"));
                 }
                 self.window = Some(id);
             } else {
                 self.window = None;
+                self.selected = None;
             }
-        } else {
-            self.window = None;
         }
         self.generation = state.generation;
     }
@@ -992,6 +1013,9 @@ impl DesktopUi {
         self.note_refresh(state, scrolled);
         let generation_changed = self.generation != state.generation;
         self.rebuild_layout(state);
+        if self.restore_focus && self.focused.is_none() {
+            self.focused = self.selected;
+        }
         if (generation_changed || self.restore_focus)
             && let Some(pane) = self.focused
         {
@@ -1341,6 +1365,13 @@ impl DesktopUi {
                 }
             });
 
+        // PaneUi clears keyboard focus when the app or another widget takes
+        // it. Keep the last positive selection separately so shutdown and tab
+        // switching do not forget which pane the user chose.
+        if let Some(pane) = self.focused {
+            self.selected = Some(pane);
+        }
+
         if matches!(action, Action::None) && self.terminal_focused(root.ctx()) {
             let (events, modifiers) = root.input(|input| (input.events.clone(), input.modifiers));
             let target = self.focused.and_then(|pane| state.target(pane));
@@ -1592,33 +1623,29 @@ fn click_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::R
     ui.add(egui::Button::new(text).sense(egui::Sense::CLICK))
 }
 
-/// A fixed-size activity mark. The orbit moves, while its outline and occupied
-/// space stay constant, so tab and button labels do not pulse in width or size.
+/// A fixed-size three-dot activity mark. Only opacity changes, so tab and
+/// button labels never pulse in width or shape.
 pub(crate) fn paint_activity_indicator(ui: &egui::Ui, rect: egui::Rect, time: f64) {
-    let angle = (time as f32 * std::f32::consts::TAU * 1.4) - std::f32::consts::FRAC_PI_2;
-    paint_orbit(ui, rect, angle);
+    let step = (time * 5.0).floor() as u64;
+    paint_activity_dots(ui, rect, step);
 }
 
-/// A refresh mark driven by completed paints rather than a timer. It moves
-/// faster when visible content refreshes faster and stays still when idle.
+/// A refresh mark driven by visible changes rather than a timer. Its bright
+/// dot advances with content/scroll activity and stays still when idle.
 fn paint_refresh_indicator(ui: &egui::Ui, rect: egui::Rect, tick: u64) {
-    const POSITIONS: u64 = 12;
-    let angle = (tick % POSITIONS) as f32 * std::f32::consts::TAU / POSITIONS as f32
-        - std::f32::consts::FRAC_PI_2;
-    paint_orbit(ui, rect, angle);
+    paint_activity_dots(ui, rect, tick);
 }
 
-fn paint_orbit(ui: &egui::Ui, rect: egui::Rect, angle: f32) {
+fn paint_activity_dots(ui: &egui::Ui, rect: egui::Rect, step: u64) {
     let center = rect.center();
-    let radius = rect.width().min(rect.height()) * 0.34;
     let color = ui.visuals().strong_text_color();
-    ui.painter().circle_stroke(
-        center,
-        radius,
-        egui::Stroke::new(1.0_f32, color.gamma_multiply(0.35)),
-    );
-    let dot = center + egui::vec2(angle.cos(), angle.sin()) * radius;
-    ui.painter().circle_filled(dot, 1.8, color);
+    let spacing = rect.width().min(rect.height()) * 0.31;
+    for index in 0..3 {
+        let strength = if index as u64 == step % 3 { 1.0 } else { 0.28 };
+        let dot = center + egui::vec2((index as f32 - 1.0) * spacing, 0.0);
+        ui.painter()
+            .circle_filled(dot, 1.7, color.gamma_multiply(strength));
+    }
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
@@ -1826,6 +1853,84 @@ mod tests {
 
         ui.note_refresh(&state, true);
         assert_eq!(ui.refresh_tick, initial + 2);
+    }
+
+    #[test]
+    fn restored_pane_survives_connecting_and_is_selected_from_the_snapshot() {
+        let mut ui = DesktopUi::default();
+        ui.restore(store::Tab {
+            window: Some(0),
+            pane: Some(1),
+            ..store::Tab::default()
+        });
+        ui.open_terminal();
+
+        // Startup paints while SSH is still connecting. With no view to
+        // validate against yet, the saved hint must not be discarded.
+        ui.rebuild_layout(&desktop::State::default());
+        assert_eq!(ui.saved().window, Some(0));
+        assert_eq!(ui.saved().pane, Some(1));
+        assert_eq!(ui.focused, None);
+
+        let mut connected = desktop::State::interactive_demo().unwrap();
+        connected.generation = 1;
+        ui.rebuild_layout(&connected);
+        assert_eq!(ui.window, Some(tmuxctl::WindowId(0)));
+        assert_eq!(ui.selected, Some(tmuxctl::PaneId(1)));
+        assert_eq!(ui.focused, Some(tmuxctl::PaneId(1)));
+    }
+
+    #[test]
+    fn missing_restored_pane_falls_back_to_a_live_pane() {
+        let mut ui = DesktopUi::default();
+        ui.restore(store::Tab {
+            window: Some(0),
+            pane: Some(999),
+            ..store::Tab::default()
+        });
+        ui.open_terminal();
+
+        let mut connected = desktop::State::interactive_demo().unwrap();
+        connected.generation = 1;
+        ui.rebuild_layout(&connected);
+        let selected = ui.selected.expect("a live fallback pane");
+        assert!(
+            connected
+                .view
+                .as_ref()
+                .unwrap()
+                .panes()
+                .contains_key(&selected)
+        );
+        assert_eq!(ui.focused, Some(selected));
+        assert_ne!(selected, tmuxctl::PaneId(999));
+    }
+
+    #[test]
+    fn restored_pane_is_followed_when_it_moved_to_another_window() {
+        let mut ui = DesktopUi::default();
+        ui.restore(store::Tab {
+            window: Some(0),
+            pane: Some(1),
+            ..store::Tab::default()
+        });
+        ui.open_terminal();
+
+        let mut connected = desktop::State::interactive_demo().unwrap();
+        connected.generation = 1;
+        let moved = connected
+            .view
+            .as_mut()
+            .unwrap()
+            .panes_mut()
+            .get_mut(&tmuxctl::PaneId(1))
+            .unwrap();
+        moved.state.window = tmuxctl::WindowId(7);
+        moved.state.left = 0;
+        ui.rebuild_layout(&connected);
+
+        assert_eq!(ui.window, Some(tmuxctl::WindowId(7)));
+        assert_eq!(ui.selected, Some(tmuxctl::PaneId(1)));
     }
 
     fn paint(ui: &mut DesktopUi, state: &mut desktop::State) -> Action {
@@ -2176,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn losing_keyboard_focus_clears_the_pane_selection() {
+    fn losing_keyboard_focus_keeps_the_last_pane_for_restore() {
         let (ctx, mut ui, mut state, pane, _target) = focus_demo_pane();
         ctx.memory_mut(|memory| {
             memory.surrender_focus(terminal::focus_id(ui.generation, pane));
@@ -2192,5 +2297,7 @@ mod tests {
             ui.focused.is_none(),
             "the white border must not outlive keyboard focus"
         );
+        assert_eq!(ui.selected, Some(pane));
+        assert_eq!(ui.saved().pane, Some(pane.0));
     }
 }

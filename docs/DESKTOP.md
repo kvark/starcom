@@ -84,12 +84,13 @@ Open tabs are saved to `~/.config/starcom/workspace.conf` (`%APPDATA%\starcom\`
 on Windows, or `$XDG_CONFIG_HOME` where it is set) and reopened next time.
 
 What is saved is where a tab points and how it should connect: destination alias,
-host, user, port, tmux socket, last-used session name, history depth, whether it
-is interactive, whether it reconnects, an extra identity path if you typed one,
-the global redraw cap (`fps`, default 5), and how long a quiet connected tab
-waits before its chip turns blue (`idle`, default 30 seconds, 0 off; see
-`etc/workspace.conf.example`). Both `fps` and `idle` are also on the **About**
-panel. The last-used session is the target used to resume that tab on startup.
+host, user, port, tmux socket, last-used session name, selected window and pane,
+history depth, whether it is interactive, whether it reconnects, an extra
+identity path if you typed one, the global redraw cap (`fps`, default 5), and
+how long a quiet connected tab waits before its chip turns blue (`idle`, default
+30 seconds, 0 off; see `etc/workspace.conf.example`). Both `fps` and `idle` are
+also on the **About** panel. The last-used session is the target used to resume
+that tab on startup.
 Nothing that would let a reader of that file connect is written: no keys, no
 passphrases, no host-key material, and no terminal contents. An identity entry
 is the path you already chose, never the key behind it.
@@ -102,8 +103,12 @@ files, `IdentitiesOnly`, and unsupported-policy blockers are re-read from
 `~/.ssh/config`, and normal host-key and authentication checks still apply. A
 tab whose saved settings are incomplete or no longer allowed stays on its form
 and shows the error; Starcom never silently creates a replacement session. A
-saved file that cannot be read is a system dialog before the window opens: it
-names the file and the parse error, and asks whether to clear the file or exit.
+saved pane is used only if it still exists in the fresh tmux snapshot. If it
+was closed, Starcom selects a visible pane in the saved window, or the first
+available window if that window also disappeared. A pane moved to another
+window is followed there. A saved file that cannot be read is a system dialog
+before the window opens: it names the file and the parse error, and asks whether
+to clear the file or exit.
 Exit is the default and leaves the file unchanged. Clearing deletes it and
 starts fresh.
 
@@ -210,10 +215,10 @@ The renderer paints only visible history rows. Font-size controls change the
 cell metrics used both to paint and to tell tmux this client's size, so the
 remote grid matches the glyphs on screen.
 
-The status bar's bottom-left activity orbit advances when the selected terminal
+The status bar's bottom-left three-dot pulse advances when the selected terminal
 contents refresh or the user scrolls it; it stays still when that panel is idle.
-The same fixed-size mark appears in a yellow connecting tab without changing the
-chip's dimensions. Next to the status mark, when a recent small tmux command has
+The same fixed-size pulse appears in a yellow connecting tab without changing
+the chip's dimensions. Next to the status mark, when a recent small tmux command has
 finished, its round-trip time is shown. That is not a probe: nothing extra is
 sent to measure it.
 
@@ -272,7 +277,7 @@ failures, a missing or destroyed session, a tmux server that exited, and an
 explicit detach all stop and wait for you, because retrying any of them would
 either loop on a security decision or quietly attach somewhere else. While a
 retry is waiting, the last view stays on screen in gray so it reads as frozen,
-not live, and the tab is yellow with a spinner.
+not live, and the tab is yellow with an animated three-dot pulse.
 
 Each retry waits a little longer, up to 30 seconds, with jitter so several tabs
 that drop together do not reconnect in lockstep. The status bar shows the attempt
