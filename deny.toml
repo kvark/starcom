@@ -33,6 +33,11 @@ ignore = [
     # Wayland client-side decorations, nowhere near SSH or terminal parsing, and
     # leaves when the GUI stack moves to a maintained font parser.
     { id = "RUSTSEC-2026-0192", reason = "unmaintained font parser behind winit; not in the SSH or terminal path" },
+    # paste is an unmaintained compile-time proc macro used to generate protocol
+    # identifiers in the pinned sunset-sftp crate. It is not linked into the
+    # application or fed runtime data. Remove this when Sunset adopts pastey or
+    # native identifier concatenation; tracked in PLAN.md M5.
+    { id = "RUSTSEC-2024-0436", reason = "compile-time macro in pinned sunset-sftp; replace with maintained identifier generation" },
 ]
 
 [bans]

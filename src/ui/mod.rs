@@ -1573,7 +1573,7 @@ pub(crate) fn paint_activity_indicator(ui: &egui::Ui, rect: egui::Rect, time: f6
     ui.painter().circle_stroke(
         center,
         radius,
-        egui::Stroke::new(1.0, color.gamma_multiply(0.35)),
+        egui::Stroke::new(1.0_f32, color.gamma_multiply(0.35)),
     );
     let angle = (time as f32 * std::f32::consts::TAU * 1.4) - std::f32::consts::FRAC_PI_2;
     let dot = center + egui::vec2(angle.cos(), angle.sin()) * radius;
