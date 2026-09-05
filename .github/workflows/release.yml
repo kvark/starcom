@@ -32,6 +32,12 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           case "$TAG" in v*) ;; *) echo "not a version tag: $TAG" >&2; exit 1;; esac
+          VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          test -n "$VERSION"
+          if test "$TAG" != "v$VERSION"; then
+            echo "tag $TAG does not match Cargo.toml version $VERSION" >&2
+            exit 1
+          fi
           awk -v want="## $TAG" '
             $0 == want { found = 1; next }
             found && /^## / { exit }
