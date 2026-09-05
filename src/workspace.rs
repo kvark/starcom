@@ -557,6 +557,7 @@ impl Workspace {
                 .is_some_and(|tab| tab.ui.terminal_focused(ctx))
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn set_notice(&mut self, notice: String) {
         self.notice = Some(notice);
     }
