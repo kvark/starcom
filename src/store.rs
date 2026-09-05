@@ -50,6 +50,10 @@ pub struct Tab {
     pub user: String,
     /// Last session this tab attached to, used as the startup resume target.
     pub session: String,
+    /// Last tmux window and pane selected in this tab. These are hints only:
+    /// reconnect validates them against the new snapshot before using them.
+    pub window: Option<u32>,
+    pub pane: Option<u32>,
     pub port: u16,
     pub identity: String,
     pub known_hosts: String,
@@ -195,7 +199,7 @@ fn parse(text: &str) -> anyhow::Result<Workspace> {
                 workspace.open_secs = open;
             }
             None if key == "version" => anyhow::ensure!(
-                value == "1",
+                matches!(value, "1" | "2"),
                 "{}: unsupported saved-workspace version {value}",
                 where_()
             ),
@@ -224,6 +228,8 @@ fn tab(fields: &collections::BTreeMap<&str, &str>) -> anyhow::Result<Tab> {
                     | "host"
                     | "user"
                     | "session"
+                    | "window"
+                    | "pane"
                     | "port"
                     | "identity"
                     | "known-hosts"
@@ -255,11 +261,19 @@ fn tab(fields: &collections::BTreeMap<&str, &str>) -> anyhow::Result<Tab> {
         "history exceeds {} lines",
         crate::snapshot::MAX_HISTORY_LINES
     );
+    let id = |key: &str| -> anyhow::Result<Option<u32>> {
+        fields
+            .get(key)
+            .map(|value| value.parse().with_context(|| format!("invalid {key}")))
+            .transpose()
+    };
     Ok(Tab {
         destination: text("destination"),
         host: text("host"),
         user: text("user"),
         session: text("session"),
+        window: id("window")?,
+        pane: id("pane")?,
         port: fields
             .get("port")
             .map(|port| port.parse())
@@ -280,7 +294,7 @@ pub fn render(workspace: &Workspace) -> String {
         "# Starcom saved connection tabs.\n\
          # Destinations and preferences only: no keys, passphrases, host-key\n\
          # material, or terminal contents.\n\
-         version 1\n",
+         version 2\n",
     );
     out.push_str(&format!("active {}\n", workspace.active));
     out.push_str(&format!(
@@ -310,6 +324,12 @@ pub fn render(workspace: &Workspace) -> String {
         put("host", &tab.host);
         put("user", &tab.user);
         put("session", &tab.session);
+        if let Some(window) = tab.window {
+            put("window", &window.to_string());
+        }
+        if let Some(pane) = tab.pane {
+            put("pane", &pane.to_string());
+        }
         put("port", &tab.port.to_string());
         put("identity", &tab.identity);
         put("known-hosts", &tab.known_hosts);
@@ -358,6 +378,8 @@ mod tests {
                     host: "10.0.0.2".into(),
                     user: "alice".into(),
                     session: String::new(),
+                    window: Some(4),
+                    pane: Some(9),
                     port: 2222,
                     identity: "/home/alice/.ssh/id_ed25519".into(),
                     known_hosts: "/home/alice/.ssh/known_hosts".into(),
@@ -451,7 +473,10 @@ mod tests {
     fn last_used_session_is_written() {
         let parsed = parse("version 1\n[tab]\ndestination dev\nsession work\n").unwrap();
         assert_eq!(parsed.tabs[0].session, "work");
+        assert_eq!(parsed.tabs[0].window, None);
+        assert_eq!(parsed.tabs[0].pane, None);
         assert!(render(&parsed).contains("session work"));
+        assert!(render(&parsed).contains("version 2"));
     }
 
     #[test]
@@ -498,7 +523,7 @@ mod tests {
             load(&file).is_err(),
             "the old agent/key radio must not be guessed at"
         );
-        fs::write(&file, "version 2\n").unwrap();
+        fs::write(&file, "version 3\n").unwrap();
         assert!(
             load(&file).is_err(),
             "a newer format must not be guessed at"
@@ -520,6 +545,7 @@ mod tests {
         );
         assert!(parse("[tab]\naccess maybe\n").is_err());
         assert!(parse("[tab]\nreconnect maybe\n").is_err());
+        assert!(parse("[tab]\npane not-a-number\n").is_err());
         let many = "[tab]\nhost a\n".repeat(MAX_TABS + 1);
         assert!(parse(&many).is_err(), "tab count must be bounded");
         assert!(parse("[tab]\nhost a\nhost b\n").is_err(), "duplicate key");

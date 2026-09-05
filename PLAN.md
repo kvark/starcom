@@ -116,7 +116,9 @@ The following are correctness rules, not optional polish:
 - Unsupported SSH routing, trust, or authentication directives are shown as
   blockers; Starcom does not quietly connect with different semantics.
 - Persisted state is destinations and preferences, never credentials, host-key
-  material, or terminal contents. Restoring a workspace opens forms, not sessions.
+  material, or terminal contents. Restoring a workspace reconnects saved tabs
+  to their existing sessions by default, validating saved pane/window hints
+  against each fresh snapshot before using them.
 - Session discovery uses `tmux -N` and cannot start a server. Starcom asks on its
   own only after an attach failed because the session was missing, when the user
   has already authenticated and the list is the answer. Creating a session is
@@ -171,7 +173,8 @@ terminal checkpoint.
   mouse reports; drags stay local selection. File drops upload over SFTP.
 - Divider dragging that resizes tmux on release.
 - Event-driven redraw and a worker thread that does no network I/O under the UI
-  model lock.
+  model lock. Hidden-tab output updates its activity timer without repainting an
+  unchanged selected terminal.
 - Automatic reconnection after transport loss: classification, cancellable
   jittered backoff, a visible attempt/countdown with a stop control, a fresh
   epoch and rebuilt models per attempt, and reports when the reattached session

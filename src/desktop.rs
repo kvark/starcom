@@ -109,6 +109,9 @@ pub enum Discovery {
 }
 
 pub(crate) struct State {
+    /// Bumped immediately before a worker asks the GUI to reconsider this
+    /// client. The workspace uses it to discard duplicate and hidden-tab wakes.
+    revision: u64,
     epoch: u64,
     pending: Option<Request>,
     stopping: bool,
@@ -138,6 +141,7 @@ pub(crate) struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            revision: 0,
             epoch: 0,
             pending: None,
             stopping: false,
@@ -183,6 +187,10 @@ impl State {
 
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// An interactive demo view for tests that need input tokens without a
@@ -296,15 +304,25 @@ pub struct Client {
 impl Client {
     pub fn new(wake: Wake) -> std::io::Result<Self> {
         let shared = sync::Arc::new((sync::Mutex::new(State::default()), sync::Condvar::new()));
+        let notify_shared = sync::Arc::clone(&shared);
+        let notify: Wake = sync::Arc::new(move || {
+            let mut state = notify_shared
+                .0
+                .lock()
+                .unwrap_or_else(sync::PoisonError::into_inner);
+            state.revision = state.revision.wrapping_add(1);
+            drop(state);
+            wake();
+        });
         let worker_shared = sync::Arc::clone(&shared);
-        let worker_wake = sync::Arc::clone(&wake);
+        let worker_wake = sync::Arc::clone(&notify);
         let worker = thread::Builder::new()
             .name("starcom-ssh".to_owned())
             .spawn(move || worker_loop(worker_shared, worker_wake))?;
         Ok(Self {
             shared,
             worker: Some(worker),
-            wake,
+            wake: notify,
         })
     }
 

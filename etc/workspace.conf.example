@@ -2,7 +2,7 @@
 # Copy to ~/.config/starcom/workspace.conf (or %APPDATA%\starcom\ on Windows)
 # and edit. Destinations and preferences only: no keys, passphrases, host-key
 # material, or terminal contents. A last-used session name is a resume target.
-version 1
+version 2
 active 0
 # Reconnect saved tabs to their existing tmux sessions at startup.
 restore-tabs yes
