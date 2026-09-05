@@ -70,9 +70,10 @@ Choosing a known host lists its tmux sessions and selects the first one so
 **Connect** is the next click. Each tab is one session and one window of that
 session: its form or its panes, not both side by side.
 
-Tabs are saved and reopened automatically on their disconnected forms by
-default; this can be disabled in **About**. Starcom never authenticates at
-startup, and the saved file holds destinations, never credentials.
+Tabs are saved and resumed automatically by reconnecting to their previous host
+and tmux session; this can be disabled in **About**. Startup uses the same SSH
+authentication and host-key checks as **Connect**, while the saved file holds
+destinations, never credentials.
 **Create session** is the one action that may start a tmux server, and it asks
 first.
 

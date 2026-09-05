@@ -103,8 +103,8 @@ impl Form {
         }
     }
 
-    /// Fill a form from a saved tab. Deliberately does not connect: restoring a
-    /// workspace must never authenticate on the user's behalf at startup.
+    /// Fill a form from a saved tab. The workspace decides whether to reconnect
+    /// it after current SSH policy has been applied.
     pub(crate) fn restore(saved: store::Tab) -> Self {
         Self {
             destination: saved.destination,
@@ -304,8 +304,8 @@ pub struct DesktopUi {
     agent_available: bool,
     agent_checked: time::Instant,
     /// Destination we last asked the host to list sessions for. Empty means
-    /// never listed. Restored tabs copy the destination here so opening a
-    /// workspace does not authenticate.
+    /// never listed. Restored tabs copy the destination here because startup
+    /// attaches directly instead of performing a redundant discovery request.
     listed_destination: String,
     /// List as soon as a host is chosen or a custom destination is committed.
     auto_list: bool,
@@ -370,7 +370,7 @@ impl DesktopUi {
         self.agent_available
     }
 
-    /// Restore a saved tab into this UI's form, showing the connection screen.
+    /// Restore a saved tab into this UI's form using current SSH policy.
     pub(crate) fn restore(&mut self, saved: store::Tab) {
         self.form = Form::restore(saved);
         self.profile_source = self.form.destination().to_owned();
@@ -385,6 +385,15 @@ impl DesktopUi {
             self.form
                 .apply_routing(&profile, self.config.default_identities());
         }
+    }
+
+    /// Build the saved attachment and show its terminal while the worker
+    /// reconnects. Invalid or incomplete saved forms stay on the connection
+    /// screen so the user can repair them.
+    pub(crate) fn resume(&mut self) -> anyhow::Result<desktop::Connection> {
+        let connection = self.form.connection()?;
+        self.open_terminal();
+        Ok(connection)
     }
 
     pub(crate) fn saved(&self) -> store::Tab {

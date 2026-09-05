@@ -53,8 +53,8 @@ are listed for one-click selection; the field after those buttons accepts a
 hostname, address, or alias that is not in that list. Selecting a known host
 resolves the supported
 profile and lists that host's tmux sessions, selecting the first so **Connect**
-is available immediately. Restored tabs do not list or authenticate on their
-own.
+is available immediately. Startup resume attaches directly to each saved
+session without listing first, using the current SSH configuration.
 
 Currently supported:
 
@@ -89,22 +89,23 @@ is interactive, whether it reconnects, an extra identity path if you typed one,
 the global redraw cap (`fps`, default 5), and how long a quiet connected tab
 waits before its chip turns blue (`idle`, default 30 seconds, 0 off; see
 `etc/workspace.conf.example`). Both `fps` and `idle` are also on the **About**
-panel. The last-used session is a form hint: restoring a workspace still does
-not authenticate.
+panel. The last-used session is the target used to resume that tab on startup.
 Nothing that would let a reader of that file connect is written: no keys, no
 passphrases, no host-key material, and no terminal contents. An identity entry
 is the path you already chose, never the key behind it.
 
-Saved tabs reopen automatically by default, together and immediately visible on
-their disconnected connection forms. Disable **Restore open tabs on startup**
-in **About** to begin future launches with an empty workspace instead. Identity
+Saved tabs resume automatically by default: each reconnects to its previous host
+and existing tmux session, and the active tab shows connection progress until
+its terminal view is rebuilt. Disable **Resume open tabs on startup** in
+**About** to begin future launches with an empty workspace instead. Identity
 files, `IdentitiesOnly`, and unsupported-policy blockers are re-read from
-`~/.ssh/config` so a saved tab cannot skip a new `IdentityFile` or connect on
-terms the config no longer allows. Starcom does not connect or authenticate at
-startup — you press **Connect**, exactly as on a cold start. A saved file that
-cannot be read is a system dialog before the window opens: it names the file and
-the parse error, and asks whether to clear the file or exit. Exit is the default
-and leaves the file unchanged. Clearing deletes it and starts fresh.
+`~/.ssh/config`, and normal host-key and authentication checks still apply. A
+tab whose saved settings are incomplete or no longer allowed stays on its form
+and shows the error; Starcom never silently creates a replacement session. A
+saved file that cannot be read is a system dialog before the window opens: it
+names the file and the parse error, and asks whether to clear the file or exit.
+Exit is the default and leaves the file unchanged. Clearing deletes it and
+starts fresh.
 
 The demo neither reads nor writes this file.
 

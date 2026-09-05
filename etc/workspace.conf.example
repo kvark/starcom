@@ -1,10 +1,10 @@
 # Starcom saved connection tabs.
 # Copy to ~/.config/starcom/workspace.conf (or %APPDATA%\starcom\ on Windows)
 # and edit. Destinations and preferences only: no keys, passphrases, host-key
-# material, or terminal contents. A last-used session name is a form hint.
+# material, or terminal contents. A last-used session name is a resume target.
 version 1
 active 0
-# Reopen saved tabs on their disconnected forms at startup.
+# Reconnect saved tabs to their existing tmux sessions at startup.
 restore-tabs yes
 # Idle remote paint rate, 1..=60. 0 means the default (5). Pointer and key
 # events still paint immediately. After keys or wheel, echo runs at up to
