@@ -17,10 +17,10 @@ other three items — connection reuse, ProxyJump, and certificate/MFA workflows
 are blocked on Sunset 0.6 and are recorded below with what specifically blocks
 each. M5 is next.
 
-Development targets `main` directly. CI runs for pull requests and updates to
-`main`. Routine milestone branches, generated recovery trees, and shadow copies
-of the source are not part of the workflow; the application source lives in the
-normal repository root.
+Development lands on protected `main` through short-lived pull requests. CI runs
+for pull requests and updates to `main`. Routine milestone branches, generated
+recovery trees, and shadow copies of the source are not part of the workflow;
+the application source lives in the normal repository root.
 
 ## Product goal
 
