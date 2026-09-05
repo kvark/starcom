@@ -19,6 +19,7 @@ struct Tab {
     last_seq: u64,
     last_output: time::Instant,
     last_phase: desktop::Phase,
+    last_revision: u64,
 }
 
 pub(crate) enum Action {
@@ -62,6 +63,9 @@ pub(crate) struct Workspace {
     /// GUI-side copy of the last event-loop clock, used to notice a machine
     /// sleep while the SSH worker is blocked in poll.
     suspend_clock: reconnect::AliveClock,
+    /// A local action was applied after the frame that produced it, so one more
+    /// paint is required even if no client worker changed.
+    local_dirty: bool,
     /// The winit lifecycle can ask us to shut down through more than one path.
     /// Only the first call may persist and clear the tab list.
     shut_down: bool,
@@ -141,6 +145,7 @@ fn spawn_tab(
         last_seq: 0,
         last_output: time::Instant::now(),
         last_phase: desktop::Phase::Idle,
+        last_revision: 0,
     })
 }
 
@@ -148,6 +153,13 @@ fn busy_phase(phase: desktop::Phase) -> bool {
     matches!(
         phase,
         desktop::Phase::Connecting | desktop::Phase::Reconnecting
+    )
+}
+
+fn live_phase(phase: desktop::Phase) -> bool {
+    matches!(
+        phase,
+        desktop::Phase::Watching | desktop::Phase::Demo | desktop::Phase::Resynchronizing
     )
 }
 
@@ -249,6 +261,7 @@ impl Workspace {
             session_started: time::Instant::now(),
             echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
+            local_dirty: false,
             shut_down: false,
         };
         if startup != desktop::Startup::Demo {
@@ -359,6 +372,52 @@ impl Workspace {
         } else {
             idle
         }
+    }
+
+    /// Consume worker revisions and report whether anything currently visible
+    /// changed. Output in a hidden, already-active tab updates its quiet timer
+    /// without repainting the selected terminal.
+    pub(crate) fn remote_changed(&mut self) -> bool {
+        let mut repaint = std::mem::take(&mut self.local_dirty);
+        let now = time::Instant::now();
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            let state = tab.client.lock();
+            let revision = state.revision();
+            if revision == tab.last_revision {
+                continue;
+            }
+            let phase = state.phase;
+            let seq = state
+                .view
+                .as_ref()
+                .map(crate::snapshot::View::display_seq)
+                .unwrap_or(0);
+            drop(state);
+
+            let phase_changed = phase != tab.last_phase;
+            let display_changed = seq != tab.last_seq;
+            let was_quiet = self.idle > 0
+                && live_phase(tab.last_phase)
+                && now.saturating_duration_since(tab.last_output)
+                    >= time::Duration::from_secs(u64::from(self.idle));
+            tab.last_revision = revision;
+            if phase_changed || display_changed {
+                tab.last_phase = phase;
+                tab.last_seq = seq;
+                tab.last_output = now;
+            }
+            repaint |= (!self.composer_open && index == self.active)
+                || phase_changed
+                || (display_changed && was_quiet);
+        }
+
+        let state = self.composer.client.lock();
+        let revision = state.revision();
+        if revision != self.composer.last_revision {
+            self.composer.last_revision = revision;
+            repaint |= self.composer_open;
+        }
+        repaint
     }
 
     fn show_about(&mut self, ctx: &egui::Context) {
@@ -683,6 +742,7 @@ impl Workspace {
                             let now = time::Instant::now();
                             for tab in &mut self.tabs {
                                 let state = tab.client.lock();
+                                tab.last_revision = state.revision();
                                 let phase = state.phase;
                                 let seq = state
                                     .view
@@ -708,23 +768,10 @@ impl Workspace {
                                     }
                                     let selected = !self.composer_open && index == self.active;
                                     let quiet = self.idle > 0
-                                        && matches!(
-                                            phase,
-                                            desktop::Phase::Watching
-                                                | desktop::Phase::Demo
-                                                | desktop::Phase::Resynchronizing
-                                        )
+                                        && live_phase(phase)
                                         && now.saturating_duration_since(tab.last_output)
                                             >= idle_after;
-                                    if !quiet
-                                        && self.idle > 0
-                                        && matches!(
-                                            phase,
-                                            desktop::Phase::Watching
-                                                | desktop::Phase::Demo
-                                                | desktop::Phase::Resynchronizing
-                                        )
-                                    {
+                                    if !quiet && self.idle > 0 && live_phase(phase) {
                                         ui.ctx().request_repaint_after(idle_after.saturating_sub(
                                             now.saturating_duration_since(tab.last_output),
                                         ));
@@ -1048,6 +1095,7 @@ impl Workspace {
         if let Err(error) = result {
             self.notice = Some(error.to_string());
         }
+        self.local_dirty = true;
         (self.wake)();
     }
 
@@ -1557,6 +1605,7 @@ mod tests {
             session_started: time::Instant::now(),
             echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
+            local_dirty: false,
             shut_down: false,
         }
     }
@@ -1684,6 +1733,33 @@ mod tests {
         assert_eq!(workspace.paint_interval(), time::Duration::from_millis(50));
         workspace.echo_until = Some(time::Instant::now() - time::Duration::from_millis(1));
         assert_eq!(workspace.paint_interval(), idle);
+    }
+
+    #[test]
+    fn hidden_terminal_updates_do_not_repaint_the_selected_terminal() {
+        let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
+        assert!(workspace.remote_changed());
+        assert!(!workspace.remote_changed(), "duplicate wakes are discarded");
+
+        workspace.push_idle_tab().unwrap();
+        workspace.active = 0;
+        workspace.tabs[1].client.demo().unwrap();
+        assert!(
+            workspace.remote_changed(),
+            "a hidden tab's phase change updates its visible chip"
+        );
+        assert!(!workspace.remote_changed());
+
+        workspace.tabs[1].client.demo().unwrap();
+        assert!(
+            !workspace.remote_changed(),
+            "new hidden terminal contents do not repaint the selected terminal"
+        );
+        workspace.tabs[0].client.demo().unwrap();
+        assert!(
+            workspace.remote_changed(),
+            "new selected terminal contents do repaint"
+        );
     }
 
     #[test]

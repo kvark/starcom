@@ -436,6 +436,9 @@ impl winit::application::ApplicationHandler<Event> for App {
         match event {
             Event::Repaint(when) => self.schedule(when, true),
             Event::Remote => {
+                if !self.workspace.remote_changed() {
+                    return;
+                }
                 let now = time::Instant::now();
                 let interval = self.workspace.paint_interval();
                 let when = match self.last_paint {

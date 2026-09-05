@@ -39,8 +39,10 @@ Tabs, mouse, paste, session create, SFTP drops, and an About panel after
 - **Move pane.** Arrow buttons swap the focused pane with its neighbor.
 - **Terminal polish.** Zoomed panes show a distinct restore icon. Activity uses
   a fixed-size orbit instead of shape-shifting text glyphs. Shift-Enter falls
-  back to Enter instead of allowing `S-Enter` to appear as literal input, and
-  move arrows account for tmux's separator cell.
+  back to Enter instead of allowing `S-Enter` to appear as literal input. The
+  status orbit advances only when the selected terminal changes or scrolls;
+  hidden-tab output no longer repaints an unchanged selected terminal. Move
+  arrows account for tmux's separator cell.
 - **History.** The default local history depth is 1000 lines, matching the
   snapshot cap.
 - **Sunset.** Pinned to `navigato-rs/sunset` `c245252`, which includes the

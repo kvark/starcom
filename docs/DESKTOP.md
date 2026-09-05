@@ -210,17 +210,19 @@ The renderer paints only visible history rows. Font-size controls change the
 cell metrics used both to paint and to tell tmux this client's size, so the
 remote grid matches the glyphs on screen.
 
-The status bar's bottom-left activity orbit ticks on each workspace repaint, the
-same liveness mark FileMan uses. The same fixed-size mark appears in a yellow
-connecting tab without changing the chip's dimensions. Next to the status mark,
-when a recent small tmux command has finished, its round-trip time is shown. That
-is not a probe: nothing extra is sent to measure it.
+The status bar's bottom-left activity orbit advances when the selected terminal
+contents refresh or the user scrolls it; it stays still when that panel is idle.
+The same fixed-size mark appears in a yellow connecting tab without changing the
+chip's dimensions. Next to the status mark, when a recent small tmux command has
+finished, its round-trip time is shown. That is not a probe: nothing extra is
+sent to measure it.
 
 Remote pane output is redrawn at most 5 times per second by default (`fps` in
 `workspace.conf`; `etc/workspace.conf.example` is the documented file). Buttons,
 hover, typing, and other local UI stay immediate. After keys or wheel are sent,
 remote frames run at up to 20 fps for a short time so the echo does not wait on
-the idle cap.
+the idle cap. Output in a hidden tab keeps that tab's activity/quiet state
+accurate but does not repaint an unchanged selected terminal.
 
 ## Pane controls
 

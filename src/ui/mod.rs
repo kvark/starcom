@@ -312,6 +312,10 @@ pub struct DesktopUi {
     /// Last cell size sent to tmux, so we do not spam refresh-client -C.
     client_cells: Option<core::Size>,
     pending_client_cells: Option<(core::Size, time::Instant)>,
+    /// The status marker advances once per visible terminal refresh, not with
+    /// wall time. An idle tab therefore cannot animate itself.
+    refresh_tick: u64,
+    last_refresh: Option<(u64, u64)>,
 }
 
 impl Default for DesktopUi {
@@ -351,6 +355,8 @@ impl DesktopUi {
             auto_list: false,
             client_cells: None,
             pending_client_cells: None,
+            refresh_tick: 0,
+            last_refresh: None,
         }
     }
 
@@ -970,7 +976,20 @@ impl DesktopUi {
         self.generation = state.generation;
     }
 
+    fn note_refresh(&mut self, state: &desktop::State, scrolled: bool) {
+        let refresh = state
+            .view
+            .as_ref()
+            .map(|view| (state.generation, view.display_seq()));
+        if refresh != self.last_refresh || scrolled {
+            self.refresh_tick = self.refresh_tick.wrapping_add(1);
+            self.last_refresh = refresh;
+        }
+    }
+
     fn show_terminal(&mut self, root: &mut egui::Ui, state: &mut desktop::State) -> Action {
+        let scrolled = root.input(|input| input.smooth_scroll_delta != egui::Vec2::ZERO);
+        self.note_refresh(state, scrolled);
         let generation_changed = self.generation != state.generation;
         self.rebuild_layout(state);
         if (generation_changed || self.restore_focus)
@@ -1059,7 +1078,7 @@ impl DesktopUi {
                                     egui::vec2(14.0, 14.0),
                                     egui::Sense::hover(),
                                 );
-                                paint_activity_indicator(ui, rect, ui.ctx().time());
+                                paint_refresh_indicator(ui, rect, self.refresh_tick);
                             });
                         if matches!(
                             state.phase,
@@ -1576,6 +1595,20 @@ fn click_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::R
 /// A fixed-size activity mark. The orbit moves, while its outline and occupied
 /// space stay constant, so tab and button labels do not pulse in width or size.
 pub(crate) fn paint_activity_indicator(ui: &egui::Ui, rect: egui::Rect, time: f64) {
+    let angle = (time as f32 * std::f32::consts::TAU * 1.4) - std::f32::consts::FRAC_PI_2;
+    paint_orbit(ui, rect, angle);
+}
+
+/// A refresh mark driven by completed paints rather than a timer. It moves
+/// faster when visible content refreshes faster and stays still when idle.
+fn paint_refresh_indicator(ui: &egui::Ui, rect: egui::Rect, tick: u64) {
+    const POSITIONS: u64 = 12;
+    let angle = (tick % POSITIONS) as f32 * std::f32::consts::TAU / POSITIONS as f32
+        - std::f32::consts::FRAC_PI_2;
+    paint_orbit(ui, rect, angle);
+}
+
+fn paint_orbit(ui: &egui::Ui, rect: egui::Rect, angle: f32) {
     let center = rect.center();
     let radius = rect.width().min(rect.height()) * 0.34;
     let color = ui.visuals().strong_text_color();
@@ -1584,7 +1617,6 @@ pub(crate) fn paint_activity_indicator(ui: &egui::Ui, rect: egui::Rect, time: f6
         radius,
         egui::Stroke::new(1.0_f32, color.gamma_multiply(0.35)),
     );
-    let angle = (time as f32 * std::f32::consts::TAU * 1.4) - std::f32::consts::FRAC_PI_2;
     let dot = center + egui::vec2(angle.cos(), angle.sin()) * radius;
     ui.painter().circle_filled(dot, 1.8, color);
 }
@@ -1764,6 +1796,36 @@ mod tests {
     fn new_ui_starts_on_connection_form() {
         let ui = DesktopUi::default();
         assert_eq!(ui.screen, Screen::Connection);
+    }
+
+    #[test]
+    fn refresh_marker_tracks_visible_changes_and_scrolling_not_time() {
+        let mut ui = DesktopUi::default();
+        let mut state = desktop::State::interactive_demo().unwrap();
+        ui.note_refresh(&state, false);
+        let initial = ui.refresh_tick;
+
+        ui.note_refresh(&state, false);
+        assert_eq!(ui.refresh_tick, initial, "an idle frame is not activity");
+
+        let pane = state
+            .view
+            .as_ref()
+            .and_then(|view| view.panes().keys().next().copied())
+            .unwrap();
+        state
+            .view
+            .as_mut()
+            .unwrap()
+            .apply(tmuxctl::Notification::Output {
+                pane,
+                bytes: b"changed".to_vec(),
+            });
+        ui.note_refresh(&state, false);
+        assert_eq!(ui.refresh_tick, initial + 1);
+
+        ui.note_refresh(&state, true);
+        assert_eq!(ui.refresh_tick, initial + 2);
     }
 
     fn paint(ui: &mut DesktopUi, state: &mut desktop::State) -> Action {
