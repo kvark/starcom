@@ -34,10 +34,10 @@ resolution has actually been performed; do not invent lockfile entries.
 
 ## Workflow
 
-Work directly on `main` during this initial development phase; do not create
-extra milestone branches unless requested. CI runs on pull requests and pushes
-to `main`, not on other branch pushes. Preserve merged work before deleting an
-old branch.
+Use a short-lived branch and pull request: protected `main` requires the five CI
+checks before merge. Do not create extra milestone branches unless requested.
+CI runs on pull requests and pushes to `main`, not on unreviewed branch pushes.
+Preserve merged work before deleting an old branch.
 
 Run these checks before submitting changes:
 

@@ -50,6 +50,7 @@ pub(crate) struct Workspace {
     store: Option<path::PathBuf>,
     fps: u32,
     idle: u32,
+    restore_tabs: bool,
     about: bool,
     about_icon: Option<egui::TextureHandle>,
     /// Seconds this install has been open across launches. Updated on persist.
@@ -61,6 +62,9 @@ pub(crate) struct Workspace {
     /// GUI-side copy of the last event-loop clock, used to notice a machine
     /// sleep while the SSH worker is blocked in poll.
     suspend_clock: reconnect::AliveClock,
+    /// The winit lifecycle can ask us to shut down through more than one path.
+    /// Only the first call may persist and clear the tab list.
+    shut_down: bool,
 }
 
 /// A restored tab is labelled by where it points, not by a live connection.
@@ -238,12 +242,14 @@ impl Workspace {
                 .map(|home| store::path(&home)),
             fps: store::DEFAULT_FPS,
             idle: store::DEFAULT_IDLE,
+            restore_tabs: true,
             about: false,
             about_icon: None,
             open_secs: 0,
             session_started: time::Instant::now(),
             echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
+            shut_down: false,
         };
         if startup != desktop::Startup::Demo {
             workspace.reload_config();
@@ -295,13 +301,16 @@ impl Workspace {
                 }
             },
         };
-        for tab in saved.tabs {
-            if self.push_idle_tab().is_err() {
-                break;
+        self.restore_tabs = saved.restore_tabs;
+        if self.restore_tabs {
+            for tab in saved.tabs {
+                if self.push_idle_tab().is_err() {
+                    break;
+                }
+                let index = self.tabs.len() - 1;
+                self.tabs[index].label = label(&tab);
+                self.tabs[index].ui.restore(tab);
             }
-            let index = self.tabs.len() - 1;
-            self.tabs[index].label = label(&tab);
-            self.tabs[index].ui.restore(tab);
         }
         self.active = saved.active.min(self.tabs.len().saturating_sub(1));
         self.composer_open = self.tabs.is_empty();
@@ -334,6 +343,7 @@ impl Workspace {
         ctx.request_repaint_after(time::Duration::from_secs(1));
         let mut fps = self.fps;
         let mut idle = self.idle;
+        let mut restore_tabs = self.restore_tabs;
         let mut close = false;
         let open_for = format_open(self.open_secs_now());
         if self.about_icon.is_none()
@@ -347,10 +357,10 @@ impl Workspace {
         // First-frame Area size is 0 unless we name one; that clips the
         // contents and flashes egui's debug overflow (red) edges.
         let response = egui::Modal::new(id)
-            .area(egui::Modal::default_area(id).default_size([380.0, 300.0]))
+            .area(egui::Modal::default_area(id).default_size([400.0, 340.0]))
             .show(ctx, |ui| {
-                ui.set_min_size(egui::vec2(360.0, 260.0));
-                ui.set_width(360.0);
+                ui.set_min_size(egui::vec2(380.0, 300.0));
+                ui.set_width(380.0);
                 ui.horizontal(|ui| {
                     if let Some(ref icon) = icon {
                         ui.add(egui::Image::new((icon.id(), egui::vec2(72.0, 72.0))));
@@ -391,6 +401,11 @@ impl Workspace {
                     );
                 });
                 ui.weak("0 seconds keeps a connected tab green.");
+                ui.add_space(6.0);
+                ui.checkbox(&mut restore_tabs, "Restore open tabs on startup");
+                ui.weak(
+                    "Restored tabs open as disconnected forms and never authenticate by themselves.",
+                );
                 ui.add_space(10.0);
                 ui.label(format!("Open for {open_for} in total"));
                 ui.add_space(8.0);
@@ -403,9 +418,13 @@ impl Workspace {
         if close || response.should_close() {
             self.about = false;
         }
-        if store::clamp_fps(fps) != self.fps || idle.min(store::MAX_IDLE) != self.idle {
+        if store::clamp_fps(fps) != self.fps
+            || idle.min(store::MAX_IDLE) != self.idle
+            || restore_tabs != self.restore_tabs
+        {
             self.fps = store::clamp_fps(fps);
             self.idle = idle.min(store::MAX_IDLE);
+            self.restore_tabs = restore_tabs;
             self.persist();
         }
     }
@@ -441,6 +460,7 @@ impl Workspace {
                 .map(|tab| tab.ui.saved())
                 .collect(),
             active: self.active,
+            restore_tabs: self.restore_tabs,
             fps: store::clamp_fps(self.fps),
             idle: self.idle.min(store::MAX_IDLE),
             open_secs: self.open_secs.min(store::MAX_OPEN_SECS),
@@ -1025,6 +1045,10 @@ impl Workspace {
     }
 
     pub fn shutdown(&mut self) {
+        if self.shut_down {
+            return;
+        }
+        self.shut_down = true;
         self.cancel_transient();
         // Save before dropping the tabs: the forms are the thing being saved.
         self.persist();
@@ -1203,7 +1227,7 @@ mod tests {
         assert_eq!(workspace.tabs[1].client.phase(), desktop::Phase::Idle);
     }
     #[test]
-    fn saved_tabs_reopen_on_their_form_without_connecting() {
+    fn saved_tabs_reopen_automatically_without_connecting() {
         let directory = std::env::temp_dir().join(format!(
             "starcom-workspace-{}-{:?}",
             std::process::id(),
@@ -1245,6 +1269,7 @@ mod tests {
                     },
                 ],
                 active: 1,
+                restore_tabs: true,
                 fps: store::DEFAULT_FPS,
                 idle: store::DEFAULT_IDLE,
                 open_secs: 0,
@@ -1254,6 +1279,7 @@ mod tests {
 
         let mut workspace = idle_workspace(Some(file.clone()));
         assert!(workspace.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
+        assert!(workspace.restore_tabs);
         assert_eq!(workspace.tabs.len(), 2);
         assert_eq!(workspace.active, 1);
         // The whole point: no tab may be connecting or connected at startup.
@@ -1267,6 +1293,7 @@ mod tests {
         }
         assert_eq!(workspace.tabs[0].label, "dev / work");
         assert_eq!(workspace.tabs[1].label, "build.example.test / ci");
+        assert!(!workspace.composer_open);
         workspace.persist();
         let reloaded = store::load(&file).unwrap().unwrap();
         assert_eq!(reloaded.tabs.len(), 2);
@@ -1275,6 +1302,107 @@ mod tests {
         assert_eq!(reloaded.tabs[0].session, "work");
         assert_eq!(reloaded.tabs[1].session, "ci");
         assert_eq!(reloaded.active, 1);
+
+        // The native lifecycle can request shutdown more than once. A later
+        // call must not replace the first call's saved tabs with the cleared
+        // in-memory list.
+        workspace.shutdown();
+        workspace.shutdown();
+        assert_eq!(store::load(&file).unwrap().unwrap().tabs.len(), 2);
+
+        let mut reopened = idle_workspace(Some(file));
+        assert!(reopened.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
+        assert_eq!(reopened.tabs.len(), 2);
+        assert_eq!(reopened.active, 1);
+        assert!(!reopened.composer_open);
+    }
+
+    #[test]
+    fn one_open_tab_survives_shutdown_and_the_next_startup() {
+        let directory = std::env::temp_dir().join(format!(
+            "starcom-workspace-one-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let file = directory.join("workspace.conf");
+
+        let mut closing = idle_workspace(Some(file.clone()));
+        closing.push_idle_tab().unwrap();
+        let saved = store::Tab {
+            destination: "dev".into(),
+            host: "dev.example.test".into(),
+            user: "alice".into(),
+            session: "work".into(),
+            port: 22,
+            history: store::DEFAULT_HISTORY,
+            interactive: true,
+            reconnect: true,
+            ..store::Tab::default()
+        };
+        closing.tabs[0].label = label(&saved);
+        closing.tabs[0].ui.restore(saved);
+        closing.shutdown();
+        closing.shutdown();
+
+        let on_disk = store::load(&file).unwrap().unwrap();
+        assert!(on_disk.restore_tabs);
+        assert_eq!(on_disk.tabs.len(), 1);
+        assert_eq!(on_disk.tabs[0].destination, "dev");
+
+        let mut started = idle_workspace(Some(file));
+        assert!(started.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
+        assert_eq!(started.tabs.len(), 1);
+        assert_eq!(started.tabs[0].label, "dev / work");
+        assert!(!started.composer_open);
+    }
+
+    #[test]
+    fn disabled_tab_restore_starts_with_an_empty_workspace() {
+        let directory = std::env::temp_dir().join(format!(
+            "starcom-workspace-no-restore-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let file = directory.join("workspace.conf");
+        store::save(
+            &file,
+            &store::Workspace {
+                tabs: vec![store::Tab {
+                    destination: "dev".into(),
+                    host: "dev.example.test".into(),
+                    ..store::Tab::default()
+                }],
+                restore_tabs: false,
+                ..store::Workspace::default()
+            },
+        )
+        .unwrap();
+
+        let mut workspace = idle_workspace(Some(file));
+        assert!(workspace.restore(|_, _| dialog::BrokenStore::Exit).unwrap());
+        assert!(!workspace.restore_tabs);
+        assert!(workspace.tabs.is_empty());
+        assert!(workspace.composer_open);
     }
 
     fn idle_workspace(store: Option<path::PathBuf>) -> Workspace {
@@ -1298,12 +1426,14 @@ mod tests {
             store,
             fps: store::DEFAULT_FPS,
             idle: store::DEFAULT_IDLE,
+            restore_tabs: true,
             about: false,
             about_icon: None,
             open_secs: 0,
             session_started: time::Instant::now(),
             echo_until: None,
             suspend_clock: reconnect::AliveClock::now(),
+            shut_down: false,
         }
     }
 

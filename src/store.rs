@@ -64,6 +64,7 @@ pub struct Tab {
 pub struct Workspace {
     pub tabs: Vec<Tab>,
     pub active: usize,
+    pub restore_tabs: bool,
     pub fps: u32,
     pub idle: u32,
     pub open_secs: u64,
@@ -74,6 +75,7 @@ impl Default for Workspace {
         Self {
             tabs: Vec::new(),
             active: 0,
+            restore_tabs: true,
             fps: DEFAULT_FPS,
             idle: DEFAULT_IDLE,
             open_secs: 0,
@@ -159,6 +161,13 @@ fn parse(text: &str) -> anyhow::Result<Workspace> {
             }
             // Before the first [tab]: file-level settings.
             None if key == "active" => workspace.active = value.parse().with_context(where_)?,
+            None if key == "restore-tabs" => {
+                workspace.restore_tabs = match value {
+                    "yes" => true,
+                    "no" => false,
+                    _ => anyhow::bail!("{}: invalid restore-tabs value {value:?}", where_()),
+                };
+            }
             None if key == "fps" => {
                 let fps: u32 = value.parse().with_context(where_)?;
                 anyhow::ensure!(
@@ -275,6 +284,10 @@ pub fn render(workspace: &Workspace) -> String {
          version 1\n",
     );
     out.push_str(&format!("active {}\n", workspace.active));
+    out.push_str(&format!(
+        "restore-tabs {}\n",
+        if workspace.restore_tabs { "yes" } else { "no" }
+    ));
     out.push_str(&format!("fps {}\n", clamp_fps(workspace.fps)));
     out.push_str(&format!("idle {}\n", workspace.idle.min(MAX_IDLE)));
     out.push_str(&format!(
@@ -365,6 +378,7 @@ mod tests {
                 },
             ],
             active: 1,
+            restore_tabs: true,
             fps: DEFAULT_FPS,
             idle: DEFAULT_IDLE,
             open_secs: 0,
@@ -378,6 +392,17 @@ mod tests {
         assert_eq!(parse(&render(&workspace)).unwrap().fps, 12);
         assert_eq!(parse("fps 0\n").unwrap().fps, DEFAULT_FPS);
         assert!(parse("fps 99\n").is_err());
+    }
+
+    #[test]
+    fn tab_restore_is_enabled_by_default_and_round_trips() {
+        assert!(parse("").unwrap().restore_tabs);
+        let mut workspace = sample();
+        workspace.restore_tabs = false;
+        let text = render(&workspace);
+        assert!(text.contains("restore-tabs no"));
+        assert!(!parse(&text).unwrap().restore_tabs);
+        assert!(parse("restore-tabs maybe\n").is_err());
     }
 
     #[test]
@@ -405,6 +430,7 @@ mod tests {
             "/etc/workspace.conf.example"
         )))
         .expect("etc/workspace.conf.example must stay a valid workspace.conf");
+        assert!(parsed.restore_tabs);
         assert_eq!(parsed.fps, DEFAULT_FPS);
         assert_eq!(parsed.tabs.len(), 1);
         assert_eq!(parsed.tabs[0].destination, "example");

@@ -95,14 +95,16 @@ Nothing that would let a reader of that file connect is written: no keys, no
 passphrases, no host-key material, and no terminal contents. An identity entry
 is the path you already chose, never the key behind it.
 
-Restored tabs open on their connection form with the fields filled in. Identity
+Saved tabs reopen automatically by default, together and immediately visible on
+their disconnected connection forms. Disable **Restore open tabs on startup**
+in **About** to begin future launches with an empty workspace instead. Identity
 files, `IdentitiesOnly`, and unsupported-policy blockers are re-read from
 `~/.ssh/config` so a saved tab cannot skip a new `IdentityFile` or connect on
 terms the config no longer allows. Starcom does not connect or authenticate at
 startup — you press **Connect**, exactly as on a cold start. A saved file that
 cannot be read is a system dialog before the window opens: it names the file and
 the parse error, and asks whether to clear the file or exit. Exit is the default
-and leaves the file unchanged. Clearing deletes it and starts with one new tab.
+and leaves the file unchanged. Clearing deletes it and starts fresh.
 
 The demo neither reads nor writes this file.
 

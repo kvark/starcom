@@ -11,15 +11,16 @@ reported. Alternate-screen panes and a History setting below tmux's buffer are
 not treated as lost output. Loss during output, input, paste, and a remote layout
 change, plus a restarted tmux server, are covered by fixture tests.
 
-M4 now persists non-secret tabs and restores them without authenticating, and
-adds explicit session discovery and creation. Its other three items — connection
-reuse, ProxyJump, and certificate/MFA workflows — are blocked on Sunset 0.6 and
-are recorded below with what specifically blocks each. M5 is next.
+M4 now persists non-secret tabs, restores them by default without authenticating
+with an opt-out setting, and adds explicit session discovery and creation. Its
+other three items — connection reuse, ProxyJump, and certificate/MFA workflows —
+are blocked on Sunset 0.6 and are recorded below with what specifically blocks
+each. M5 is next.
 
-Development targets `main` directly. CI runs for pull requests and updates to
-`main`. Routine milestone branches, generated recovery trees, and shadow copies
-of the source are not part of the workflow; the application source lives in the
-normal repository root.
+Development lands on protected `main` through short-lived pull requests. CI runs
+for pull requests and updates to `main`. Routine milestone branches, generated
+recovery trees, and shadow copies of the source are not part of the workflow;
+the application source lives in the normal repository root.
 
 ## Product goal
 
@@ -175,7 +176,8 @@ terminal checkpoint.
   jittered backoff, a visible attempt/countdown with a stop control, a fresh
   epoch and rebuilt models per attempt, and reports when the reattached session
   or its scrollback is not continuous with what was on screen.
-- Saved connection tabs restored onto their forms, never authenticated on start.
+- Saved connection tabs restored automatically onto their forms by default,
+  never authenticated on start, with an opt-out setting in About.
 - Explicit session listing (`tmux -N`, which cannot start a server) and confirmed
   session creation, which is the one path allowed to start one.
 - Ordered shutdown and a native Linux/X11 close-path test.
@@ -249,7 +251,8 @@ verified to fail when automatic retry is disabled.
 
 ### M4 — Multiple-machine operational fit: two items done, three blocked on the SSH backend
 
-- [x] Persist non-secret tabs/profiles and restore them without auto-authentication.
+- [x] Persist non-secret tabs/profiles and restore them by default, with an
+  opt-out setting and no auto-authentication.
 - [x] Add explicit session discovery/creation UI without changing attach semantics.
   Listing is also offered on its own after an attach fails because the session is
   missing: the user has already authenticated and the list is the answer. No
