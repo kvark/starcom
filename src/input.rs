@@ -37,6 +37,17 @@ pub struct Modifiers {
 
 impl Key {
     pub(crate) fn name(self, modifiers: Modifiers) -> Result<String, Error> {
+        // Shift+Enter has no portable terminal encoding. Passing `S-Enter` to
+        // tmux makes some tmux/application combinations surface the key name as
+        // literal input. Treat it like a conventional terminal does: Enter.
+        let modifiers = if self == Self::Enter {
+            Modifiers {
+                shift: false,
+                ..modifiers
+            }
+        } else {
+            modifiers
+        };
         let name = match self {
             Self::Enter => "Enter".to_owned(),
             Self::Backspace => "BSpace".to_owned(),
@@ -274,6 +285,16 @@ mod tests {
     #[test]
     fn named_keys_cannot_become_control_commands() {
         assert_eq!(Key::Up.name(Modifiers::default()).unwrap(), "Up");
+        assert_eq!(
+            Key::Enter
+                .name(Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                })
+                .unwrap(),
+            "Enter",
+            "Shift+Enter must not become literal S-Enter input"
+        );
         assert_eq!(
             Key::Left
                 .name(Modifiers {

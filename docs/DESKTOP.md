@@ -149,6 +149,9 @@ Click a pane to focus it. Text and committed IME input are encoded as UTF-8.
 Enter, arrows, Home/End, Page Up/Down, Insert/Delete, Tab, Escape, Backspace, and
 F1-F20 are sent through tmux's key handling. Plain terminal control combinations
 such as Ctrl-C, Ctrl-X, Ctrl-V, and Ctrl-Z remain application input.
+Traditional terminal input has no portable distinct Shift-Enter encoding, so
+Starcom sends it as Enter instead of letting an extended `S-Enter` key name
+surface as literal text.
 
 Local clipboard shortcuts are:
 
@@ -201,10 +204,11 @@ The renderer paints only visible history rows. Font-size controls change the
 cell metrics used both to paint and to tell tmux this client's size, so the
 remote grid matches the glyphs on screen.
 
-The status bar's bottom-left spinner ticks on each workspace repaint, the same
-liveness mark FileMan uses. Next to it, when a recent small tmux command has
-finished, its round-trip time is shown. That is not a probe: nothing extra is
-sent to measure it.
+The status bar's bottom-left activity orbit ticks on each workspace repaint, the
+same liveness mark FileMan uses. The same fixed-size mark appears in a yellow
+connecting tab without changing the chip's dimensions. Next to the status mark,
+when a recent small tmux command has finished, its round-trip time is shown. That
+is not a probe: nothing extra is sent to measure it.
 
 Remote pane output is redrawn at most 5 times per second by default (`fps` in
 `workspace.conf`; `etc/workspace.conf.example` is the documented file). Buttons,
@@ -220,7 +224,8 @@ Each interactive pane has window-style buttons in its top-right corner:
 - split below (`split-window -v`)
 - move left / right / up / down (`swap-pane` with the neighbor that shares
   that edge). Hidden when there is no neighbor on that side.
-- maximize / restore (`resize-pane -Z`)
+- maximize / restore (`resize-pane -Z`); the icon changes to overlapping
+  rectangles while the pane is maximized
 - close the pane (`kill-pane`), hidden when it is the last pane in the
   window
 

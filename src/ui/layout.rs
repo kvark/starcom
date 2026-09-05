@@ -139,6 +139,10 @@ impl Node {
         })
     }
 
+    pub fn is_zoomed(panes: &[&snapshot::Pane]) -> bool {
+        panes.len() > 1 && Self::from_panes(panes).is_none()
+    }
+
     pub fn pane_ids(&self) -> Vec<tmuxctl::PaneId> {
         match self {
             Self::Pane(id) => vec![*id],
@@ -319,19 +323,22 @@ impl Neighbors {
             let p_bottom = p_top + pane.rows;
             let overlap_y = overlap(top, bottom, p_top, p_bottom);
             let overlap_x = overlap(left, right, p_left, p_right);
-            if p_right == left && overlap_y > best[0] {
+            // tmux reserves one cell between adjacent panes for its border.
+            // Accept exact contact as well for synthetic layouts and versions
+            // that report border-free coordinates.
+            if touches(p_right, left) && overlap_y > best[0] {
                 best[0] = overlap_y;
                 found.left = Some(pane.pane);
             }
-            if p_left == right && overlap_y > best[1] {
+            if touches(right, p_left) && overlap_y > best[1] {
                 best[1] = overlap_y;
                 found.right = Some(pane.pane);
             }
-            if p_bottom == top && overlap_x > best[2] {
+            if touches(p_bottom, top) && overlap_x > best[2] {
                 best[2] = overlap_x;
                 found.up = Some(pane.pane);
             }
-            if p_top == bottom && overlap_x > best[3] {
+            if touches(bottom, p_top) && overlap_x > best[3] {
                 best[3] = overlap_x;
                 found.down = Some(pane.pane);
             }
@@ -349,6 +356,10 @@ impl Neighbors {
 
 fn overlap(a0: usize, a1: usize, b0: usize, b1: usize) -> usize {
     a1.min(b1).saturating_sub(a0.max(b0))
+}
+
+fn touches(before_end: usize, after_start: usize) -> bool {
+    before_end == after_start || before_end.checked_add(1) == Some(after_start)
 }
 
 #[cfg(test)]
@@ -429,6 +440,7 @@ mod tests {
             Some(Node::Pane(id)) => assert_eq!(id, tmuxctl::PaneId(0)),
             other => panic!("expected the larger pane, got {other:?}"),
         }
+        assert!(Node::is_zoomed(&panes));
         assert_eq!(
             Neighbors::of(
                 panes.iter().map(|pane| PaneRect::from_state(&pane.state)),
@@ -441,7 +453,7 @@ mod tests {
 
     #[test]
     fn a_side_by_side_split_has_left_and_right_neighbors() {
-        let left = pane(1, 0, 0, 40, 24);
+        let left = pane(1, 0, 0, 39, 24);
         let right = pane(2, 40, 0, 40, 24);
         let rects = [
             PaneRect::from_state(&left.state),
@@ -466,7 +478,7 @@ mod tests {
     #[test]
     fn a_stacked_split_has_up_and_down_neighbors() {
         let top = pane(1, 0, 0, 80, 10);
-        let bottom = pane(2, 0, 10, 80, 14);
+        let bottom = pane(2, 0, 11, 80, 13);
         let rects = [
             PaneRect::from_state(&top.state),
             PaneRect::from_state(&bottom.state),

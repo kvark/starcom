@@ -18,6 +18,7 @@ struct Tab {
     ui: ui::DesktopUi,
     last_seq: u64,
     last_output: time::Instant,
+    last_phase: desktop::Phase,
 }
 
 pub(crate) enum Action {
@@ -135,11 +136,8 @@ fn spawn_tab(
         ui: ui::DesktopUi::with_config(config, config_load_error),
         last_seq: 0,
         last_output: time::Instant::now(),
+        last_phase: desktop::Phase::Idle,
     })
-}
-
-fn spin(time: f64) -> &'static str {
-    ["|", "/", "-", "\\"][((time * 8.0) as usize) % 4]
 }
 
 fn busy_phase(phase: desktop::Phase) -> bool {
@@ -552,9 +550,22 @@ impl Workspace {
     }
 
     pub fn terminal_focused(&self, ctx: &egui::Context) -> bool {
-        self.tabs
-            .get(self.active)
-            .is_some_and(|tab| tab.ui.terminal_focused(ctx))
+        !self.composer_open
+            && self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| tab.ui.terminal_focused(ctx))
+    }
+
+    fn close_shortcut_action(&self) -> Action {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return Action::None;
+        };
+        if self.composer_open {
+            Action::Select(tab.id)
+        } else {
+            Action::Close(tab.id)
+        }
     }
 
     pub fn show(&mut self, root: &mut egui::Ui) -> Action {
@@ -572,10 +583,8 @@ impl Workspace {
         if root.input_mut(|input| input.consume_shortcut(&new)) {
             navigation = Action::New;
         }
-        if root.input_mut(|input| input.consume_shortcut(&close))
-            && let Some(tab) = self.tabs.get(self.active)
-        {
-            navigation = Action::Close(tab.id);
+        if root.input_mut(|input| input.consume_shortcut(&close)) {
+            navigation = self.close_shortcut_action();
         }
         egui::Panel::top("connection-tabs")
             .frame(
@@ -628,25 +637,29 @@ impl Workspace {
                             let idle_after = time::Duration::from_secs(u64::from(self.idle));
                             let now = time::Instant::now();
                             for tab in &mut self.tabs {
-                                let seq = tab
-                                    .client
-                                    .lock()
+                                let state = tab.client.lock();
+                                let phase = state.phase;
+                                let seq = state
                                     .view
                                     .as_ref()
                                     .map(crate::snapshot::View::display_seq)
                                     .unwrap_or(0);
-                                if seq != tab.last_seq {
+                                drop(state);
+                                if seq != tab.last_seq || phase != tab.last_phase {
                                     tab.last_seq = seq;
+                                    tab.last_phase = phase;
                                     tab.last_output = now;
                                 }
                             }
                             for (index, tab) in self.tabs.iter().enumerate() {
                                 ui.push_id(tab.id, |ui| {
                                     let phase = tab.client.phase();
+                                    let busy = busy_phase(phase);
                                     let mut title = tab.label.clone();
-                                    if busy_phase(phase) {
-                                        title = format!("{} {title}", spin(ui.ctx().time()));
-                                        ui.ctx().request_repaint();
+                                    if busy {
+                                        title = format!("   {title}");
+                                        ui.ctx()
+                                            .request_repaint_after(time::Duration::from_millis(50));
                                     }
                                     let selected = !self.composer_open && index == self.active;
                                     let quiet = self.idle > 0
@@ -698,6 +711,20 @@ impl Workspace {
                                     let response = ui
                                         .add(button)
                                         .on_hover_text("Click to switch · drag to reorder");
+                                    if busy {
+                                        let indicator = egui::Rect::from_center_size(
+                                            egui::pos2(
+                                                response.rect.left() + 14.0,
+                                                response.rect.center().y,
+                                            ),
+                                            egui::vec2(14.0, 14.0),
+                                        );
+                                        ui::paint_activity_indicator(
+                                            ui,
+                                            indicator,
+                                            ui.ctx().time(),
+                                        );
+                                    }
                                     response.dnd_set_drag_payload(tab.id);
                                     if response.dragged() {
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -1038,6 +1065,22 @@ mod tests {
         assert_eq!(workspace.tabs.len(), 1);
         assert!(workspace.composer_open);
         assert!(workspace.composer.ui.showing_form());
+    }
+
+    #[test]
+    fn closing_the_composer_does_not_close_the_hidden_session() {
+        let mut workspace = Workspace::new(sync::Arc::new(|| {}), desktop::Startup::Demo).unwrap();
+        let live = workspace.tabs[0].id;
+        workspace.open_composer();
+        assert!(matches!(
+            workspace.close_shortcut_action(),
+            Action::Select(id) if id == live
+        ));
+        workspace.composer_open = false;
+        assert!(matches!(
+            workspace.close_shortcut_action(),
+            Action::Close(id) if id == live
+        ));
     }
 
     #[test]
