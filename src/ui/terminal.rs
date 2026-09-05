@@ -770,7 +770,7 @@ fn paint_chrome_icon(
     icon: ChromeIcon,
     color: egui::Color32,
 ) {
-    let stroke = egui::Stroke::new(1.4, color);
+    let stroke = egui::Stroke::new(1.4_f32, color);
     match icon {
         ChromeIcon::SplitRight => {
             painter.rect_stroke(rect, 1.5, stroke, egui::StrokeKind::Outside);
